@@ -1,0 +1,12 @@
+names:
+- '0'
+nc: 1
+roboflow:
+  license: Private
+  project: my-first-project-yfgml
+  url: https://app.roboflow.com/object-detection-gjmfn/my-first-project-yfgml/3
+  version: 3
+  workspace: object-detection-gjmfn
+test: ../test/images
+train: ../train/images
+val: ../valid/images
