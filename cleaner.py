@@ -56,7 +56,7 @@ class LaMaInpainter:
         return out_bgr
 
 
-def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainter=None):
+def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainter=None, text_segmenter=None):
     """
     Очищает текст внутри всех заданных прямоугольников баблов (bubble rects).
     Анализирует локальный цвет фона бабла, подавляет шумы сканлейта (скринтоны),
@@ -109,26 +109,46 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
         else:
             bg_color_bgr = np.median(crop, axis=(0, 1)).astype(int).tolist()
             bg_std = np.std(gray)
-        # 3. Выделение кандидатов на текст через абсолютную разность от фона
-        # Это позволяет одновременно выделить и светлое тело буквы, и ее темную обводку
-        diff = cv2.absdiff(gray_filtered, bg_color_gray)
-        
-        # Динамический порог в зависимости от контрастности/шума фона
-        thresh_val = max(18, int(bg_std * 2.0))
-        _, text_candidates = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
-        
-        # Дополнительно применяем локальный адаптивный порог для выделения деталей на градиентном фоне
-        if bg_color_gray <= 190 and bg_std > 8.0:
-            # Находим резкие перепады яркости (границы букв)
-            adaptive = cv2.adaptiveThreshold(
-                gray_filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV if bg_color_gray > 127 else cv2.THRESH_BINARY,
-                25, 3
-            )
-            # Объединяем оба метода для максимального охвата
-            dark_mask = cv2.bitwise_or(text_candidates, adaptive)
-        else:
-            dark_mask = text_candidates
+        # 3. Выделение кандидатов на текст через U-Net сегментатор или absdiff
+        use_unet = False
+        if text_segmenter is not None:
+            try:
+                # Препроцессинг под U-Net
+                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                crop_resized = cv2.resize(crop_rgb, (256, 256))
+                input_blob = crop_resized.astype(np.float32) / 255.0
+                input_blob = np.transpose(input_blob, (2, 0, 1))
+                input_blob = np.expand_dims(input_blob, axis=0)
+                
+                # Запуск инференса
+                outputs = text_segmenter.run(None, {"image": input_blob})
+                logits = outputs[0][0][0]
+                
+                # Применяем сигмоиду
+                probs = 1.0 / (1.0 + np.exp(-logits))
+                mask_256 = (probs > 0.5).astype(np.uint8) * 255
+                
+                # Ресайзим маску обратно под исходный размер кропа
+                dark_mask = cv2.resize(mask_256, (w, h), interpolation=cv2.INTER_NEAREST)
+                use_unet = True
+            except Exception as e:
+                print(f"Ошибка сегментации U-Net: {e}. Откат на absdiff.")
+                
+        if not use_unet:
+            # Абсолютная разность от фона (absdiff)
+            diff = cv2.absdiff(gray_filtered, bg_color_gray)
+            thresh_val = max(18, int(bg_std * 2.0))
+            _, text_candidates = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
+            
+            if bg_color_gray <= 190 and bg_std > 8.0:
+                adaptive = cv2.adaptiveThreshold(
+                    gray_filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY_INV if bg_color_gray > 127 else cv2.THRESH_BINARY,
+                    25, 3
+                )
+                dark_mask = cv2.bitwise_or(text_candidates, adaptive)
+            else:
+                dark_mask = text_candidates
         # 4. Анализ связанных компонентов
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask)
         text_mask = np.zeros_like(dark_mask)
@@ -211,9 +231,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
             cleaned_count += 1
 
     return cv_image, cleaned_count
-
-
-def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None):
+def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None, text_segmenter=None):
     """
     Очищает фон внутри прямоугольной области на изображении.
     Если доступна модель lama_inpainter, используется она, иначе стандартный cv2.inpaint.
@@ -233,13 +251,38 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None):
     h = max(1, min(h, full_h - y))
 
     crop = cv_image[y:y+h, x:x+w].copy()
-    # Определение текстовой маски на основе абсолютной разности от медианы
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    bg_color_gray = int(np.median(gray))
-    bg_std = np.std(gray)
-    diff = cv2.absdiff(gray, bg_color_gray)
-    thresh_val = max(18, int(bg_std * 2.0))
-    _, thresh = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
+    
+    # Определение текстовой маски на основе U-Net или абсолютной разности от медианы
+    use_unet = False
+    if text_segmenter is not None:
+        try:
+            # Препроцессинг под U-Net
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crop_resized = cv2.resize(crop_rgb, (256, 256))
+            input_blob = crop_resized.astype(np.float32) / 255.0
+            input_blob = np.transpose(input_blob, (2, 0, 1))
+            input_blob = np.expand_dims(input_blob, axis=0)
+            
+            # Запуск инференса
+            outputs = text_segmenter.run(None, {"image": input_blob})
+            logits = outputs[0][0][0]
+            probs = 1.0 / (1.0 + np.exp(-logits))
+            
+            # Бинаризация и ресайз обратно
+            mask_256 = (probs > 0.5).astype(np.uint8) * 255
+            thresh = cv2.resize(mask_256, (w, h), interpolation=cv2.INTER_NEAREST)
+            use_unet = True
+        except Exception as e:
+            print(f"Ошибка сегментации U-Net в smart_inpaint_rect: {e}")
+            
+    if not use_unet:
+        # Абсолютная разность от фона (absdiff)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        bg_color_gray = int(np.median(gray))
+        bg_std = np.std(gray)
+        diff = cv2.absdiff(gray, bg_color_gray)
+        thresh_val = max(18, int(bg_std * 2.0))
+        _, thresh = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
     # Фильтруем слишком мелкие объекты
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
     cleaned_thresh = np.zeros_like(thresh)

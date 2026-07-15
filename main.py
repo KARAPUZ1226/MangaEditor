@@ -5,6 +5,7 @@ import json
 import math
 import cv2
 import numpy as np
+import onnxruntime as ort
 
 from PySide6.QtCore import Qt, QPointF, QRectF, QSize
 from PySide6.QtGui import (
@@ -278,6 +279,10 @@ class MangaEditorApp(QMainWindow):
         self.setup_ui()
         self.setup_canvas_signals()
         self.setup_shortcuts()
+        
+        # Инициализация U-Net сегментатора
+        self.text_segmenter = None
+        self.load_text_segmenter()
 
     def setup_ui(self):
         menubar = self.menuBar()
@@ -889,8 +894,15 @@ class MangaEditorApp(QMainWindow):
                 QMessageBox.warning(self, "Ошибка инициализации", f"Не удалось запустить LaMa: {e}\nБудет использован стандартный алгоритм.")
                 self.lama_inpainter = None
                 return False
-                
         return True
+    def load_text_segmenter(self):
+        segmenter_path = os.path.join("models", "segmenter.onnx")
+        if os.path.exists(segmenter_path):
+            try:
+                self.text_segmenter = ort.InferenceSession(segmenter_path, providers=["CPUExecutionProvider"])
+                print("ИИ-сегментатор текста U-Net успешно загружен!")
+            except Exception as e:
+                print(f"Ошибка загрузки U-Net сегментатора: {e}")
 
     def download_model_gui(self, url, dest_path):
         import urllib.request
@@ -1112,7 +1124,8 @@ class MangaEditorApp(QMainWindow):
                 self.original_cv_image, 
                 bubble.rect(), 
                 dilation_pixels=6,
-                lama_inpainter=self.lama_inpainter
+                lama_inpainter=self.lama_inpainter,
+                text_segmenter=self.text_segmenter
             )
         self.statusBar().showMessage("Готово!", 3000)
         
@@ -1196,12 +1209,12 @@ class MangaEditorApp(QMainWindow):
         
         bg_before = self.layers[0].image.copy()
         cv_before = self.original_cv_image.copy()
-        
         self.original_cv_image, cleaned_count = smart_clean_bubbles(
             self.original_cv_image, 
             bubbles, 
             dilation_pixels=5, 
-            lama_inpainter=self.lama_inpainter
+            lama_inpainter=self.lama_inpainter,
+            text_segmenter=self.text_segmenter
         )
         full_h, full_w = self.original_cv_image.shape[:2]
         q_img = QImage(self.original_cv_image.data, full_w, full_h, 3*full_w, QImage.Format_BGR888).copy()
