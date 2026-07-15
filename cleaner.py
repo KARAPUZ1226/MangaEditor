@@ -121,7 +121,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
                 input_blob = np.expand_dims(input_blob, axis=0)
                 
                 # Запуск инференса
-                outputs = text_segmenter.run(None, {"image": input_blob})
+                outputs = text_segmenter.run(None, {"input": input_blob})
                 logits = outputs[0][0][0]
                 
                 # Применяем сигмоиду
@@ -264,7 +264,7 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None, t
             input_blob = np.expand_dims(input_blob, axis=0)
             
             # Запуск инференса
-            outputs = text_segmenter.run(None, {"image": input_blob})
+            outputs = text_segmenter.run(None, {"input": input_blob})
             logits = outputs[0][0][0]
             probs = 1.0 / (1.0 + np.exp(-logits))
             
