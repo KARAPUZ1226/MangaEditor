@@ -113,12 +113,12 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
         use_unet = False
         if text_segmenter is not None:
             try:
-                # Препроцессинг под U-Net (Grayscale 512x512)
+                # Препроцессинг под U-Net (Grayscale 256x256)
                 crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                crop_resized = cv2.resize(crop_gray, (512, 512))
+                crop_resized = cv2.resize(crop_gray, (256, 256))
                 input_blob = crop_resized.astype(np.float32) / 255.0
-                input_blob = np.expand_dims(input_blob, axis=0) # [1, 512, 512]
-                input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 512, 512]
+                input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
+                input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 256, 256]
                 
                 # Запуск инференса
                 outputs = text_segmenter.run(None, {"input": input_blob})
@@ -126,10 +126,10 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
                 
                 # Применяем сигмоиду
                 probs = 1.0 / (1.0 + np.exp(-logits))
-                mask_512 = (probs > 0.5).astype(np.uint8) * 255
+                mask_256 = (probs > 0.5).astype(np.uint8) * 255
                 
                 # Ресайзим маску обратно под исходный размер кропа
-                dark_mask = cv2.resize(mask_512, (w, h), interpolation=cv2.INTER_NEAREST)
+                dark_mask = cv2.resize(mask_256, (w, h), interpolation=cv2.INTER_NEAREST)
                 use_unet = True
             except Exception as e:
                 print(f"Ошибка сегментации U-Net: {e}. Откат на absdiff.")
@@ -252,25 +252,24 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None, t
 
     crop = cv_image[y:y+h, x:x+w].copy()
     
-    # Определение текстовой маски на основе U-Net или абсолютной разности от медианы
     use_unet = False
     if text_segmenter is not None:
         try:
-            # Препроцессинг под U-Net (Grayscale 512x512)
+            # Препроцессинг под U-Net (Grayscale 256x256)
             crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            crop_resized = cv2.resize(crop_gray, (512, 512))
+            crop_resized = cv2.resize(crop_gray, (256, 256))
             input_blob = crop_resized.astype(np.float32) / 255.0
-            input_blob = np.expand_dims(input_blob, axis=0) # [1, 512, 512]
-            input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 512, 512]
-            
+            input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
+            input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 256, 256]
+
             # Запуск инференса
             outputs = text_segmenter.run(None, {"input": input_blob})
             logits = outputs[0][0][0]
             probs = 1.0 / (1.0 + np.exp(-logits))
             
             # Бинаризация и ресайз обратно
-            mask_512 = (probs > 0.5).astype(np.uint8) * 255
-            thresh = cv2.resize(mask_512, (w, h), interpolation=cv2.INTER_NEAREST)
+            mask_256 = (probs > 0.5).astype(np.uint8) * 255
+            thresh = cv2.resize(mask_256, (w, h), interpolation=cv2.INTER_NEAREST)
             use_unet = True
         except Exception as e:
             print(f"Ошибка сегментации U-Net в smart_inpaint_rect: {e}")
