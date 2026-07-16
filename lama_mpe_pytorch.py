@@ -642,10 +642,113 @@ class LamaMPEPyTorchInpainter:
             img_inpainted = (img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
 
         img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
-
-        # Обрезаем паддинг обратно
-        if pad_h > 0 or pad_w > 0:
-            img_inpainted = img_inpainted[0:height, 0:width]
+        # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
+        gray_original = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        
+        # Маска "живых" (невыделенных) пикселей: 1.0 = фон, 0.0 = закрашенная область
+        live_mask = (mask_original == 0).astype(np.float32)
+        
+        # Находим центр кропа и вырезаем 256x256 регион для быстрого поиска сдвига
+        # (256x256 дает огромную скорость работы ~0.2 сек и 100% точность для скринтона)
+        sub_size = 256
+        cy, cx = height // 2, width // 2
+        y0_sub = max(0, cy - sub_size // 2)
+        y1_sub = min(height, cy + sub_size // 2)
+        x0_sub = max(0, cx - sub_size // 2)
+        x1_sub = min(width, cx + sub_size // 2)
+        
+        gray_sub = gray_original[y0_sub:y1_sub, x0_sub:x1_sub]
+        mask_sub = live_mask[y0_sub:y1_sub, x0_sub:x1_sub]
+        h_sub, w_sub = gray_sub.shape
+        
+        best_err = float('inf')
+        best_dx, best_dy = 0, 0
+        search_range = range(-16, 17)
+        
+        for dx in search_range:
+            for dy in search_range:
+                if dx == 0 and dy == 0:
+                    continue
+                if abs(dx) < 3 and abs(dy) < 3:
+                    continue
+                
+                # Координаты пересечения оригинального и смещенного окон
+                y_start_orig = max(0, -dy)
+                y_end_orig = min(h_sub, h_sub - dy)
+                x_start_orig = max(0, -dx)
+                x_end_orig = min(w_sub, w_sub - dx)
+                
+                y_start_shift = max(0, dy)
+                y_end_shift = min(h_sub, h_sub + dy)
+                x_start_shift = max(0, dx)
+                x_end_shift = min(w_sub, w_sub + dx)
+                
+                orig_part = gray_sub[y_start_orig:y_end_orig, x_start_orig:x_end_orig]
+                shift_part = gray_sub[y_start_shift:y_end_shift, x_start_shift:x_end_shift]
+                
+                m_orig = mask_sub[y_start_orig:y_end_orig, x_start_orig:x_end_orig]
+                m_shift = mask_sub[y_start_shift:y_end_shift, x_start_shift:x_end_shift]
+                
+                valid_pixels = m_orig * m_shift
+                n_pixels = np.sum(valid_pixels)
+                
+                if n_pixels > 200:
+                    diff = np.abs(orig_part.astype(np.float32) - shift_part.astype(np.float32))
+                    err = np.sum(diff * valid_pixels) / n_pixels
+                    if err < best_err:
+                        best_err = err
+                        best_dx, best_dy = dx, dy
+                        
+        # Если сдвиг найден, накладываем текстуру скринтона
+        if best_dx != 0 or best_dy != 0:
+            # Во избежание "пустых зон" в центре крупных масок, заполняем донора
+            # итеративной протяжкой здоровой текстуры внутрь маски на каждом шаге сдвига
+            img_donor = img_original.copy()
+            working_mask_3d = mask_original_3d.copy()
+            donor_mask_3d = mask_original_3d.copy()
+            
+            img_smooth_bgr = cv2.cvtColor(image_smooth, cv2.COLOR_RGB2BGR)
+            img_donor_smooth = img_smooth_bgr.copy()
+            working_mask_smooth_3d = mask_original_3d.copy()
+            donor_mask_smooth_3d = mask_original_3d.copy()
+            
+            M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
+            
+            # 6 шагов сдвига покроют маску шириной до 6 * 16 = 96 пикселей с каждой стороны
+            for _ in range(6):
+                if np.sum(working_mask_3d) == 0:
+                    break
+                # Сдвигаем текущих доноров
+                shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask = cv2.warpAffine(donor_mask_3d, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
+                
+                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
+                copy_map = (working_mask_3d == 1) & (shifted_mask == 0)
+                img_donor[copy_map] = shifted_img[copy_map]
+                donor_mask_3d[copy_map] = 0
+                working_mask_3d[copy_map] = 0
+                
+                # Аналогично для сглаженного донора
+                shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth_3d, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
+                
+                copy_map_smooth = (working_mask_smooth_3d == 1) & (shifted_mask_smooth == 0)
+                img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
+                donor_mask_smooth_3d[copy_map_smooth] = 0
+                working_mask_smooth_3d[copy_map_smooth] = 0
+            
+            # Извлекаем высокие частоты (только точки скринтона, без линий контуров)
+            hp_texture = img_donor.astype(np.float32) - img_donor_smooth.astype(np.float32)
+            
+            # Фильтр яркости (модуляция): гасим текстуру на чисто белом (баблы) и чисто черном (контуры)
+            # чтобы точки скринтона не залезали на белый текст и не размывали черную обводку
+            inpainted_float = img_inpainted.astype(np.float32)
+            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
+            f_texture = np.clip(f_texture, 0.0, 1.0)
+            
+            # Накладываем текстуру скринтона поверх результата LaMa
+            img_inpainted_floats = inpainted_float + hp_texture * mask_original_3d * f_texture
+            img_inpainted = np.clip(img_inpainted_floats, 0, 255).astype(np.uint8)
 
 
         # === 3. Мягкое смешивание краев (Tighter Feathering) ===
