@@ -1071,12 +1071,31 @@ class MangaEditorApp(QMainWindow):
                                 bg_ptr = bg_qimg.bits()
                                 bg_cv = np.array(bg_ptr).reshape(h_bg, w_bg, 3).copy()
                             
-                            # Запуск Inpainting
+                            # Находим Bounding Box мазка (где нарисовал пользователь)
+                            y_indices, x_indices = np.where(mask > 127)
+                            y0, y1 = y_indices.min(), y_indices.max()
+                            x0, x1 = x_indices.min(), x_indices.max()
+                            
+                            # Добавляем падинг 48 пикселей во все стороны для контекста
+                            pad = 48
+                            crop_y0 = max(0, y0 - pad)
+                            crop_y1 = min(h_bg, y1 + pad)
+                            crop_x0 = max(0, x0 - pad)
+                            crop_x1 = min(w_bg, x1 + pad)
+                            
+                            crop_img = bg_cv[crop_y0:crop_y1, crop_x0:crop_x1].copy()
+                            crop_mask = mask[crop_y0:crop_y1, crop_x0:crop_x1].copy()
+                            
+                            # Запуск Inpainting на КРОПЕ
                             if self.lama_inpainter is not None:
-                                inpainted = self.lama_inpainter.inpaint(bg_cv, mask)
+                                crop_inpainted = self.lama_inpainter.inpaint(crop_img, crop_mask)
                             else:
-                                inpainted = cv2.inpaint(bg_cv, mask, 3, cv2.INPAINT_TELEA)
+                                crop_inpainted = cv2.inpaint(crop_img, crop_mask, 3, cv2.INPAINT_TELEA)
                                 
+                            # Вставляем кроп обратно в исходное изображение
+                            inpainted = bg_cv.copy()
+                            inpainted[crop_y0:crop_y1, crop_x0:crop_x1] = crop_inpainted
+                            
                             bg_before_cv = self.original_cv_image.copy()
                             self.original_cv_image = inpainted.copy()
                             
@@ -1195,9 +1214,10 @@ class MangaEditorApp(QMainWindow):
         QApplication.processEvents()
         
         for bubble in bubbles_to_inpaint:
+            scene_rect = bubble.mapToScene(bubble.rect()).boundingRect()
             self.original_cv_image = smart_inpaint_rect(
                 self.original_cv_image, 
-                bubble.rect(), 
+                scene_rect, 
                 dilation_pixels=6,
                 lama_inpainter=self.lama_inpainter,
                 text_segmenter=self.text_segmenter

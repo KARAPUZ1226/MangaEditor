@@ -50,7 +50,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
 
     full_h, full_w = cv_image.shape[:2]
     cleaned_count = 0
-    padding = 32  # Контекст для LaMa
+    padding = 64  # Контекст для LaMa
 
     for bubble in bubble_items:
         rect = bubble.rect()
@@ -106,7 +106,7 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
         return cv_image
 
     full_h, full_w = cv_image.shape[:2]
-    padding = 32
+    padding = 64
 
     x0 = int(rect.x())
     y0 = int(rect.y())
