@@ -47,93 +47,73 @@ class LaMaInpainter:
 def _build_text_mask(crop, dilation_px=2):
     """
     Строит маску текста внутри кропа бабла.
+    Использует эвристику "Ореола" (Halo) для отделения текста от спидлайнов и скринтонов.
     """
     h, w = crop.shape[:2]
-    if h < 6 or w < 6:
-        return None
+    if h < 6 or w < 6: return None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     
-    # 1. Адаптивный порог (выделение черных кандидатов на любом фоне)
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+    # 1. Ищем всё тёмное (потенциальный текст и линии)
+    # Адаптируем порог под общую яркость кропа
+    crop_median = int(np.median(gray))
+    thresh_val = min(140, max(60, crop_median - 40)) 
+    _, binary = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY_INV)
     
-    # 2. Находим компоненты (буквы/шум)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
-    
-    valid_boxes = []
-    char_masks = []
+    valid_chars = []
     
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
-        cx = stats[i, cv2.CC_STAT_LEFT]
-        cy = stats[i, cv2.CC_STAT_TOP]
         cw = stats[i, cv2.CC_STAT_WIDTH]
         ch = stats[i, cv2.CC_STAT_HEIGHT]
         
-        # Эвристика символов: отсекаем пыль и гигантские линии
-        if 8 < area < (w * h * 0.2) and 3 < cw < w * 0.8 and 3 < ch < h * 0.8:
-            valid_boxes.append((cx, cy, cw, ch))
-            char_masks.append((labels == i).astype(np.uint8) * 255)
+        # Отсекаем пыль и рамки панелей
+        if 10 < area < (w * h * 0.4) and 3 < cw < w * 0.9 and 3 < ch < h * 0.9:
+            char_mask = (labels == i).astype(np.uint8) * 255
             
-    if not valid_boxes:
+            # 2. ЭВРИСТИКА ОБВОДКИ (Halo Rule)
+            # Расширяем букву на 3 пикселя, чтобы получить кольцо вокруг неё
+            dilated = cv2.dilate(char_mask, np.ones((5,5), np.uint8))
+            halo = cv2.bitwise_xor(dilated, char_mask)
+            
+            # Вычитаем другие тёмные объекты, чтобы соседние буквы не портили статистику
+            halo_clean = cv2.bitwise_and(halo, cv2.bitwise_not(binary))
+            
+            halo_pixels = gray[halo_clean == 255]
+            if len(halo_pixels) > 0:
+                halo_median = int(np.median(halo_pixels))
+                # Если вокруг буквы светло (белый фон или белая обводка) — это текст!
+                # Если вокруг серо (скринтон) или темно (рисунок) — это мусор (спидлайны)
+                if halo_median > 175:
+                    valid_chars.append(char_mask)
+
+    if not valid_chars:
         return None
 
-    # 3. Кластеризация (правило близости)
-    cluster_mask = np.zeros((h, w), dtype=np.uint8)
-    
-    # Расширяем Bounding Box каждой буквы на 15 пикселей (зона притяжения)
-    dist = 15
-    for cx, cy, cw, ch in valid_boxes:
-        x1 = max(0, cx - dist)
-        y1 = max(0, cy - dist)
-        x2 = min(w, cx + cw + dist)
-        y2 = min(h, cy + ch + dist)
-        cv2.rectangle(cluster_mask, (x1, y1), (x2, y2), 255, -1)
+    # Объединяем подтверждённые буквы
+    text_mask = np.zeros((h, w), dtype=np.uint8)
+    for mask in valid_chars:
+        text_mask = cv2.bitwise_or(text_mask, mask)
         
-    c_num_labels, c_labels, _, _ = cv2.connectedComponentsWithStats(cluster_mask)
-    
-    cluster_counts = {i: 0 for i in range(1, c_num_labels)}
-    box_cluster_ids = []
-    
-    for cx, cy, cw, ch in valid_boxes:
-        center_x = cx + cw // 2
-        center_y = cy + ch // 2
-        c_id = c_labels[center_y, center_x]
-        if c_id > 0:
-            cluster_counts[c_id] += 1
-        box_cluster_ids.append(c_id)
-        
-    final_text_mask = np.zeros((h, w), dtype=np.uint8)
-    kept_chars = 0
-    
-    for i in range(len(valid_boxes)):
-        c_id = box_cluster_ids[i]
-        # Если в кластере больше 1 символа — это текст!
-        if c_id > 0 and cluster_counts[c_id] > 1:
-            final_text_mask = cv2.bitwise_or(final_text_mask, char_masks[i])
-            kept_chars += 1
-            
-    if kept_chars == 0:
-        return None
-        
-    # 4. Расширяем маску для захвата обводки
+    # 3. Дилатация (чтобы стереть саму белую обводку тоже)
     if dilation_px > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_px * 2 + 1, dilation_px * 2 + 1))
-        final_text_mask = cv2.dilate(final_text_mask, kernel, iterations=1)
+        text_mask = cv2.dilate(text_mask, kernel, iterations=1)
         
     # Защитная зона 3px
     margin = 3
-    final_text_mask[:margin, :] = 0
-    final_text_mask[-margin:, :] = 0
-    final_text_mask[:, :margin] = 0
-    final_text_mask[:, -margin:] = 0
+    text_mask[:margin, :] = 0
+    text_mask[-margin:, :] = 0
+    text_mask[:, :margin] = 0
+    text_mask[:, -margin:] = 0
 
-    if not np.any(final_text_mask):
+    if not np.any(text_mask):
         return None
 
-    # 5. Анализ фона (кольцо вокруг маски текста)
-    bg_eval_mask = cv2.dilate(final_text_mask, np.ones((11, 11), np.uint8))
-    bg_eval_mask = cv2.bitwise_xor(bg_eval_mask, final_text_mask)
+    # 4. Анализ фона (для выбора между заливкой и LaMa)
+    bg_eval_mask = cv2.dilate(text_mask, np.ones((11, 11), np.uint8))
+    bg_eval_mask = cv2.bitwise_xor(bg_eval_mask, text_mask)
     
     bg_pixels = gray[bg_eval_mask == 255]
     if len(bg_pixels) > 0:
@@ -150,7 +130,7 @@ def _build_text_mask(crop, dilation_px=2):
         bg_median = 255
         bg_color = [255, 255, 255]
 
-    return final_text_mask, bg_color, bg_median, bg_std
+    return text_mask, bg_color, bg_median, bg_std
 
 
 def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=2, lama_inpainter=None, text_segmenter=None):
