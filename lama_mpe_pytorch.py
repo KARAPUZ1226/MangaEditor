@@ -634,21 +634,21 @@ class LamaMPEPyTorchInpainter:
                 unet_mask = cv2.resize(mask_256, (cw, ch), interpolation=cv2.INTER_NEAREST)
                 
                 # 4. Умный поиск обводки:
-                # Белая обводка (яркость > 210) должна быть непосредственно рядом с буквами.
+                # Белая обводка (яркость > 185) должна быть непосредственно рядом с буквами.
                 # Расширяем маску букв всего на 2 пикселя, чтобы найти область обводки
                 kernel = np.ones((3, 3), np.uint8)
                 near_text = cv2.dilate(unet_mask, kernel, iterations=2)
                 
                 # Выделяем белые пиксели обводки только вблизи букв
-                white_outline = (gray_orig > 210) & (near_text > 0)
+                white_outline = (gray_orig > 185) & (near_text > 0)
                 
                 # Объединяем буквы и их обводку
                 combined_text_mask = np.zeros_like(unet_mask)
                 combined_text_mask[unet_mask > 0] = 255
                 combined_text_mask[white_outline] = 255
                 
-                # Слегка расширяем объединенную маску на 1 пиксель для сглаживания краев (антиалиасинга)
-                unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=1)
+                # Слегка расширяем объединенную маску на 2 пикселя для сглаживания краев (антиалиасинга)
+                unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=2)
                 
                 # 5. Пересекаем с исходным прямоугольным выделением пользователя
                 mask_refined = np.copy(mask)
