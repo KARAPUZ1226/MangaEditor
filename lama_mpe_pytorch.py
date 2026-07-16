@@ -604,7 +604,7 @@ class LamaMPEPyTorchInpainter:
         mask_original = np.copy(mask)
         mask_original[mask_original < 127] = 0
         mask_original[mask_original >= 127] = 1
-        mask_original = mask_original[:, :, None]
+        mask_original_3d = mask_original[:, :, None]
 
         height, width, c = image.shape
 
@@ -640,5 +640,31 @@ class LamaMPEPyTorchInpainter:
         if new_h != height or new_w != width:
             img_inpainted = cv2.resize(img_inpainted, (width, height), interpolation=cv2.INTER_LINEAR)
 
-        ans = img_inpainted * mask_original + img_original * (1 - mask_original)
+        # === 1. Измерение и подмешивание высокочастотного шума ===
+        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        blurred_orig = cv2.GaussianBlur(gray_orig, (3, 3), 0)
+        hp_noise = cv2.subtract(gray_orig, blurred_orig)
+        
+        unmasked_pixels = hp_noise[mask < 127]
+        noise_std = np.std(unmasked_pixels) if unmasked_pixels.size > 0 else 0.0
+        noise_std = min(noise_std, 3.5)  # Сдерживаем сильные шумы
+        
+        if noise_std > 0.3:
+            noise_img = np.random.normal(0, noise_std, (height, width, 1)).astype(np.float32)
+            img_inpainted_floats = img_inpainted.astype(np.float32) + noise_img * mask_original_3d
+            img_inpainted = np.clip(img_inpainted_floats, 0, 255).astype(np.uint8)
+
+        # === 2. Мягкое смешивание (Feathering) краев маски ===
+        mask_bin = mask_original.astype(np.float32)
+        ksize = min(15, min(height, width) // 3 | 1)
+        if ksize >= 3:
+            feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
+        else:
+            feathered_mask = mask_bin
+            
+        if len(feathered_mask.shape) == 2:
+            feathered_mask = feathered_mask[:, :, None]
+
+        ans = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+        ans = np.clip(ans, 0, 255).astype(np.uint8)
         return ans
