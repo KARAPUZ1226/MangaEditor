@@ -49,9 +49,8 @@ class WaifuDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.combo_scale = QComboBox()
-        self.combo_scale.addItems(["x2 (Рекомендуется)", "x4"])
+        self.combo_scale.addItems(["Без увеличения (только очистка)", "x2 (Рекомендуется)", "x4"])
         form.addRow("Масштаб увеличения:", self.combo_scale)
-        
         self.chk_denoise = QCheckBox("Шумоподавление (убрать JPG артефакты)")
         self.chk_denoise.setChecked(True)
         form.addRow("", self.chk_denoise)
@@ -82,29 +81,31 @@ class WaifuDialog(QDialog):
         
         try:
             import numpy as np
-            scale = 2 if self.combo_scale.currentIndex() == 0 else 4
+            scale_idx = self.combo_scale.currentIndex()
             img = self.image_data.copy()
             
             if self.chk_denoise.isChecked():
                 # Профессиональный алгоритм фильтрации JPEG-шумов (Non-Local Means)
                 img = cv2.fastNlMeansDenoisingColored(img, None, h=10, hColor=10, templateWindowSize=7, searchWindowSize=21)
                 
-            h, w = img.shape[:2]
-            new_h, new_w = h * scale, w * scale
-            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-            
-            # Резкость
-            gaussian = cv2.GaussianBlur(resized, (0, 0), 2.0)
-            sharpened = cv2.addWeighted(resized, 1.5, gaussian, -0.5, 0)
+            if scale_idx == 0:
+                # Без масштабирования (только очистка шума и уровней)
+                sharpened = img
+            else:
+                scale = 2 if scale_idx == 1 else 4
+                h, w = img.shape[:2]
+                new_h, new_w = h * scale, w * scale
+                resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+                
+                # Резкость
+                gaussian = cv2.GaussianBlur(resized, (0, 0), 2.0)
+                sharpened = cv2.addWeighted(resized, 1.5, gaussian, -0.5, 0)
             
             # Профессиональная чистка уровней (Levels):
-            # Все пиксели белее 230 становятся чисто-белыми (255)
-            # Все пиксели чернее 25 становятся глубоким черным (0)
-            # Это полностью вычищает остатки JPEG-грязи и артефактов на фоне
             cleaned_levels = np.clip((sharpened.astype(np.float32) - 25) * (255.0 / (230 - 25)), 0, 255).astype(np.uint8)
             
             self.upscaled_image = cleaned_levels
-            QMessageBox.information(self, "Успех", "Апскейл и профессиональная очистка успешно завершены!")
+            QMessageBox.information(self, "Успех", "Очистка успешно завершена!")
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось выполнить апскейл: {e}")

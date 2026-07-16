@@ -149,12 +149,26 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
                 dark_mask = cv2.bitwise_or(text_candidates, adaptive)
             else:
                 dark_mask = text_candidates
+
+        # Находим темный текст (тело букв) через простой порог яркости
+        # (Манга-текст всегда черный или темно-серый, обычно < 110)
+        _, dark_text = cv2.threshold(gray_filtered, 110, 255, cv2.THRESH_BINARY_INV)
+        
+        # Убираем одиночный микрошум
+        num_labels_dt, labels_dt, stats_dt, _ = cv2.connectedComponentsWithStats(dark_text)
+        cleaned_dark = np.zeros_like(dark_text)
+        for i in range(1, num_labels_dt):
+            if stats_dt[i, cv2.CC_STAT_AREA] > 3:
+                cleaned_dark[labels_dt == i] = 255
+                
+        # Расширяем тело букв на 5 пикселей ( outline + 5 пикселей чтоб наверняка)
+        outline_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        dilated_dark_text = cv2.dilate(cleaned_dark, outline_kernel, iterations=1)
+
         # 4. Анализ связанных компонентов
         if use_unet:
-            text_mask = dark_mask.copy()
-            # Для определения высоты букв считаем статистику связанных компонентов без жесткой фильтрации
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_mask)
-            valid_heights = [stats[i, cv2.CC_STAT_HEIGHT] for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] > 2]
+            # Объединяем U-Net маску и расширенное тело букв
+            text_mask = cv2.bitwise_or(dark_mask, dilated_dark_text)
         else:
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask)
             text_mask = np.zeros_like(dark_mask)
@@ -167,10 +181,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
                 height = stats[i, cv2.CC_STAT_HEIGHT]
                 area = stats[i, cv2.CC_STAT_AREA]
 
-                # Вычисляем плотность объекта
                 density = area / (width * height) if (width * height) > 0 else 0
-
-                # Проверяем контакты с краями
                 touches_left_or_right = (left <= 2 or (left + width) >= (w - 2))
                 touches_top_or_bottom = (top <= 2 or (top + height) >= (h - 2))
 
@@ -183,56 +194,49 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
                 if is_border:
                     continue
 
-                # Исключаем гигантские нетекстовые заливки
                 if area > (w * h * 0.45) or width > w * 0.95 or height > h * 0.95:
                     continue
 
-                # Исключаем микро-шум
                 if area <= 2:
                     continue
 
                 text_mask[labels == i] = 255
                 valid_heights.append(height)
+                
+            text_mask = cv2.bitwise_or(text_mask, dilated_dark_text)
+
+        # Защитная рамка 8 пикселей: никогда не стираем внешние 8 пикселей кропа,
+        # чтобы дилатация случайно не задела и не размыла черные границы баблов
+        safety_margin = 8
+        text_mask[:safety_margin, :] = 0
+        text_mask[-safety_margin:, :] = 0
+        text_mask[:, :safety_margin] = 0
+        text_mask[:, -safety_margin:] = 0
 
         if np.any(text_mask == 255):
-            # Вычисляем медианную высоту букв для адаптивного подбора радиуса дилатации
-            median_height = np.median(valid_heights) if valid_heights else 15
-            
-            # Адаптивный размер расширения маски на основе высоты букв (берём 10% от высоты букв, минимум 3 пикселя)
-            # Это предотвращает размытие (smudging) текстур при inpaint'е
-            dilate_size = max(3, int(median_height * 0.10))
-            
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
-            dilated_mask = cv2.dilate(text_mask, kernel, iterations=1)
-            
-            # Защитная рамка: никогда не стираем внешние 3 пикселя кропа, 
-            # чтобы дилатация случайно не задела и не размыла черные границы баблов
-            dilated_mask[:3, :] = 0
-            dilated_mask[-3:, :] = 0
-            dilated_mask[:, :3] = 0
-            dilated_mask[:, -3:] = 0
             # 6. Заполнение / Inpainting
             if bg_color_gray > 195 or bg_std < 18.0:
                 # Однородный/светлый фон: заливаем сплошным цветом
-                crop[dilated_mask == 255] = bg_color_bgr
+                crop[text_mask == 255] = bg_color_bgr
             else:
                 # Текстурированный фон: используем LaMa или Navier-Stokes inpaint
                 if lama_inpainter is not None:
                     try:
-                        inpainted_crop = lama_inpainter.inpaint(crop, dilated_mask)
+                        inpainted_crop = lama_inpainter.inpaint(crop, text_mask)
                         crop[:] = inpainted_crop
                     except Exception as e:
-                        print(f"LaMa inpaint error: {e}")
-                        inpainted_crop = cv2.inpaint(crop, dilated_mask, 3, cv2.INPAINT_NS)
+                        print(f"Ошибка LaMa: {e}")
+                        inpainted_crop = cv2.inpaint(crop, text_mask, 3, cv2.INPAINT_TELEA)
                         crop[:] = inpainted_crop
                 else:
-                    inpainted_crop = cv2.inpaint(crop, dilated_mask, 3, cv2.INPAINT_NS)
+                    inpainted_crop = cv2.inpaint(crop, text_mask, 3, cv2.INPAINT_TELEA)
                     crop[:] = inpainted_crop
 
             cv_image[y:y+h, x:x+w] = crop
             cleaned_count += 1
 
     return cv_image, cleaned_count
+
 def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None, text_segmenter=None):
     """
     Очищает фон внутри прямоугольной области на изображении.
@@ -284,30 +288,49 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=5, lama_inpainter=None, t
         diff = cv2.absdiff(gray, bg_color_gray)
         thresh_val = max(18, int(bg_std * 2.0))
         _, thresh = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
-    # Фильтруем слишком мелкие объекты
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
-    cleaned_thresh = np.zeros_like(thresh)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] > 5:
-            cleaned_thresh[labels == i] = 255
 
-    # Морфология и дилатация маски
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned_thresh = cv2.morphologyEx(cleaned_thresh, cv2.MORPH_CLOSE, close_kernel)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_pixels, dilation_pixels))
-    mask_crop = cv2.dilate(cleaned_thresh, kernel, iterations=1)
+    # Находим темный текст (тело букв) через простой порог яркости
+    gray_img = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, dark_text = cv2.threshold(gray_img, 110, 255, cv2.THRESH_BINARY_INV)
+    
+    # Убираем одиночный микрошум
+    num_labels_dt, labels_dt, stats_dt, _ = cv2.connectedComponentsWithStats(dark_text)
+    cleaned_dark = np.zeros_like(dark_text)
+    for i in range(1, num_labels_dt):
+        if stats_dt[i, cv2.CC_STAT_AREA] > 3:
+            cleaned_dark[labels_dt == i] = 255
+            
+    # Расширяем тело букв на 5 пикселей для покрытия обводки
+    outline_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated_dark_text = cv2.dilate(cleaned_dark, outline_kernel, iterations=1)
+    
+    # Объединяем маски
+    final_mask = cv2.bitwise_or(thresh, dilated_dark_text)
+    
+    # Защитная рамка 8 пикселей
+    safety_margin = 8
+    final_mask[:safety_margin, :] = 0
+    final_mask[-safety_margin:, :] = 0
+    final_mask[:, :safety_margin] = 0
+    final_mask[:, -safety_margin:] = 0
 
-    if lama_inpainter is not None:
-        # Используем ИИ LaMa для Inpainting'а только на вырезанном участке (crop)
-        # В LaMa лучше передавать не весь кадр, если он огромный, а только участок + паддинг,
-        # но для простоты передаем crop как есть (LaMaInpainter сам ресайзит)
-        inpainted_crop = lama_inpainter.inpaint(crop, mask_crop)
-        inpainted = cv_image.copy()
-        inpainted[y:y+h, x:x+w] = inpainted_crop
-        return inpainted
-    else:
-        # Классический inpaint с Navier-Stokes
-        full_mask = np.zeros((full_h, full_w), dtype=np.uint8)
-        full_mask[y:y+h, x:x+w] = mask_crop
-        inpainted = cv2.inpaint(cv_image, full_mask, 3, cv2.INPAINT_NS)
-        return inpainted
+    if np.any(final_mask == 255):
+        gray_c = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        bg_color_gray_c = int(np.median(gray_c))
+        bg_std_c = np.std(gray_c)
+        bg_color_bgr = np.median(crop, axis=(0, 1)).astype(int).tolist()
+        
+        if bg_color_gray_c > 195 or bg_std_c < 18.0:
+            crop[final_mask == 255] = bg_color_bgr
+        else:
+            if lama_inpainter is not None:
+                try:
+                    crop = lama_inpainter.inpaint(crop, final_mask)
+                except Exception as e:
+                    print(f"Ошибка LaMa inpaint в smart_inpaint_rect: {e}")
+                    cv2.inpaint(crop, final_mask, 3, cv2.INPAINT_TELEA, dst=crop)
+            else:
+                cv2.inpaint(crop, final_mask, 3, cv2.INPAINT_TELEA, dst=crop)
+
+    cv_image[y:y+h, x:x+w] = crop
+    return cv_image
