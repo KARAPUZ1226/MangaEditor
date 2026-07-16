@@ -812,7 +812,7 @@ class LamaMPEPyTorchInpainter:
             working_mask = mask_original.copy()
             donor_mask = mask_original.copy()
             
-            img_smooth_bgr = cv2.cvtColor(image_smooth, cv2.COLOR_RGB2BGR)
+            img_smooth_bgr = cv2.GaussianBlur(img_original, (7, 7), 0)
             img_donor_smooth = img_smooth_bgr.copy()
             working_mask_smooth = mask_original.copy()
             donor_mask_smooth = mask_original.copy()
@@ -850,6 +850,10 @@ class LamaMPEPyTorchInpainter:
             inpainted_float = img_inpainted.astype(np.float32)
             f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
             f_texture = np.clip(f_texture, 0.0, 1.0)
+            
+            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture)}, max={np.max(hp_texture)}, mean_abs={np.mean(np.abs(hp_texture))}")
+            print(f"[LaMa PyTorch DEBUG] f_texture stats: min={np.min(f_texture)}, max={np.max(f_texture)}, mean={np.mean(f_texture)}")
+            print(f"[LaMa PyTorch DEBUG] mask_original_3d sum: {np.sum(mask_original_3d)}")
             
             # Накладываем текстуру скринтона поверх результата LaMa
             # (Ничего не делаем здесь, переносим наложение в конец)
