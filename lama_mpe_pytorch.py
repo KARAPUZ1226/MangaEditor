@@ -603,16 +603,20 @@ class LamaMPEPyTorchInpainter:
         img_original = np.copy(image)
         
         # === 0. Автоматическое уточнение маски ===
-        # Выделяем только темный текст (<95) и светлую обводку (>225),
+        # Выделяем только темный текст (<110) и светлую обводку (>210),
         # оставляя средние серые тона скринтонов в качестве "живого" фона.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        text_pixels = (gray_orig < 95) | (gray_orig > 225)
+        text_pixels = (gray_orig < 110) | (gray_orig > 210)
         
         mask_refined = np.copy(mask)
         mask_refined[~text_pixels] = 0
         
-        # Если уточненная маска пуста (например, стираем чистый серый фон), откатываемся к оригиналу
-        if np.sum(mask_refined >= 127) < 10:
+        # Если уточненная маска не пуста, расширяем её на 2 пикселя (дилатация),
+        # чтобы гарантированно покрыть антиалиасинг (сглаживание) по краям букв
+        if np.sum(mask_refined >= 127) >= 10:
+            kernel = np.ones((3, 3), np.uint8)
+            mask_refined = cv2.dilate(mask_refined, kernel, iterations=2)
+        else:
             mask_refined = mask
 
         mask_original = np.copy(mask_refined)
