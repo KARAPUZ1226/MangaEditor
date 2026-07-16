@@ -1078,9 +1078,10 @@ class MangaEditorApp(QMainWindow):
                             w0 = x1 - x0 + 1
                             h0 = y1 - y0 + 1
                             
-                            # Расширяем область до квадрата, кратного 8
+                            # Расширяем область до квадрата, кратного 8, не менее 512px
                             min_padding = 96
                             S = max(w0 + 2 * min_padding, h0 + 2 * min_padding)
+                            S = max(S, 512)
                             S = ((S + 7) // 8) * 8
                             
                             cx = x0 + w0 // 2

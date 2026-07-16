@@ -23,8 +23,9 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
         w0 = int(rect.width())
         h0 = int(rect.height())
 
-        # 1. Расширяем область до квадрата, кратного 8 (без растяжения!)
+        # 1. Расширяем область до квадрата, кратного 8, не менее 512px (без растяжения!)
         S = max(w0 + 2 * min_padding, h0 + 2 * min_padding)
+        S = max(S, 512)
         S = ((S + 7) // 8) * 8
         
         cx = x0 + w0 // 2
@@ -87,8 +88,9 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
     w0 = int(rect.width())
     h0 = int(rect.height())
 
-    # 1. Расширяем область до квадрата, кратного 8
+    # 1. Расширяем область до квадрата, кратного 8, не менее 512px
     S = max(w0 + 2 * min_padding, h0 + 2 * min_padding)
+    S = max(S, 512)
     S = ((S + 7) // 8) * 8
     
     cx = x0 + w0 // 2

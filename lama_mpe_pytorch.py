@@ -647,50 +647,6 @@ class LamaMPEPyTorchInpainter:
         if pad_h > 0 or pad_w > 0:
             img_inpainted = img_inpainted[0:height, 0:width]
 
-        # === 2. Измерение шума с исключением ребер (локальная дисперсия) ===
-        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        blurred_orig = cv2.GaussianBlur(gray_orig, (3, 3), 0)
-        hp_noise = cv2.subtract(gray_orig, blurred_orig)
-        
-        # Вычисляем локальное стандартное отклонение для исключения резких ребер
-        gray_float = gray_orig.astype(np.float32)
-        mean_local = cv2.boxFilter(gray_float, -1, (3, 3))
-        sq_mean_local = cv2.boxFilter(gray_float**2, -1, (3, 3))
-        var_local = np.maximum(sq_mean_local - mean_local**2, 0)
-        std_local = np.sqrt(var_local)
-        
-        # Ищем плоские текстурные области без резких контуров
-        flat_mask = (std_local < 15.0) & (mask < 127)
-        
-        # Если плоских пикселей достаточно (>10% невыделенного), меряем по ним,
-        # иначе (например, плотный скринтон) меряем по всей области.
-        unmasked_total = np.sum(mask < 127)
-        if np.sum(flat_mask) > 0.1 * unmasked_total:
-            unmasked_pixels = hp_noise[flat_mask]
-        else:
-            unmasked_pixels = hp_noise[mask < 127]
-            
-        noise_std = np.std(unmasked_pixels) if unmasked_pixels.size > 0 else 0.0
-        # Ослабляем шум в 2 раза и ставим жесткий лимит (max 1.8),
-        # чтобы он оставался едва заметным и не выделялся "грязным" прямоугольником.
-        noise_std = min(noise_std * 0.5, 1.8)
-        
-        if noise_std > 0.1:
-            # Генерируем 3-канальный шум
-            noise_img = np.random.normal(0, noise_std, (height, width, 3)).astype(np.float32)
-            
-            # Размываем шум (GaussianBlur), чтобы он стал "крупнозернистым" (clumpy)
-            # и визуально соответствовал размеру печатных точек скринтона (halftone dot gain)
-            noise_img = cv2.GaussianBlur(noise_img, (3, 3), 0.5)
-            
-            # Модулируем шум по яркости: гасим его на краях диапазона (0 и 255)
-            # чтобы белый фон оставался идеально белым, а черный - черным.
-            inpainted_float = img_inpainted.astype(np.float32)
-            f_noise = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
-            f_noise = np.clip(f_noise, 0.0, 1.0)
-            
-            img_inpainted_floats = inpainted_float + noise_img * mask_original_3d * f_noise
-            img_inpainted = np.clip(img_inpainted_floats, 0, 255).astype(np.uint8)
 
         # === 3. Мягкое смешивание краев (Tighter Feathering) ===
         mask_bin = mask_original.astype(np.float32)
