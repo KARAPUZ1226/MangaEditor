@@ -808,11 +808,11 @@ class LamaMPEPyTorchInpainter:
         print(f"[LaMa PyTorch DEBUG] Best shift found: dx={best_dx}, dy={best_dy}")
         if best_dx != 0 or best_dy != 0:
             # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
-            img_donor = img_original.copy()
+            img_donor = img_inpainted.copy()
             working_mask = mask_original.copy()
             donor_mask = mask_original.copy()
             
-            img_smooth_bgr = cv2.GaussianBlur(img_original, (7, 7), 0)
+            img_smooth_bgr = cv2.GaussianBlur(img_inpainted, (7, 7), 0)
             img_donor_smooth = img_smooth_bgr.copy()
             working_mask_smooth = mask_original.copy()
             donor_mask_smooth = mask_original.copy()
