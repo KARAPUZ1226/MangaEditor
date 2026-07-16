@@ -1010,7 +1010,7 @@ class MangaEditorApp(QMainWindow):
         if not active_layer:
             return
             
-        if self.layers and active_layer == self.layers[0] and self.view.tool != "restore":
+        if self.layers and active_layer == self.layers[0] and self.view.tool not in ["restore", "inpaint"]:
             self.statusBar().showMessage("Предупреждение: Рисование на оригинальном слое заблокировано! Выберите другой слой.", 3000)
             return
             
@@ -1032,6 +1032,86 @@ class MangaEditorApp(QMainWindow):
     def on_canvas_draw_end(self):
         active_layer = self.get_active_layer()
         if active_layer and self.draw_start_image is not None and self.view.tool in ["brush", "eraser", "inpaint", "restore"]:
+            if self.view.tool == "inpaint":
+                # Воспроизводим поведение Spot Healing Brush (Кисть удаления)
+                h, w = active_layer.image.height(), active_layer.image.width()
+                
+                curr_qimg = active_layer.image.convertToFormat(QImage.Format_ARGB32)
+                start_qimg = self.draw_start_image.convertToFormat(QImage.Format_ARGB32)
+                
+                curr_ptr = curr_qimg.bits()
+                start_ptr = start_qimg.bits()
+                
+                curr_arr = np.array(curr_ptr).reshape(h, w, 4)
+                start_arr = np.array(start_ptr).reshape(h, w, 4)
+                
+                # Ищем где изменился альфа-канал или цвета (красный штрих)
+                diff = np.any(curr_arr != start_arr, axis=-1)
+                
+                if np.any(diff):
+                    mask = (diff.astype(np.uint8) * 255)
+                    
+                    if self.original_cv_image is not None:
+                        # Подгружаем LaMa при необходимости
+                        self.check_and_load_lama(prompt=False)
+                        
+                        try:
+                            self.statusBar().showMessage("ИИ стирает и дорисовывает выделенную кистью область...")
+                            QApplication.processEvents()
+                            
+                            h_bg, w_bg = self.layers[0].image.height(), self.layers[0].image.width()
+                            
+                            # Берём чистый BGR до мазка
+                            if active_layer == self.layers[0]:
+                                start_bgr_qimg = self.draw_start_image.convertToFormat(QImage.Format_BGR888)
+                                start_bgr_ptr = start_bgr_qimg.bits()
+                                bg_cv = np.array(start_bgr_ptr).reshape(h_bg, w_bg, 3).copy()
+                            else:
+                                bg_qimg = self.layers[0].image.convertToFormat(QImage.Format_BGR888)
+                                bg_ptr = bg_qimg.bits()
+                                bg_cv = np.array(bg_ptr).reshape(h_bg, w_bg, 3).copy()
+                            
+                            # Запуск Inpainting
+                            if self.lama_inpainter is not None:
+                                inpainted = self.lama_inpainter.inpaint(bg_cv, mask)
+                            else:
+                                inpainted = cv2.inpaint(bg_cv, mask, 3, cv2.INPAINT_TELEA)
+                                
+                            bg_before_cv = self.original_cv_image.copy()
+                            self.original_cv_image = inpainted.copy()
+                            
+                            # Конвертируем обратно в QImage
+                            inpainted_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+                            q_img = QImage(inpainted_rgb.data, w_bg, h_bg, w_bg * 3, QImage.Format_RGB888).copy()
+                            
+                            bg_before = self.layers[0].image.copy()
+                            self.layers[0].image = q_img
+                            self.layers[0].setPixmap(QPixmap.fromImage(q_img))
+                            
+                            # Фиксируем в Undo
+                            desc = "ИИ Кисть удаления"
+                            cmd = UndoPaintCommand(self.layers[0], bg_before, self.layers[0].image, desc, self)
+                            cmd.set_cv_images(bg_before_cv, self.original_cv_image)
+                            self.undo_stack.push(cmd)
+                            
+                        except Exception as e:
+                            print(f"Inpaint brush error: {e}")
+                            self.statusBar().showMessage(f"Ошибка ИИ: {e}", 3000)
+                
+                # Если рисовали на прозрачном слое — очищаем его от красного штриха
+                if active_layer != self.layers[0]:
+                    active_layer.image = self.draw_start_image.copy()
+                    active_layer.setPixmap(QPixmap.fromImage(active_layer.image))
+                else:
+                    # Если рисовали на оригинальном слое, то красная линия заменяется на результат inpaint
+                    pass
+                    
+                self.draw_start_image = None
+                self.sync_history_list()
+                self.statusBar().showMessage("Область успешно очищена ИИ!", 3000)
+                return
+            
+            # Стандартная обработка для остальных инструментов (кисть, ластик, восстановление)
             if active_layer == self.layers[0]:
                 h, w = active_layer.image.height(), active_layer.image.width()
                 temp_qimg = active_layer.image.convertToFormat(QImage.Format_BGR888)
