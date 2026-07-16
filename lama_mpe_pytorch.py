@@ -750,14 +750,19 @@ class LamaMPEPyTorchInpainter:
         # Маска "живых" (невыделенных) пикселей: 1.0 = фон, 0.0 = закрашенная область
         live_mask = (mask_original == 0).astype(np.float32)
         
-        # Находим центр кропа и вырезаем 256x256 регион для быстрого поиска сдвига
-        # (256x256 дает огромную скорость работы ~0.2 сек и 100% точность для скринтона)
+        # Находим центр выделения пользователя для локального поиска сдвига текстуры
+        y_indices, x_indices = np.where(mask_original == 1)
+        if len(y_indices) > 0:
+            cy_box = int(y_indices.mean())
+            cx_box = int(x_indices.mean())
+        else:
+            cy_box, cx_box = height // 2, width // 2
+            
         sub_size = 256
-        cy, cx = height // 2, width // 2
-        y0_sub = max(0, cy - sub_size // 2)
-        y1_sub = min(height, cy + sub_size // 2)
-        x0_sub = max(0, cx - sub_size // 2)
-        x1_sub = min(width, cx + sub_size // 2)
+        y0_sub = max(0, cy_box - sub_size // 2)
+        y1_sub = min(height, cy_box + sub_size // 2)
+        x0_sub = max(0, cx_box - sub_size // 2)
+        x1_sub = min(width, cx_box + sub_size // 2)
         
         gray_sub = gray_original[y0_sub:y1_sub, x0_sub:x1_sub]
         mask_sub = live_mask[y0_sub:y1_sub, x0_sub:x1_sub]
@@ -800,6 +805,7 @@ class LamaMPEPyTorchInpainter:
                         best_dx, best_dy = dx, dy
                         
         # Если сдвиг найден, накладываем текстуру скринтона
+        print(f"[LaMa PyTorch DEBUG] Best shift found: dx={best_dx}, dy={best_dy}")
         if best_dx != 0 or best_dy != 0:
             # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
             img_donor = img_original.copy()
@@ -821,17 +827,22 @@ class LamaMPEPyTorchInpainter:
                 shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
                 shifted_mask = cv2.warpAffine(donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
-                copy_map = (working_mask == 1) & (shifted_mask == 0)
+                # Анализируем яркость смещенного донора (игнорируем черные линии контуров < 110)
+                shifted_gray = cv2.cvtColor(shifted_img, cv2.COLOR_BGR2GRAY)
+                
+                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми и чистыми (> 110)
+                copy_map = (working_mask == 1) & (shifted_mask == 0) & (shifted_gray > 110)
                 img_donor[copy_map] = shifted_img[copy_map]
                 donor_mask[copy_map] = 0
                 working_mask[copy_map] = 0
                 
-                # Аналогично для сглаженного донора
+                # Analogously for the smoothed donor
                 shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
                 shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0)
+                shifted_smooth_gray = cv2.cvtColor(shifted_smooth, cv2.COLOR_BGR2GRAY)
+                
+                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0) & (shifted_smooth_gray > 110)
                 img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
                 donor_mask_smooth[copy_map_smooth] = 0
                 working_mask_smooth[copy_map_smooth] = 0
