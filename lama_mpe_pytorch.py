@@ -862,6 +862,16 @@ class LamaMPEPyTorchInpainter:
             # Высокочастотная текстура: разность синтеза и сглаженного инпейнта
             hp_texture = synth_screentone - img_smooth_bgr.astype(np.float32)
             
+            # 5. Выделяем контуры и линии рисунка (Line Reinsertion), чтобы вернуть им сплошной цвет
+            inpainted_gray = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+            inpainted_edges = cv2.Canny(inpainted_gray, 30, 80)
+            dilated_inpainted_edges = cv2.dilate(inpainted_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+            dark_pixels = (inpainted_gray < 80)
+            line_mask_inpainted = ((dilated_inpainted_edges > 0) | dark_pixels).astype(np.float32)
+            
+            # Гасим текстуру скринтона на линиях рисунка, оставляя их сплошными
+            hp_texture = hp_texture * (1.0 - line_mask_inpainted[:, :, None])
+            
             # Фильтр яркости (модуляция): гасим текстуру на чисто белом (баблы) и чисто черном (контуры)
             # чтобы точки скринтона не залезали на белый текст и не размывали черную обводку
             inpainted_float = img_inpainted.astype(np.float32)
