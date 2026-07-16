@@ -597,34 +597,79 @@ class LamaMPEPyTorchInpainter:
         print(f"[LaMa PyTorch] Loading checkpoint {model_path} to {self.device}...")
         self.model = load_lama_mpe(model_path, self.device)
         self.model.eval()
+        
+        # Загружаем text segmenter (U-Net) для точного удаления только текста
+        segmenter_path = os.path.join(os.path.dirname(model_path), "segmenter.onnx")
+        if os.path.exists(segmenter_path):
+            import onnxruntime as ort
+            self.segmenter = ort.InferenceSession(segmenter_path, providers=['CPUExecutionProvider'])
+            print(f"[LaMa PyTorch] Loaded text segmenter from {segmenter_path}")
+        else:
+            self.segmenter = None
+            print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
         
-        # === 0. Автоматическое уточнение маски ===
-        # Находим все темные пиксели (текст, обводки, контуры)
-        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        binary_dark = (gray_orig < 145).astype(np.uint8)
-        
-        # Находим связные компоненты, чтобы отсеять мелкие точки скринтона (обычно площадь < 15-20 пикселей)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
-        
-        text_mask = np.zeros_like(binary_dark)
-        for i in range(1, num_labels):
-            # Если площадь компонента больше 35 пикселей - это буквы или линии рисунка, сохраняем их
-            if stats[i, cv2.CC_STAT_AREA] > 35:
-                text_mask[labels == i] = 255
+        # === 0. Автоматическое уточнение маски через U-Net segmenter ===
+        if self.segmenter is not None:
+            try:
+                # 1. Готовим изображение для U-Net (Grayscale, 256x256)
+                ch, cw = img_original.shape[:2]
+                crop_gray = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                crop_resized = cv2.resize(crop_gray, (256, 256))
                 
-        # Расширяем маску на 4 пикселя (дилатация), чтобы полностью перекрыть белые обводки букв
-        kernel = np.ones((3, 3), np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
+                input_blob = crop_resized.astype(np.float32) / 255.0
+                input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
+                input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 256, 256]
+                
+                # 2. Инференс U-Net
+                outputs = self.segmenter.run(None, {"input": input_blob})
+                logits = outputs[0][0][0]
+                probs = 1.0 / (1.0 + np.exp(-logits))
+                
+                # 3. Бинаризация маски U-Net (порог 0.5)
+                mask_256 = (probs > 0.5).astype(np.uint8) * 255
+                unet_mask = cv2.resize(mask_256, (cw, ch), interpolation=cv2.INTER_NEAREST)
+                
+                # 4. Расширяем полученную маску U-Net на 5 пикселей (дилатация),
+                # чтобы гарантированно и с запасом перекрыть белые обводки и антиалиасинг букв.
+                kernel = np.ones((3, 3), np.uint8)
+                unet_mask_dilated = cv2.dilate(unet_mask, kernel, iterations=5)
+                
+                # 5. Пересекаем с исходным прямоугольным выделением пользователя
+                mask_refined = np.copy(mask)
+                mask_refined[unet_mask_dilated == 0] = 0
+            except Exception as e:
+                print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
+                # Откат к связным компонентам
+                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                binary_dark = (gray_orig < 145).astype(np.uint8)
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+                text_mask = np.zeros_like(binary_dark)
+                for i in range(1, num_labels):
+                    if stats[i, cv2.CC_STAT_AREA] > 35:
+                        text_mask[labels == i] = 255
+                kernel = np.ones((3, 3), np.uint8)
+                text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
+                mask_refined = np.copy(mask)
+                mask_refined[text_mask_dilated == 0] = 0
+        else:
+            # Откат к связным компонентам если U-Net не загружен
+            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+            binary_dark = (gray_orig < 145).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+            text_mask = np.zeros_like(binary_dark)
+            for i in range(1, num_labels):
+                if stats[i, cv2.CC_STAT_AREA] > 35:
+                    text_mask[labels == i] = 255
+            kernel = np.ones((3, 3), np.uint8)
+            text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
+            mask_refined = np.copy(mask)
+            mask_refined[text_mask_dilated == 0] = 0
         
-        # Пересекаем с маской выделения пользователя
-        mask_refined = np.copy(mask)
-        mask_refined[text_mask_dilated == 0] = 0
-        
-        # Если после фильтрации маска пуста (например, стираем чистый фон), откатываемся к оригиналу
+        # Если после фильтрации маска пуста, откатываемся к оригиналу
         if np.sum(mask_refined >= 127) < 10:
             mask_refined = mask
 
