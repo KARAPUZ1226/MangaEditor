@@ -819,19 +819,16 @@ class LamaMPEPyTorchInpainter:
             
             M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
-            # 6 шагов сдвига покроют маску шириной до 6 * 16 = 96 пикселей с каждой стороны
-            for _ in range(6):
+            # 20 шагов сдвига гарантированно покроют маску любой ширины при малых периодах (например, 3 пикселя)
+            for _ in range(20):
                 if np.sum(working_mask) == 0:
                     break
                 # Сдвигаем текущих доноров
                 shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
                 shifted_mask = cv2.warpAffine(donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                # Анализируем яркость смещенного донора (игнорируем черные линии контуров < 110)
-                shifted_gray = cv2.cvtColor(shifted_img, cv2.COLOR_BGR2GRAY)
-                
-                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми и чистыми (> 110)
-                copy_map = (working_mask == 1) & (shifted_mask == 0) & (shifted_gray > 110)
+                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
+                copy_map = (working_mask == 1) & (shifted_mask == 0)
                 img_donor[copy_map] = shifted_img[copy_map]
                 donor_mask[copy_map] = 0
                 working_mask[copy_map] = 0
@@ -840,9 +837,7 @@ class LamaMPEPyTorchInpainter:
                 shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
                 shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                shifted_smooth_gray = cv2.cvtColor(shifted_smooth, cv2.COLOR_BGR2GRAY)
-                
-                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0) & (shifted_smooth_gray > 110)
+                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0)
                 img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
                 donor_mask_smooth[copy_map_smooth] = 0
                 working_mask_smooth[copy_map_smooth] = 0
