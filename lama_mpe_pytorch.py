@@ -603,19 +603,19 @@ class LamaMPEPyTorchInpainter:
         img_original = np.copy(image)
         
         # === 0. Автоматическое уточнение маски ===
-        # Выделяем только темный текст (<110) и светлую обводку (>210),
+        # Выделяем только темный текст (<135) и светлую обводку (>200),
         # оставляя средние серые тона скринтонов в качестве "живого" фона.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        text_pixels = (gray_orig < 110) | (gray_orig > 210)
+        text_pixels = (gray_orig < 135) | (gray_orig > 200)
         
         mask_refined = np.copy(mask)
         mask_refined[~text_pixels] = 0
         
-        # Если уточненная маска не пуста, расширяем её на 2 пикселя (дилатация),
+        # Если уточненная маска не пуста, расширяем её на 3 пикселя (дилатация),
         # чтобы гарантированно покрыть антиалиасинг (сглаживание) по краям букв
         if np.sum(mask_refined >= 127) >= 10:
             kernel = np.ones((3, 3), np.uint8)
-            mask_refined = cv2.dilate(mask_refined, kernel, iterations=2)
+            mask_refined = cv2.dilate(mask_refined, kernel, iterations=3)
         else:
             mask_refined = mask
 
@@ -691,8 +691,6 @@ class LamaMPEPyTorchInpainter:
         for dx in search_range:
             for dy in search_range:
                 if dx == 0 and dy == 0:
-                    continue
-                if abs(dx) < 3 and abs(dy) < 3:
                     continue
                 
                 # Координаты пересечения оригинального и смещенного окон
