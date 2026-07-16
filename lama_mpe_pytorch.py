@@ -603,20 +603,29 @@ class LamaMPEPyTorchInpainter:
         img_original = np.copy(image)
         
         # === 0. Автоматическое уточнение маски ===
-        # Выделяем только темный текст (<135) и светлую обводку (>200),
-        # оставляя средние серые тона скринтонов в качестве "живого" фона.
+        # Находим все темные пиксели (текст, обводки, контуры)
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        text_pixels = (gray_orig < 135) | (gray_orig > 200)
+        binary_dark = (gray_orig < 145).astype(np.uint8)
         
+        # Находим связные компоненты, чтобы отсеять мелкие точки скринтона (обычно площадь < 15-20 пикселей)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+        
+        text_mask = np.zeros_like(binary_dark)
+        for i in range(1, num_labels):
+            # Если площадь компонента больше 35 пикселей - это буквы или линии рисунка, сохраняем их
+            if stats[i, cv2.CC_STAT_AREA] > 35:
+                text_mask[labels == i] = 255
+                
+        # Расширяем маску на 4 пикселя (дилатация), чтобы полностью перекрыть белые обводки букв
+        kernel = np.ones((3, 3), np.uint8)
+        text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
+        
+        # Пересекаем с маской выделения пользователя
         mask_refined = np.copy(mask)
-        mask_refined[~text_pixels] = 0
+        mask_refined[text_mask_dilated == 0] = 0
         
-        # Если уточненная маска не пуста, расширяем её на 3 пикселя (дилатация),
-        # чтобы гарантированно покрыть антиалиасинг (сглаживание) по краям букв
-        if np.sum(mask_refined >= 127) >= 10:
-            kernel = np.ones((3, 3), np.uint8)
-            mask_refined = cv2.dilate(mask_refined, kernel, iterations=3)
-        else:
+        # Если после фильтрации маска пуста (например, стираем чистый фон), откатываемся к оригиналу
+        if np.sum(mask_refined >= 127) < 10:
             mask_refined = mask
 
         mask_original = np.copy(mask_refined)
