@@ -83,7 +83,7 @@ def _build_text_mask(crop, dilation_px=4):
 
     # 2. Поиск текста: absdiff от медианы фона
     diff = cv2.absdiff(gray_filtered, bg_median)
-    thresh_val = max(18, int(bg_std * 2.0))
+    thresh_val = max(30, int(bg_std * 2.5))
     _, text_candidates = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
 
     # 3. Connected components — фильтруем шум и границы баблов
@@ -135,7 +135,7 @@ def _build_text_mask(crop, dilation_px=4):
     return text_mask, bg_color, bg_median, bg_std
 
 
-def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=4, lama_inpainter=None, text_segmenter=None):
+def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=2, lama_inpainter=None, text_segmenter=None):
     """
     Очищает текст внутри всех заданных прямоугольников баблов.
     text_segmenter пока не используется (зарезервирован для будущей дообученной модели).
@@ -172,19 +172,16 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=4, lama_inpainte
 
         text_mask, bg_color, bg_median, bg_std = result
 
-        # Заполнение
-        if bg_median > 195 or bg_std < 18.0:
-            crop[text_mask == 255] = bg_color
+        # Заполнение: LaMa дорисовывает фон, fallback — заливка медианным цветом
+        if lama_inpainter is not None:
+            try:
+                inpainted = lama_inpainter.inpaint(crop, text_mask)
+                crop[:] = inpainted
+            except Exception as e:
+                print(f"LaMa error: {e}")
+                crop[text_mask == 255] = bg_color
         else:
-            if lama_inpainter is not None:
-                try:
-                    inpainted = lama_inpainter.inpaint(crop, text_mask)
-                    crop[:] = inpainted
-                except Exception as e:
-                    print(f"LaMa error: {e}")
-                    crop[:] = cv2.inpaint(crop, text_mask, 3, cv2.INPAINT_TELEA)
-            else:
-                crop[:] = cv2.inpaint(crop, text_mask, 3, cv2.INPAINT_TELEA)
+            crop[text_mask == 255] = bg_color
 
         cv_image[y:y+h, x:x+w] = crop
         cleaned_count += 1
@@ -192,7 +189,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=4, lama_inpainte
     return cv_image, cleaned_count
 
 
-def smart_inpaint_rect(cv_image, rect, dilation_pixels=4, lama_inpainter=None, text_segmenter=None):
+def smart_inpaint_rect(cv_image, rect, dilation_pixels=2, lama_inpainter=None, text_segmenter=None):
     """
     Очищает текст внутри ручного прямоугольного выделения.
     """
@@ -218,17 +215,14 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=4, lama_inpainter=None, t
 
     text_mask, bg_color, bg_median, bg_std = result
 
-    if bg_median > 195 or bg_std < 18.0:
-        crop[text_mask == 255] = bg_color
+    if lama_inpainter is not None:
+        try:
+            crop = lama_inpainter.inpaint(crop, text_mask)
+        except Exception as e:
+            print(f"LaMa error: {e}")
+            crop[text_mask == 255] = bg_color
     else:
-        if lama_inpainter is not None:
-            try:
-                crop = lama_inpainter.inpaint(crop, text_mask)
-            except Exception as e:
-                print(f"LaMa error: {e}")
-                crop = cv2.inpaint(crop, text_mask, 3, cv2.INPAINT_TELEA)
-        else:
-            crop = cv2.inpaint(crop, text_mask, 3, cv2.INPAINT_TELEA)
+        crop[text_mask == 255] = bg_color
 
     cv_image[y:y+h, x:x+w] = crop
     return cv_image
