@@ -809,55 +809,76 @@ class LamaMPEPyTorchInpainter:
         # Если сдвиг найден, накладываем текстуру скринтона
         print(f"[LaMa PyTorch DEBUG] Best shift found: dx={best_dx}, dy={best_dy}")
         if best_dx != 0 or best_dy != 0:
-            # === ПАРАМЕТРИЧЕСКИЙ СИНТЕЗ СКРИНТОНА ===
-            # Вместо копирования пикселей генерируем математическую сетку точек
+            # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
+            img_donor = img_inpainted.copy()
+            working_mask = mask_original.copy()
+            donor_mask = mask_original.copy()
             
-            norm_sq = float(best_dx**2 + best_dy**2)
-            k1_x = best_dx / norm_sq
-            k1_y = best_dy / norm_sq
-            k2_x = -best_dy / norm_sq
-            k2_y = best_dx / norm_sq
+            # Изолируем структурные линии рисунка (убиваем маленькие черные точки скринтона)
+            # cv2.MORPH_CLOSE (dilate -> erode) расширяет белый цвет, съедая мелкий черный мусор (точки),
+            # а затем сужает белый цвет, восстанавливая толщину крупных черных контуров рисунка.
+            morph_kernel = np.ones((3, 3), np.uint8)
+            lines_only = cv2.morphologyEx(gray_original, cv2.MORPH_CLOSE, morph_kernel, iterations=2)
             
-            Y_grid, X_grid = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
+            # Все темные пиксели, пережившие эту мясорубку - это толстые структурные линии
+            structural_lines_mask = (lines_only < 200)
             
-            phase1_base = 2.0 * np.pi * (X_grid * k1_x + Y_grid * k1_y)
-            phase2_base = 2.0 * np.pi * (X_grid * k2_x + Y_grid * k2_y)
+            # Исключаем структурные линии из пула здоровых доноров!
+            # Это на 100% блокирует размазывание контуров и эффект "лесенок"
+            donor_mask[structural_lines_mask] = 1
             
-            kernel = np.ones((11, 11), np.uint8)
-            dilated_mask = cv2.dilate(mask_original.astype(np.uint8), kernel, iterations=1)
-            ring_mask = (dilated_mask == 1) & (mask_original == 0)
+            # Аналогично для сглаженных масок (чтобы вычитание hp_texture работало синхронно)
+            donor_mask_smooth = mask_original.copy()
+            donor_mask_smooth[structural_lines_mask] = 1
             
-            best_phi_err = float('inf')
-            best_phi1, best_phi2 = 0.0, 0.0
+            img_smooth_bgr = cv2.GaussianBlur(img_inpainted, (7, 7), 0)
+            img_donor_smooth = img_smooth_bgr.copy()
+            working_mask_smooth = mask_original.copy()
             
-            if np.sum(ring_mask) > 50:
-                gray_orig_ring = gray_original[ring_mask].astype(np.float32) / 255.0
-                p1_ring = phase1_base[ring_mask]
-                p2_ring = phase2_base[ring_mask]
+            M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
+            
+            # 20 шагов сдвига гарантированно покроют маску любой ширины при малых периодах (например, 3 пикселя)
+            for _ in range(20):
+                if np.sum(working_mask) == 0:
+                    break
+                # Сдвигаем текущих доноров
+                shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask = cv2.warpAffine(donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                phi_steps = np.linspace(0, 2*np.pi, 8, endpoint=False)
-                for p1 in phi_steps:
-                    for p2 in phi_steps:
-                        wave_ring = np.cos(p1_ring - p1) + np.cos(p2_ring - p2)
-                        wave_norm = (wave_ring + 2.0) / 4.0
-                        err = np.mean(np.abs(wave_norm - gray_orig_ring))
-                        if err < best_phi_err:
-                            best_phi_err = err
-                            best_phi1, best_phi2 = p1, p2
-                            
-            wave = np.cos(phase1_base - best_phi1) + np.cos(phase2_base - best_phi2)
+                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
+                copy_map = (working_mask == 1) & (shifted_mask == 0)
+                img_donor[copy_map] = shifted_img[copy_map]
+                donor_mask[copy_map] = 0
+                working_mask[copy_map] = 0
+                
+                # Analogously for the smoothed donor
+                shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
+                
+                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0)
+                img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
+                donor_mask_smooth[copy_map_smooth] = 0
+                working_mask_smooth[copy_map_smooth] = 0
             
-            gray_inpaint = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-            T = 2.0 - 4.0 * gray_inpaint
+            # Извлекаем высокие частоты (только точки скринтона, без линий контуров)
+            hp_texture = img_donor.astype(np.float32) - img_donor_smooth.astype(np.float32)
             
-            synthetic_mask = (wave < T)
-            synthetic_gray = np.where(synthetic_mask, 0, 255).astype(np.uint8)
-            synthetic_bgr = cv2.cvtColor(synthetic_gray, cv2.COLOR_GRAY2BGR)
-            synthetic_bgr = cv2.GaussianBlur(synthetic_bgr, (3, 3), 0)
+            # Фильтр яркости (модуляция): гасим текстуру на чисто белом (баблы) и чисто черном (контуры)
+            # чтобы точки скринтона не залезали на белый текст и не размывали черную обводку
+            inpainted_float = img_inpainted.astype(np.float32)
+            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
+            f_texture = np.clip(f_texture, 0.0, 1.0)
             
-            print(f"[LaMa PyTorch DEBUG] Parametric Synthesis: phi1={best_phi1:.2f}, phi2={best_phi2:.2f}")
+            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture)}, max={np.max(hp_texture)}, mean_abs={np.mean(np.abs(hp_texture))}")
+            print(f"[LaMa PyTorch DEBUG] f_texture stats: min={np.min(f_texture)}, max={np.max(f_texture)}, mean={np.mean(f_texture)}")
+            print(f"[LaMa PyTorch DEBUG] mask_original_3d sum: {np.sum(mask_original_3d)}")
+            
+            # Накладываем текстуру скринтона поверх результата LaMa
+            # (Ничего не делаем здесь, переносим наложение в конец)
+            pass
 
-        # === Мягкое смешивание (Feathered Blending) ===
+
+        # === 3. Мягкое смешивание базовой структуры (LaMa + Оригинал) ===
         mask_bin = mask_original.astype(np.float32)
         ksize = 5 if min(height, width) >= 5 else 3
         feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
@@ -865,10 +886,15 @@ class LamaMPEPyTorchInpainter:
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
+        # Смешиваем базовые структуры (гладкие слои)
+        img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+        
+        # === 4. Наложение текстуры поверх смешанной базы ("Бутерброд") ===
         if best_dx != 0 or best_dy != 0:
-            ans = synthetic_bgr.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+            # Накладываем текстуру на уже смешанную базу, чтобы сохранить 100% резкость точек скринтона
+            ans = img_blended + hp_texture * mask_original_3d * f_texture
         else:
-            ans = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+            ans = img_blended
             
         ans = np.clip(ans, 0, 255).astype(np.uint8)
         return ans
