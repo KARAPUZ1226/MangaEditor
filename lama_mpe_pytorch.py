@@ -665,6 +665,10 @@ class LamaMPEPyTorchInpainter:
                         
                 combined_lines = cv2.bitwise_or(all_black_lines, speedlines_mask)
                 
+                # Физически разрываем связь между текстом и фоном: обнуляем пиксели букв, найденные U-Net,
+                # чтобы они не объединялись с фоновыми контурами в один компонент.
+                combined_lines[unet_mask > 0] = 0
+                
                 # Анализируем компоненты: те, что касаются границ кропа или являются очень длинными, помечаем как защищенные
                 num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_lines, connectivity=8)
                 protected_lines = np.zeros_like(combined_lines)
