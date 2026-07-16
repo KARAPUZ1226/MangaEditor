@@ -618,12 +618,14 @@ class LamaMPEPyTorchInpainter:
                 # 1. Готовим изображение для U-Net (Grayscale, ресайз ТОЛЬКО области выделения пользователя)
                 ch, cw = img_original.shape[:2]
                 gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                print(f"[LaMa PyTorch DEBUG] Crop shape: {ch}x{cw}")
                 
                 # Ищем точные границы выделения пользователя на маске
                 y_indices, x_indices = np.where(mask >= 127)
                 if len(y_indices) > 0:
                     y0_box, y1_box = y_indices.min(), y_indices.max() + 1
                     x0_box, x1_box = x_indices.min(), x_indices.max() + 1
+                    print(f"[LaMa PyTorch DEBUG] BBox found: {y1_box-y0_box}x{x1_box-x0_box} at ({x0_box},{y0_box})")
                     
                     # Вырезаем область выделения и приводим к 256x256 (соответствует обучающей выборке U-Net)
                     bbox_gray = gray_orig[y0_box:y1_box, x0_box:x1_box]
@@ -661,7 +663,7 @@ class LamaMPEPyTorchInpainter:
                 lines = cv2.HoughLinesP(all_black_lines, 1, np.pi/180, threshold=50, minLineLength=40, maxLineGap=10)
                 if lines is not None:
                     for line in lines:
-                        x1, y1, x2, y2 = line[0]
+                        x1, y1, x2, y2 = line.flatten()
                         cv2.line(speedlines_mask, (x1, y1), (x2, y2), 255, 3)
                         
                 combined_lines = cv2.bitwise_or(all_black_lines, speedlines_mask)
@@ -701,15 +703,24 @@ class LamaMPEPyTorchInpainter:
                 combined_text_mask[unet_mask > 0] = 255
                 combined_text_mask[white_outline] = 255
                 
+                print(f"[LaMa PyTorch DEBUG] unet_mask active: {np.sum(unet_mask > 0)}, combined_text_mask active: {np.sum(combined_text_mask > 0)}")
+                
                 # Слегка расширяем объединенную маску на 2 пикселя для сглаживания краев (антиалиасинга)
                 unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=2)
+                
+                print(f"[LaMa PyTorch DEBUG] unet_mask_refined before protection: {np.sum(unet_mask_refined > 0)}")
+                print(f"[LaMa PyTorch DEBUG] protected_lines active: {np.sum(protected_lines > 0)}")
                 
                 # Исключаем защищенные линии рисунка из маски закрашивания
                 unet_mask_refined[protected_lines > 0] = 0
                 
+                print(f"[LaMa PyTorch DEBUG] unet_mask_refined after protection: {np.sum(unet_mask_refined > 0)}")
+                
                 # 6. Пересекаем с исходным прямоугольным выделением пользователя
                 mask_refined = np.copy(mask)
                 mask_refined[unet_mask_refined == 0] = 0
+                
+                print(f"[LaMa PyTorch DEBUG] mask_refined final active: {np.sum(mask_refined >= 127)}")
             except Exception as e:
                 print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
                 # Откат к связным компонентам
