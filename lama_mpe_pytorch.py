@@ -846,18 +846,27 @@ class LamaMPEPyTorchInpainter:
             f_texture = np.clip(f_texture, 0.0, 1.0)
             
             # Накладываем текстуру скринтона поверх результата LaMa
-            img_inpainted_floats = inpainted_float + hp_texture * mask_original_3d * f_texture
-            img_inpainted = np.clip(img_inpainted_floats, 0, 255).astype(np.uint8)
+            # (Ничего не делаем здесь, переносим наложение в конец)
+            pass
 
 
-        # === 3. Мягкое смешивание краев (Tighter Feathering) ===
+        # === 3. Мягкое смешивание базовой структуры (LaMa + Оригинал) ===
         mask_bin = mask_original.astype(np.float32)
         ksize = 5 if min(height, width) >= 5 else 3
         feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
-            
+        
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
-        ans = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+        # Смешиваем базовые структуры (гладкие слои)
+        img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+        
+        # === 4. Наложение текстуры поверх смешанной базы ("Бутерброд") ===
+        if best_dx != 0 or best_dy != 0:
+            # Накладываем текстуру на уже смешанную базу, чтобы сохранить 100% резкость точек скринтона
+            ans = img_blended + hp_texture * mask_original_3d * f_texture
+        else:
+            ans = img_blended
+            
         ans = np.clip(ans, 0, 255).astype(np.uint8)
         return ans
