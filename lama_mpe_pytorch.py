@@ -614,11 +614,17 @@ class LamaMPEPyTorchInpainter:
         pad_w = (pad_size - (width % pad_size)) % pad_size
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Предобработка: Двусторонний фильтр (Bilateral Filter) для размытия скринтонов
+        # Он сглаживает мелкоточечные шумы (скринтоны), но оставляет контурные линии рисунка.
+        # Модели (LaMa) намного проще восстанавливать сглаженный серый градиент, чем сетку точек.
+        image_smooth = cv2.bilateralFilter(image_rgb, d=9, sigmaColor=50, sigmaSpace=50)
+
         if pad_h > 0 or pad_w > 0:
-            image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            image_padded = cv2.copyMakeBorder(image_smooth, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
             mask_padded = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
-            image_padded = image_rgb
+            image_padded = image_smooth
             mask_padded = mask
 
         img_torch = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze_(0).float() / 255.
@@ -665,11 +671,15 @@ class LamaMPEPyTorchInpainter:
             unmasked_pixels = hp_noise[mask < 127]
             
         noise_std = np.std(unmasked_pixels) if unmasked_pixels.size > 0 else 0.0
-        noise_std = min(noise_std, 6.0)  # Сдерживаем экстремальные шумы
+        noise_std = min(noise_std, 5.0)  # Сдерживаем экстремальные шумы
         
         if noise_std > 0.1:
             # Генерируем 3-канальный шум
             noise_img = np.random.normal(0, noise_std, (height, width, 3)).astype(np.float32)
+            
+            # Размываем шум (GaussianBlur), чтобы он стал "крупнозернистым" (clumpy)
+            # и визуально соответствовал размеру печатных точек скринтона (halftone dot gain)
+            noise_img = cv2.GaussianBlur(noise_img, (3, 3), 0.5)
             
             # Модулируем шум по яркости: гасим его на краях диапазона (0 и 255)
             # чтобы белый фон оставался идеально белым, а черный - черным.
