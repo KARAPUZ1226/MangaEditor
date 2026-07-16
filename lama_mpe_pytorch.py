@@ -633,14 +633,26 @@ class LamaMPEPyTorchInpainter:
                 mask_256 = (probs > 0.5).astype(np.uint8) * 255
                 unet_mask = cv2.resize(mask_256, (cw, ch), interpolation=cv2.INTER_NEAREST)
                 
-                # 4. Расширяем полученную маску U-Net на 5 пикселей (дилатация),
-                # чтобы гарантированно и с запасом перекрыть белые обводки и антиалиасинг букв.
+                # 4. Умный поиск обводки:
+                # Белая обводка (яркость > 210) должна быть непосредственно рядом с буквами.
+                # Расширяем маску букв всего на 2 пикселя, чтобы найти область обводки
                 kernel = np.ones((3, 3), np.uint8)
-                unet_mask_dilated = cv2.dilate(unet_mask, kernel, iterations=5)
+                near_text = cv2.dilate(unet_mask, kernel, iterations=2)
+                
+                # Выделяем белые пиксели обводки только вблизи букв
+                white_outline = (gray_orig > 210) & (near_text > 0)
+                
+                # Объединяем буквы и их обводку
+                combined_text_mask = np.zeros_like(unet_mask)
+                combined_text_mask[unet_mask > 0] = 255
+                combined_text_mask[white_outline] = 255
+                
+                # Слегка расширяем объединенную маску на 1 пиксель для сглаживания краев (антиалиасинга)
+                unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=1)
                 
                 # 5. Пересекаем с исходным прямоугольным выделением пользователя
                 mask_refined = np.copy(mask)
-                mask_refined[unet_mask_dilated == 0] = 0
+                mask_refined[unet_mask_refined == 0] = 0
             except Exception as e:
                 print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
                 # Откат к связным компонентам
