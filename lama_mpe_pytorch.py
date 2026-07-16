@@ -608,21 +608,21 @@ class LamaMPEPyTorchInpainter:
 
         height, width, c = image.shape
 
+        # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
         pad_size = 8
-        h, w, c = image.shape
-        new_h = ((pad_size - (h % pad_size)) + h) if h % pad_size != 0 else h
-        new_w = ((pad_size - (w % pad_size)) + w) if w % pad_size != 0 else w
+        pad_h = (pad_size - (height % pad_size)) % pad_size
+        pad_w = (pad_size - (width % pad_size)) % pad_size
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        if new_h != h or new_w != w:
-            image_resized = cv2.resize(image_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        if pad_h > 0 or pad_w > 0:
+            image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            mask_padded = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
-            image_resized = image_rgb
-            mask_resized = mask
+            image_padded = image_rgb
+            mask_padded = mask
 
-        img_torch = torch.from_numpy(image_resized).permute(2, 0, 1).unsqueeze_(0).float() / 255.
-        mask_torch = torch.from_numpy(mask_resized).unsqueeze_(0).unsqueeze_(0).float() / 255.0
+        img_torch = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze_(0).float() / 255.
+        mask_torch = torch.from_numpy(mask_padded).unsqueeze_(0).unsqueeze_(0).float() / 255.0
         mask_torch[mask_torch < 0.5] = 0
         mask_torch[mask_torch >= 0.5] = 1
 
@@ -637,30 +637,29 @@ class LamaMPEPyTorchInpainter:
 
         img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
 
-        if new_h != height or new_w != width:
-            img_inpainted = cv2.resize(img_inpainted, (width, height), interpolation=cv2.INTER_LINEAR)
+        # Обрезаем паддинг обратно
+        if pad_h > 0 or pad_w > 0:
+            img_inpainted = img_inpainted[0:height, 0:width]
 
-        # === 1. Измерение и подмешивание высокочастотного шума ===
+        # === 2. Измерение и подмешивание высокочастотного шума (до 8.0) ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         blurred_orig = cv2.GaussianBlur(gray_orig, (3, 3), 0)
         hp_noise = cv2.subtract(gray_orig, blurred_orig)
         
         unmasked_pixels = hp_noise[mask < 127]
         noise_std = np.std(unmasked_pixels) if unmasked_pixels.size > 0 else 0.0
-        noise_std = min(noise_std, 3.5)  # Сдерживаем сильные шумы
+        noise_std = min(noise_std, 8.0)  # Повышенный предел для адаптации под скринтоны
         
         if noise_std > 0.3:
             noise_img = np.random.normal(0, noise_std, (height, width, 1)).astype(np.float32)
             img_inpainted_floats = img_inpainted.astype(np.float32) + noise_img * mask_original_3d
             img_inpainted = np.clip(img_inpainted_floats, 0, 255).astype(np.uint8)
 
-        # === 2. Мягкое смешивание (Feathering) краев маски ===
+        # === 3. Мягкое смешивание краев (Tighter Feathering) ===
         mask_bin = mask_original.astype(np.float32)
-        ksize = min(15, min(height, width) // 3 | 1)
-        if ksize >= 3:
-            feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
-        else:
-            feathered_mask = mask_bin
+        # Ограничиваем размытие маски до 5 пикселей для сохранения резких границ волос/текстур
+        ksize = 5 if min(height, width) >= 5 else 3
+        feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
             
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
