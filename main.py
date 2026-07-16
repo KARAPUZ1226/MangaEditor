@@ -935,25 +935,11 @@ class MangaEditorApp(QMainWindow):
             return False
 
     def load_standard_image(self, file_path):
-        img = cv_imread_unicode(file_path)
-        if img is None:
+        self.original_cv_image = cv_imread_unicode(file_path)
+        if self.original_cv_image is None:
             QMessageBox.critical(self, "Ошибка", "Не удалось прочитать файл изображения.")
             return
-            
-        # Автоматическая чистка шума уровней (без изменения масштаба) при загрузке Ч/Б манги
-        import numpy as np
-        is_gray = True
-        if len(img.shape) == 3 and img.shape[2] == 3:
-            diff_rg = np.mean(np.abs(img[:, :, 0].astype(int) - img[:, :, 1].astype(int)))
-            diff_gb = np.mean(np.abs(img[:, :, 1].astype(int) - img[:, :, 2].astype(int)))
-            if diff_rg > 8 or diff_gb > 8:
-                is_gray = False
-                
-        if is_gray:
-            # Убирает JPEG артефакты, делает серый фон чисто белым, а текст - чисто черным
-            img = np.clip((img.astype(np.float32) - 25) * (255.0 / (230 - 25)), 0, 255).astype(np.uint8)
-            
-        self.original_cv_image = img
+
         self.on_original_image_loaded()
         self.scene.clear()
         self.layers.clear()
