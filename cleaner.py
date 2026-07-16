@@ -44,95 +44,113 @@ class LaMaInpainter:
         return out_bgr
 
 
-def _build_text_mask(crop, dilation_px=4):
+def _build_text_mask(crop, dilation_px=2):
     """
     Строит маску текста внутри кропа бабла.
-    
-    Алгоритм:
-    1. Определяем медианный цвет фона (исключая предварительно найденный текст)
-    2. absdiff от фона → порог → кандидаты на текст
-    3. Connected components с фильтрацией шума и границ
-    4. Дилатация на dilation_px пикселей для захвата обводки букв
-    5. Защитная зона 3px от краёв кропа (границы баблов)
     """
     h, w = crop.shape[:2]
     if h < 6 or w < 6:
         return None
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray_filtered = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
-
-    # 1. Оценка фона
-    bg_median = int(np.median(gray_filtered))
-
-    # Грубая маска для исключения текста из оценки фона
-    if bg_median > 127:
-        temp_thresh = int(bg_median * 0.85)
-        _, temp_mask = cv2.threshold(gray_filtered, temp_thresh, 255, cv2.THRESH_BINARY_INV)
-    else:
-        temp_thresh = int(bg_median + (255 - bg_median) * 0.25)
-        _, temp_mask = cv2.threshold(gray_filtered, temp_thresh, 255, cv2.THRESH_BINARY)
-
-    bg_pixels = (temp_mask == 0)
-    if np.any(bg_pixels):
-        bg_color = np.median(crop[bg_pixels], axis=0).astype(int).tolist()
-        bg_std = float(np.std(gray[bg_pixels]))
-    else:
-        bg_color = np.median(crop, axis=(0, 1)).astype(int).tolist()
-        bg_std = float(np.std(gray))
-
-    # 2. Поиск текста: absdiff от медианы фона
-    diff = cv2.absdiff(gray_filtered, bg_median)
-    thresh_val = max(30, int(bg_std * 2.5))
-    _, text_candidates = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
-
-    # 3. Connected components — фильтруем шум и границы баблов
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_candidates)
-    text_mask = np.zeros_like(text_candidates)
-
+    
+    # 1. Адаптивный порог (выделение черных кандидатов на любом фоне)
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+    
+    # 2. Находим компоненты (буквы/шум)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+    
+    valid_boxes = []
+    char_masks = []
+    
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         cx = stats[i, cv2.CC_STAT_LEFT]
         cy = stats[i, cv2.CC_STAT_TOP]
         cw = stats[i, cv2.CC_STAT_WIDTH]
         ch = stats[i, cv2.CC_STAT_HEIGHT]
-
-        # Микрошум
-        if area <= 3:
-            continue
-
-        # Гигантские заливки (вся панель или весь фон)
-        if area > (w * h * 0.45) or cw > w * 0.95 or ch > h * 0.95:
-            continue
-
-        # Границы бабла: касается двух перпендикулярных краёв + тонкая линия
-        density = area / (cw * ch) if (cw * ch) > 0 else 0
-        touches_x = (cx <= 2 or (cx + cw) >= (w - 2))
-        touches_y = (cy <= 2 or (cy + ch) >= (h - 2))
-
-        if touches_x and touches_y:
-            continue
-        if (cw > w * 0.9 or ch > h * 0.9) and density < 0.18:
-            continue
-
-        text_mask[labels == i] = 255
-
-    # 4. Дилатация — расширяем маску чтобы захватить обводку/антиалиасинг букв
-    if dilation_px > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_px * 2 + 1, dilation_px * 2 + 1))
-        text_mask = cv2.dilate(text_mask, kernel, iterations=1)
-
-    # 5. Защитная зона: не стираем ничего ближе 3px к краю кропа
-    margin = 3
-    text_mask[:margin, :] = 0
-    text_mask[-margin:, :] = 0
-    text_mask[:, :margin] = 0
-    text_mask[:, -margin:] = 0
-
-    if not np.any(text_mask):
+        
+        # Эвристика символов: отсекаем пыль и гигантские линии
+        if 8 < area < (w * h * 0.2) and 3 < cw < w * 0.8 and 3 < ch < h * 0.8:
+            valid_boxes.append((cx, cy, cw, ch))
+            char_masks.append((labels == i).astype(np.uint8) * 255)
+            
+    if not valid_boxes:
         return None
 
-    return text_mask, bg_color, bg_median, bg_std
+    # 3. Кластеризация (правило близости)
+    cluster_mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # Расширяем Bounding Box каждой буквы на 15 пикселей (зона притяжения)
+    dist = 15
+    for cx, cy, cw, ch in valid_boxes:
+        x1 = max(0, cx - dist)
+        y1 = max(0, cy - dist)
+        x2 = min(w, cx + cw + dist)
+        y2 = min(h, cy + ch + dist)
+        cv2.rectangle(cluster_mask, (x1, y1), (x2, y2), 255, -1)
+        
+    c_num_labels, c_labels, _, _ = cv2.connectedComponentsWithStats(cluster_mask)
+    
+    cluster_counts = {i: 0 for i in range(1, c_num_labels)}
+    box_cluster_ids = []
+    
+    for cx, cy, cw, ch in valid_boxes:
+        center_x = cx + cw // 2
+        center_y = cy + ch // 2
+        c_id = c_labels[center_y, center_x]
+        if c_id > 0:
+            cluster_counts[c_id] += 1
+        box_cluster_ids.append(c_id)
+        
+    final_text_mask = np.zeros((h, w), dtype=np.uint8)
+    kept_chars = 0
+    
+    for i in range(len(valid_boxes)):
+        c_id = box_cluster_ids[i]
+        # Если в кластере больше 1 символа — это текст!
+        if c_id > 0 and cluster_counts[c_id] > 1:
+            final_text_mask = cv2.bitwise_or(final_text_mask, char_masks[i])
+            kept_chars += 1
+            
+    if kept_chars == 0:
+        return None
+        
+    # 4. Расширяем маску для захвата обводки
+    if dilation_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_px * 2 + 1, dilation_px * 2 + 1))
+        final_text_mask = cv2.dilate(final_text_mask, kernel, iterations=1)
+        
+    # Защитная зона 3px
+    margin = 3
+    final_text_mask[:margin, :] = 0
+    final_text_mask[-margin:, :] = 0
+    final_text_mask[:, :margin] = 0
+    final_text_mask[:, -margin:] = 0
+
+    if not np.any(final_text_mask):
+        return None
+
+    # 5. Анализ фона (кольцо вокруг маски текста)
+    bg_eval_mask = cv2.dilate(final_text_mask, np.ones((11, 11), np.uint8))
+    bg_eval_mask = cv2.bitwise_xor(bg_eval_mask, final_text_mask)
+    
+    bg_pixels = gray[bg_eval_mask == 255]
+    if len(bg_pixels) > 0:
+        bg_std = float(np.std(bg_pixels))
+        bg_median = int(np.median(bg_pixels))
+        
+        median_mask = (gray == bg_median) & (bg_eval_mask == 255)
+        if np.any(median_mask):
+            bg_color = np.median(crop[median_mask], axis=0).astype(int).tolist()
+        else:
+            bg_color = np.median(crop[bg_eval_mask == 255], axis=0).astype(int).tolist()
+    else:
+        bg_std = 0.0
+        bg_median = 255
+        bg_color = [255, 255, 255]
+
+    return final_text_mask, bg_color, bg_median, bg_std
 
 
 def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=2, lama_inpainter=None, text_segmenter=None):
@@ -172,16 +190,21 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=2, lama_inpainte
 
         text_mask, bg_color, bg_median, bg_std = result
 
-        # Заполнение: LaMa дорисовывает фон, fallback — заливка медианным цветом
-        if lama_inpainter is not None:
-            try:
-                inpainted = lama_inpainter.inpaint(crop, text_mask)
-                crop[:] = inpainted
-            except Exception as e:
-                print(f"LaMa error: {e}")
-                crop[text_mask == 255] = bg_color
-        else:
+        # Твоя логика: если фон простой - заливаем белым (цветом бабла), иначе - ИИ дорисовка
+        is_simple_bg = (bg_std < 12.0) or (bg_median > 240 and bg_std < 25.0)
+        
+        if is_simple_bg:
             crop[text_mask == 255] = bg_color
+        else:
+            if lama_inpainter is not None:
+                try:
+                    inpainted = lama_inpainter.inpaint(crop, text_mask)
+                    crop[:] = inpainted
+                except Exception as e:
+                    print(f"LaMa error: {e}")
+                    crop[text_mask == 255] = bg_color
+            else:
+                crop[text_mask == 255] = bg_color
 
         cv_image[y:y+h, x:x+w] = crop
         cleaned_count += 1
@@ -215,14 +238,19 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=2, lama_inpainter=None, t
 
     text_mask, bg_color, bg_median, bg_std = result
 
-    if lama_inpainter is not None:
-        try:
-            crop = lama_inpainter.inpaint(crop, text_mask)
-        except Exception as e:
-            print(f"LaMa error: {e}")
-            crop[text_mask == 255] = bg_color
-    else:
+    is_simple_bg = (bg_std < 12.0) or (bg_median > 240 and bg_std < 25.0)
+    
+    if is_simple_bg:
         crop[text_mask == 255] = bg_color
+    else:
+        if lama_inpainter is not None:
+            try:
+                crop = lama_inpainter.inpaint(crop, text_mask)
+            except Exception as e:
+                print(f"LaMa error: {e}")
+                crop[text_mask == 255] = bg_color
+        else:
+            crop[text_mask == 255] = bg_color
 
     cv_image[y:y+h, x:x+w] = crop
     return cv_image
