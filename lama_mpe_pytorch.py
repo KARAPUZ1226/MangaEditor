@@ -747,8 +747,15 @@ class LamaMPEPyTorchInpainter:
         # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
         gray_original = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # Маска "живых" (невыделенных) пикселей: 1.0 = фон, 0.0 = закрашенная область
-        live_mask = (mask_original == 0).astype(np.float32)
+        # 1. Выделяем структурные линии рисунка (чтобы исключить их из доноров текстуры скринтона)
+        # Размываем изображение, чтобы стереть мелкие точки скринтона, оставив только толстые линии контуров
+        blurred_for_lines = cv2.GaussianBlur(gray_original, (9, 9), 0)
+        detected_edges = cv2.Canny(blurred_for_lines, 30, 80)
+        # Дилатируем линии, чтобы создать вокруг них буферную зону
+        dilated_edges = cv2.dilate(detected_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=2)
+
+        # Маска "живых" (невыделенных) пикселей: 1.0 = фон, 0.0 = закрашенная область или структурная линия рисунка
+        live_mask = ((mask_original == 0) & (dilated_edges == 0)).astype(np.float32)
         
         # Находим центр выделения пользователя для локального поиска сдвига текстуры
         y_indices, x_indices = np.where(mask_original == 1)
@@ -813,27 +820,13 @@ class LamaMPEPyTorchInpainter:
             img_donor = img_inpainted.copy()
             working_mask = mask_original.copy()
             donor_mask = mask_original.copy()
-            
-            # Изолируем структурные линии рисунка (убиваем маленькие черные точки скринтона)
-            # cv2.MORPH_CLOSE (dilate -> erode) расширяет белый цвет, съедая мелкий черный мусор (точки),
-            # а затем сужает белый цвет, восстанавливая толщину крупных черных контуров рисунка.
-            morph_kernel = np.ones((3, 3), np.uint8)
-            lines_only = cv2.morphologyEx(gray_original, cv2.MORPH_CLOSE, morph_kernel, iterations=2)
-            
-            # Все темные пиксели, пережившие эту мясорубку - это толстые структурные линии
-            structural_lines_mask = (lines_only < 200)
-            
-            # Исключаем структурные линии из пула здоровых доноров!
-            # Это на 100% блокирует размазывание контуров и эффект "лесенок"
-            donor_mask[structural_lines_mask] = 1
-            
-            # Аналогично для сглаженных масок (чтобы вычитание hp_texture работало синхронно)
-            donor_mask_smooth = mask_original.copy()
-            donor_mask_smooth[structural_lines_mask] = 1
+            donor_mask[dilated_edges > 0] = 1
             
             img_smooth_bgr = cv2.GaussianBlur(img_inpainted, (7, 7), 0)
             img_donor_smooth = img_smooth_bgr.copy()
             working_mask_smooth = mask_original.copy()
+            donor_mask_smooth = mask_original.copy()
+            donor_mask_smooth[dilated_edges > 0] = 1
             
             M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
