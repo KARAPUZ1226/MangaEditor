@@ -617,8 +617,8 @@ class LamaMPEPyTorchInpainter:
             try:
                 # 1. Готовим изображение для U-Net (Grayscale, 256x256)
                 ch, cw = img_original.shape[:2]
-                crop_gray = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-                crop_resized = cv2.resize(crop_gray, (256, 256))
+                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                crop_resized = cv2.resize(gray_orig, (256, 256))
                 
                 input_blob = crop_resized.astype(np.float32) / 255.0
                 input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
