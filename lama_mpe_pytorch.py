@@ -747,12 +747,19 @@ class LamaMPEPyTorchInpainter:
         # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
         gray_original = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Выделяем структурные линии рисунка (чтобы исключить их из доноров текстуры скринтона)
-        # Размываем изображение, чтобы стереть мелкие точки скринтона, оставив только толстые линии контуров
-        blurred_for_lines = cv2.GaussianBlur(gray_original, (9, 9), 0)
-        detected_edges = cv2.Canny(blurred_for_lines, 30, 80)
-        # Дилатируем линии, чтобы создать вокруг них буферную зону
-        dilated_edges = cv2.dilate(detected_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=2)
+        # 1. Выделяем структурные линии рисунка через анализ связных компонентов
+        # Это позволяет надежно отделить мелкие круглые точки скринтона от длинных контуров и штриховки
+        _, binary = cv2.threshold(gray_original, 160, 255, cv2.THRESH_BINARY_INV)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        dilated_edges = np.zeros_like(gray_original)
+        for i in range(1, num_labels):
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            area = stats[i, cv2.CC_STAT_AREA]
+            ar = max(w / (h + 1e-5), h / (w + 1e-5))
+            if area > 45 or ar > 1.8 or w > 12 or h > 12:
+                dilated_edges[labels == i] = 255
+        dilated_edges = cv2.dilate(dilated_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=2)
 
         # Маска "живых" (невыделенных) пикселей: 1.0 = фон, 0.0 = закрашенная область или структурная линия рисунка
         live_mask = ((mask_original == 0) & (dilated_edges == 0)).astype(np.float32)
