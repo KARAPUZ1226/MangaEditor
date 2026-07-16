@@ -653,10 +653,7 @@ class LamaMPEPyTorchInpainter:
                 # 4. Создание карты вечных контуров (PROTECTED_LINES) для защиты рисунка
                 # Сливаем скринтон медианным фильтром, сохраняя толстые линии рисунка
                 median_blurred = cv2.medianBlur(gray_orig, 5)
-                all_black_lines = cv2.adaptiveThreshold(
-                    median_blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                    cv2.THRESH_BINARY_INV, 15, 10
-                )
+                all_black_lines = (median_blurred < 100).astype(np.uint8) * 255
                 
                 # Находим длинные прямые спидлайны
                 speedlines_mask = np.zeros_like(all_black_lines)
