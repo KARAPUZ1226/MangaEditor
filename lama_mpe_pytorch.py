@@ -601,7 +601,21 @@ class LamaMPEPyTorchInpainter:
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
-        mask_original = np.copy(mask)
+        
+        # === 0. Автоматическое уточнение маски ===
+        # Выделяем только темный текст (<95) и светлую обводку (>225),
+        # оставляя средние серые тона скринтонов в качестве "живого" фона.
+        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        text_pixels = (gray_orig < 95) | (gray_orig > 225)
+        
+        mask_refined = np.copy(mask)
+        mask_refined[~text_pixels] = 0
+        
+        # Если уточненная маска пуста (например, стираем чистый серый фон), откатываемся к оригиналу
+        if np.sum(mask_refined >= 127) < 10:
+            mask_refined = mask
+
+        mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
         mask_original[mask_original >= 127] = 1
         mask_original_3d = mask_original[:, :, None]
@@ -622,10 +636,10 @@ class LamaMPEPyTorchInpainter:
 
         if pad_h > 0 or pad_w > 0:
             image_padded = cv2.copyMakeBorder(image_smooth, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-            mask_padded = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            mask_padded = cv2.copyMakeBorder(mask_refined, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
             image_padded = image_smooth
-            mask_padded = mask
+            mask_padded = mask_refined
 
         img_torch = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze_(0).float() / 255.
         mask_torch = torch.from_numpy(mask_padded).unsqueeze_(0).unsqueeze_(0).float() / 255.0
