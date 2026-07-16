@@ -642,6 +642,11 @@ class LamaMPEPyTorchInpainter:
             img_inpainted = (img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
 
         img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
+
+        # Обрезаем паддинг обратно
+        if pad_h > 0 or pad_w > 0:
+            img_inpainted = img_inpainted[0:height, 0:width]
+
         # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
         gray_original = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
@@ -701,41 +706,40 @@ class LamaMPEPyTorchInpainter:
                         
         # Если сдвиг найден, накладываем текстуру скринтона
         if best_dx != 0 or best_dy != 0:
-            # Во избежание "пустых зон" в центре крупных масок, заполняем донора
-            # итеративной протяжкой здоровой текстуры внутрь маски на каждом шаге сдвига
+            # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
             img_donor = img_original.copy()
-            working_mask_3d = mask_original_3d.copy()
-            donor_mask_3d = mask_original_3d.copy()
+            working_mask = mask_original.copy()
+            donor_mask = mask_original.copy()
             
             img_smooth_bgr = cv2.cvtColor(image_smooth, cv2.COLOR_RGB2BGR)
             img_donor_smooth = img_smooth_bgr.copy()
-            working_mask_smooth_3d = mask_original_3d.copy()
-            donor_mask_smooth_3d = mask_original_3d.copy()
+            working_mask_smooth = mask_original.copy()
+            donor_mask_smooth = mask_original.copy()
             
             M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
             # 6 шагов сдвига покроют маску шириной до 6 * 16 = 96 пикселей с каждой стороны
             for _ in range(6):
-                if np.sum(working_mask_3d) == 0:
+                if np.sum(working_mask) == 0:
                     break
                 # Сдвигаем текущих доноров
                 shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
-                shifted_mask = cv2.warpAffine(donor_mask_3d, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
+                shifted_mask = cv2.warpAffine(donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
                 # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
-                copy_map = (working_mask_3d == 1) & (shifted_mask == 0)
+                copy_map = (working_mask == 1) & (shifted_mask == 0)
                 img_donor[copy_map] = shifted_img[copy_map]
-                donor_mask_3d[copy_map] = 0
-                working_mask_3d[copy_map] = 0
+                donor_mask[copy_map] = 0
+                working_mask[copy_map] = 0
                 
                 # Аналогично для сглаженного донора
                 shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
-                shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth_3d, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
+                shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                copy_map_smooth = (working_mask_smooth_3d == 1) & (shifted_mask_smooth == 0)
+                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0)
                 img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
-                donor_mask_smooth_3d[copy_map_smooth] = 0
-                working_mask_smooth_3d[copy_map_smooth] = 0
+                donor_mask_smooth[copy_map_smooth] = 0
+                working_mask_smooth[copy_map_smooth] = 0
             
             # Извлекаем высокие частоты (только точки скринтона, без линий контуров)
             hp_texture = img_donor.astype(np.float32) - img_donor_smooth.astype(np.float32)
