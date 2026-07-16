@@ -615,23 +615,38 @@ class LamaMPEPyTorchInpainter:
         # === 0. Автоматическое уточнение маски через U-Net segmenter ===
         if self.segmenter is not None:
             try:
-                # 1. Готовим изображение для U-Net (Grayscale, 256x256)
+                # 1. Готовим изображение для U-Net (Grayscale, ресайз ТОЛЬКО области выделения пользователя)
                 ch, cw = img_original.shape[:2]
                 gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-                crop_resized = cv2.resize(gray_orig, (256, 256))
                 
-                input_blob = crop_resized.astype(np.float32) / 255.0
-                input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
-                input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 256, 256]
-                
-                # 2. Инференс U-Net
-                outputs = self.segmenter.run(None, {"input": input_blob})
-                logits = outputs[0][0][0]
-                probs = 1.0 / (1.0 + np.exp(-logits))
-                
-                # 3. Бинаризация маски U-Net (порог 0.5)
-                mask_256 = (probs > 0.5).astype(np.uint8) * 255
-                unet_mask = cv2.resize(mask_256, (cw, ch), interpolation=cv2.INTER_NEAREST)
+                # Ищем точные границы выделения пользователя на маске
+                y_indices, x_indices = np.where(mask >= 127)
+                if len(y_indices) > 0:
+                    y0_box, y1_box = y_indices.min(), y_indices.max() + 1
+                    x0_box, x1_box = x_indices.min(), x_indices.max() + 1
+                    
+                    # Вырезаем область выделения и приводим к 256x256 (соответствует обучающей выборке U-Net)
+                    bbox_gray = gray_orig[y0_box:y1_box, x0_box:x1_box]
+                    bbox_resized = cv2.resize(bbox_gray, (256, 256))
+                    
+                    input_blob = bbox_resized.astype(np.float32) / 255.0
+                    input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
+                    input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 256, 256]
+                    
+                    # 2. Инференс U-Net
+                    outputs = self.segmenter.run(None, {"input": input_blob})
+                    logits = outputs[0][0][0]
+                    probs = 1.0 / (1.0 + np.exp(-logits))
+                    
+                    # 3. Бинаризация маски U-Net (порог 0.5)
+                    mask_256 = (probs > 0.5).astype(np.uint8) * 255
+                    bbox_mask = cv2.resize(mask_256, (x1_box - x0_box, y1_box - y0_box), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Возвращаем маску в оригинальный размер кропа
+                    unet_mask = np.zeros_like(gray_orig)
+                    unet_mask[y0_box:y1_box, x0_box:x1_box] = bbox_mask
+                else:
+                    unet_mask = np.zeros_like(gray_orig)
                 
                 # 4. Создание карты вечных контуров (PROTECTED_LINES) для защиты рисунка
                 # Сливаем скринтон медианным фильтром, сохраняя толстые линии рисунка
