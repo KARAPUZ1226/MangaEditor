@@ -11,7 +11,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
 
     full_h, full_w = cv_image.shape[:2]
     cleaned_count = 0
-    padding = 128  # Увеличенный контекст для LaMa для точного восстановления скринтонов
+    min_padding = 96  # Гарантированный паддинг контекста со всех сторон
 
     for bubble in bubble_items:
         rect = bubble.rect()
@@ -23,11 +23,24 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
         w0 = int(rect.width())
         h0 = int(rect.height())
 
-        # Расширенные координаты для кропа
-        x = max(0, x0 - padding)
-        y = max(0, y0 - padding)
-        x_end = min(full_w, x0 + w0 + padding)
-        y_end = min(full_h, y0 + h0 + padding)
+        # 1. Расширяем область до квадрата, кратного 8 (без растяжения!)
+        S = max(w0 + 2 * min_padding, h0 + 2 * min_padding)
+        S = ((S + 7) // 8) * 8
+        
+        cx = x0 + w0 // 2
+        cy = y0 + h0 // 2
+        
+        x = cx - S // 2
+        y = cy - S // 2
+        
+        # Удерживаем в границах картинки
+        if x < 0: x = 0
+        if y < 0: y = 0
+        if x + S > full_w: x = max(0, full_w - S)
+        if y + S > full_h: y = max(0, full_h - S)
+        
+        x_end = min(full_w, x + S)
+        y_end = min(full_h, y + S)
 
         w = x_end - x
         h = y_end - y
@@ -67,17 +80,30 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
         return cv_image
 
     full_h, full_w = cv_image.shape[:2]
-    padding = 128
+    min_padding = 96
 
     x0 = int(rect.x())
     y0 = int(rect.y())
     w0 = int(rect.width())
     h0 = int(rect.height())
 
-    x = max(0, x0 - padding)
-    y = max(0, y0 - padding)
-    x_end = min(full_w, x0 + w0 + padding)
-    y_end = min(full_h, y0 + h0 + padding)
+    # 1. Расширяем область до квадрата, кратного 8
+    S = max(w0 + 2 * min_padding, h0 + 2 * min_padding)
+    S = ((S + 7) // 8) * 8
+    
+    cx = x0 + w0 // 2
+    cy = y0 + h0 // 2
+    
+    x = cx - S // 2
+    y = cy - S // 2
+    
+    if x < 0: x = 0
+    if y < 0: y = 0
+    if x + S > full_w: x = max(0, full_w - S)
+    if y + S > full_h: y = max(0, full_h - S)
+    
+    x_end = min(full_w, x + S)
+    y_end = min(full_h, y + S)
     
     w = x_end - x
     h = y_end - y

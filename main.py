@@ -1075,13 +1075,27 @@ class MangaEditorApp(QMainWindow):
                             y_indices, x_indices = np.where(mask > 127)
                             y0, y1 = y_indices.min(), y_indices.max()
                             x0, x1 = x_indices.min(), x_indices.max()
+                            w0 = x1 - x0 + 1
+                            h0 = y1 - y0 + 1
                             
-                            # Добавляем падинг 48 пикселей во все стороны для контекста
-                            pad = 48
-                            crop_y0 = max(0, y0 - pad)
-                            crop_y1 = min(h_bg, y1 + pad)
-                            crop_x0 = max(0, x0 - pad)
-                            crop_x1 = min(w_bg, x1 + pad)
+                            # Расширяем область до квадрата, кратного 8
+                            min_padding = 96
+                            S = max(w0 + 2 * min_padding, h0 + 2 * min_padding)
+                            S = ((S + 7) // 8) * 8
+                            
+                            cx = x0 + w0 // 2
+                            cy = y0 + h0 // 2
+                            
+                            crop_x0 = cx - S // 2
+                            crop_y0 = cy - S // 2
+                            
+                            if crop_x0 < 0: crop_x0 = 0
+                            if crop_y0 < 0: crop_y0 = 0
+                            if crop_x0 + S > w_bg: crop_x0 = max(0, w_bg - S)
+                            if crop_y0 + S > h_bg: crop_y0 = max(0, h_bg - S)
+                            
+                            crop_x1 = min(w_bg, crop_x0 + S)
+                            crop_y1 = min(h_bg, crop_y0 + S)
                             
                             crop_img = bg_cv[crop_y0:crop_y1, crop_x0:crop_x1].copy()
                             crop_mask = mask[crop_y0:crop_y1, crop_x0:crop_x1].copy()
