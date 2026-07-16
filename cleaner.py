@@ -150,47 +150,49 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=5, lama_inpainte
             else:
                 dark_mask = text_candidates
         # 4. Анализ связанных компонентов
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask)
-        text_mask = np.zeros_like(dark_mask)
-        valid_heights = []
+        if use_unet:
+            text_mask = dark_mask.copy()
+            # Для определения высоты букв считаем статистику связанных компонентов без жесткой фильтрации
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_mask)
+            valid_heights = [stats[i, cv2.CC_STAT_HEIGHT] for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] > 2]
+        else:
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask)
+            text_mask = np.zeros_like(dark_mask)
+            valid_heights = []
 
-        for i in range(1, num_labels):
-            left = stats[i, cv2.CC_STAT_LEFT]
-            top = stats[i, cv2.CC_STAT_TOP]
-            width = stats[i, cv2.CC_STAT_WIDTH]
-            height = stats[i, cv2.CC_STAT_HEIGHT]
-            area = stats[i, cv2.CC_STAT_AREA]
+            for i in range(1, num_labels):
+                left = stats[i, cv2.CC_STAT_LEFT]
+                top = stats[i, cv2.CC_STAT_TOP]
+                width = stats[i, cv2.CC_STAT_WIDTH]
+                height = stats[i, cv2.CC_STAT_HEIGHT]
+                area = stats[i, cv2.CC_STAT_AREA]
 
-            # Вычисляем плотность объекта (отношение площади к площади его рамки)
-            density = area / (width * height) if (width * height) > 0 else 0
+                # Вычисляем плотность объекта
+                density = area / (width * height) if (width * height) > 0 else 0
 
-            # Проверяем контакты с краями
-            touches_left_or_right = (left <= 2 or (left + width) >= (w - 2))
-            touches_top_or_bottom = (top <= 2 or (top + height) >= (h - 2))
+                # Проверяем контакты с краями
+                touches_left_or_right = (left <= 2 or (left + width) >= (w - 2))
+                touches_top_or_bottom = (top <= 2 or (top + height) >= (h - 2))
 
-            # Считаем объект нетекстовой границей только если:
-            # 1. Он касается углов/всех краев одновременно (рамка/угол бабла)
-            # 2. Он очень длинный по ширине или высоте и при этом тонкий (линия панели/бабла)
-            is_border = False
-            if touches_left_or_right and touches_top_or_bottom:
-                is_border = True
-            elif (width > w * 0.9 or height > h * 0.9) and density < 0.18:
-                is_border = True
+                is_border = False
+                if touches_left_or_right and touches_top_or_bottom:
+                    is_border = True
+                elif (width > w * 0.9 or height > h * 0.9) and density < 0.18:
+                    is_border = True
 
-            if is_border:
-                continue
+                if is_border:
+                    continue
 
-            # Исключаем гигантские нетекстовые заливки (вся панель)
-            if area > (w * h * 0.45) or width > w * 0.95 or height > h * 0.95:
-                continue
+                # Исключаем гигантские нетекстовые заливки
+                if area > (w * h * 0.45) or width > w * 0.95 or height > h * 0.95:
+                    continue
 
-            # Исключаем микро-шум
-            if area <= 2:
-                continue
+                # Исключаем микро-шум
+                if area <= 2:
+                    continue
 
-            # Компонент прошел все фильтры => это текст
-            text_mask[labels == i] = 255
-            valid_heights.append(height)
+                text_mask[labels == i] = 255
+                valid_heights.append(height)
 
         if np.any(text_mask == 255):
             # Вычисляем медианную высоту букв для адаптивного подбора радиуса дилатации
