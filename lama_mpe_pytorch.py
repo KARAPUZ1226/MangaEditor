@@ -650,51 +650,7 @@ class LamaMPEPyTorchInpainter:
                 else:
                     unet_mask = np.zeros_like(gray_orig)
                 
-                # 4. Создание карты вечных контуров (PROTECTED_LINES) для защиты рисунка
-                # Сливаем скринтон медианным фильтром, сохраняя толстые линии рисунка
-                median_blurred = cv2.medianBlur(gray_orig, 5)
-                all_black_lines = (median_blurred < 100).astype(np.uint8) * 255
-                
-                # Находим длинные прямые спидлайны
-                speedlines_mask = np.zeros_like(all_black_lines)
-                lines = cv2.HoughLinesP(all_black_lines, 1, np.pi/180, threshold=50, minLineLength=40, maxLineGap=10)
-                if lines is not None:
-                    for line in lines:
-                        x1, y1, x2, y2 = line.flatten()
-                        cv2.line(speedlines_mask, (x1, y1), (x2, y2), 255, 3)
-                        
-                combined_lines = cv2.bitwise_or(all_black_lines, speedlines_mask)
-                
-                # Физически разрываем связь между текстом и фоном: обнуляем пиксели букв, найденные U-Net,
-                # чтобы они не объединялись с фоновыми контурами в один компонент.
-                combined_lines[unet_mask > 0] = 0
-                
-                # Анализируем компоненты: те, что касаются границ кропа или являются очень длинными, помечаем как защищенные
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_lines, connectivity=8)
-                protected_lines = np.zeros_like(combined_lines)
-                
-                for i in range(1, num_labels):
-                    x_comp = stats[i, cv2.CC_STAT_LEFT]
-                    y_comp = stats[i, cv2.CC_STAT_TOP]
-                    w_comp = stats[i, cv2.CC_STAT_WIDTH]
-                    h_comp = stats[i, cv2.CC_STAT_HEIGHT]
-                    area = stats[i, cv2.CC_STAT_AREA]
-                    
-                    # Касание границ кропа (с небольшим допуском в 2 пикселя)
-                    touches_border = (
-                        x_comp <= 2 or 
-                        y_comp <= 2 or 
-                        (x_comp + w_comp) >= (cw - 2) or 
-                        (y_comp + h_comp) >= (ch - 2)
-                    )
-                    
-                    aspect_ratio = max(w_comp, h_comp) / (min(w_comp, h_comp) + 1e-5)
-                    is_very_long = aspect_ratio > 5.0 and area > 100
-                    
-                    if touches_border or is_very_long or area > 5000:
-                        protected_lines[labels == i] = 255
-                
-                # 5. Умный поиск обводки:
+                # 4. Умный поиск обводки:
                 # Белая обводка (яркость > 185) должна быть непосредственно рядом с буквами.
                 kernel = np.ones((3, 3), np.uint8)
                 near_text = cv2.dilate(unet_mask, kernel, iterations=2)
@@ -704,24 +660,12 @@ class LamaMPEPyTorchInpainter:
                 combined_text_mask[unet_mask > 0] = 255
                 combined_text_mask[white_outline] = 255
                 
-                print(f"[LaMa PyTorch DEBUG] unet_mask active: {np.sum(unet_mask > 0)}, combined_text_mask active: {np.sum(combined_text_mask > 0)}")
-                
                 # Слегка расширяем объединенную маску на 2 пикселя для сглаживания краев (антиалиасинга)
                 unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=2)
                 
-                print(f"[LaMa PyTorch DEBUG] unet_mask_refined before protection: {np.sum(unet_mask_refined > 0)}")
-                print(f"[LaMa PyTorch DEBUG] protected_lines active: {np.sum(protected_lines > 0)}")
-                
-                # Исключаем защищенные линии рисунка из маски закрашивания
-                unet_mask_refined[protected_lines > 0] = 0
-                
-                print(f"[LaMa PyTorch DEBUG] unet_mask_refined after protection: {np.sum(unet_mask_refined > 0)}")
-                
-                # 6. Пересекаем с исходным прямоугольным выделением пользователя
+                # 5. Пересекаем с исходным прямоугольным выделением пользователя
                 mask_refined = np.copy(mask)
                 mask_refined[unet_mask_refined == 0] = 0
-                
-                print(f"[LaMa PyTorch DEBUG] mask_refined final active: {np.sum(mask_refined >= 127)}")
             except Exception as e:
                 print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
                 # Откат к связным компонентам
