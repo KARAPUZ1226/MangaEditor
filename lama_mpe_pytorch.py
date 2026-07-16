@@ -758,7 +758,7 @@ class LamaMPEPyTorchInpainter:
         else:
             cy_box, cx_box = height // 2, width // 2
             
-        sub_size = 256
+        sub_size = 512
         y0_sub = max(0, cy_box - sub_size // 2)
         y1_sub = min(height, cy_box + sub_size // 2)
         x0_sub = max(0, cx_box - sub_size // 2)
@@ -774,7 +774,9 @@ class LamaMPEPyTorchInpainter:
         
         for dx in search_range:
             for dy in search_range:
-                if dx == 0 and dy == 0:
+                # Исключаем мелкие и строго вертикальные/горизонтальные сдвиги,
+                # заставляя алгоритм искать диагональную сетку скринтона
+                if abs(dx) <= 1 or abs(dy) <= 1:
                     continue
                 
                 # Координаты пересечения оригинального и смещенного окон
