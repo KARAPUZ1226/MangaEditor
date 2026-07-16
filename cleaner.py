@@ -10,27 +10,23 @@ class LaMaInpainter:
     def inpaint(self, img, mask):
         """
         Восстанавливает стертую область изображения.
-        Принимает BGR-изображение и одноканальную маску (255 = стирать, 0 = сохранить).
+        Ресайзит в 512x512 (размер входа ONNX LaMa), чтобы избежать ошибок ONNX Runtime,
+        и восстанавливает оригинальный размер.
         """
-        h, w = img.shape[:2]
+        h_orig, w_orig = img.shape[:2]
 
-        pad_h = (8 - h % 8) % 8
-        pad_w = (8 - w % 8) % 8
+        # 1. Ресайз под требования ONNX-модели LaMa (512x512)
+        img_resized = cv2.resize(img, (512, 512), interpolation=cv2.INTER_AREA)
+        mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
 
-        if pad_h > 0 or pad_w > 0:
-            img_padded = cv2.copyMakeBorder(img, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-            mask_padded = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
-        else:
-            img_padded = img
-            mask_padded = mask
-
-        img_rgb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB)
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         img_input = img_rgb.astype(np.float32) / 255.0
         img_input = np.transpose(img_input, (2, 0, 1))[np.newaxis, ...]
 
-        mask_input = (mask_padded.astype(np.float32) > 127).astype(np.float32)
+        mask_input = (mask_resized.astype(np.float32) > 127).astype(np.float32)
         mask_input = mask_input[np.newaxis, np.newaxis, ...]
 
+        # 2. Запуск ИИ
         outputs = self.session.run(None, {'image': img_input, 'mask': mask_input})
 
         out_tensor = outputs[0][0]
@@ -38,10 +34,14 @@ class LaMaInpainter:
         out_img = np.clip(out_img * 255.0, 0, 255).astype(np.uint8)
         out_bgr = cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR)
 
-        if pad_h > 0 or pad_w > 0:
-            out_bgr = out_bgr[:h, :w]
+        # 3. Ресайз обратно к исходным размерам кропа
+        out_bgr_resized = cv2.resize(out_bgr, (w_orig, h_orig), interpolation=cv2.INTER_CUBIC)
 
-        return out_bgr
+        # 4. Переносим только стертые пиксели, чтобы не размывать оригинальный фон вокруг
+        result = img.copy()
+        result[mask > 127] = out_bgr_resized[mask > 127]
+
+        return result
 
 
 def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainter=None, text_segmenter=None):
