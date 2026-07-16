@@ -671,7 +671,9 @@ class LamaMPEPyTorchInpainter:
             unmasked_pixels = hp_noise[mask < 127]
             
         noise_std = np.std(unmasked_pixels) if unmasked_pixels.size > 0 else 0.0
-        noise_std = min(noise_std, 5.0)  # Сдерживаем экстремальные шумы
+        # Ослабляем шум в 2 раза и ставим жесткий лимит (max 1.8),
+        # чтобы он оставался едва заметным и не выделялся "грязным" прямоугольником.
+        noise_std = min(noise_std * 0.5, 1.8)
         
         if noise_std > 0.1:
             # Генерируем 3-канальный шум
