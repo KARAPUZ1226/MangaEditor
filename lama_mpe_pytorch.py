@@ -698,8 +698,12 @@ class LamaMPEPyTorchInpainter:
         if np.sum(mask_refined >= 127) < 150:
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
             
+            # Ограничиваем область фоллбека маской пользователя (заменяем фон на серый 128)
+            gray_analysis = gray_orig.copy()
+            gray_analysis[mask == 0] = 128
+            
             # 1. Проверяем наличие речевого бабла (большая белая область)
-            binary_white = (gray_orig > 220).astype(np.uint8)
+            binary_white = (gray_analysis > 220).astype(np.uint8)
             num_labels_w, labels_w, stats_w, centroids_w = cv2.connectedComponentsWithStats(binary_white, connectivity=8)
             bubble_mask = np.zeros_like(gray_orig)
             has_bubble = False
@@ -709,7 +713,7 @@ class LamaMPEPyTorchInpainter:
                     has_bubble = True
             
             # 2. Проверяем наличие букв текста (темные объекты среднего размера)
-            binary_dark = (gray_orig < 130).astype(np.uint8)
+            binary_dark = (gray_analysis < 130).astype(np.uint8)
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
             text_mask = np.zeros_like(binary_dark)
             has_text = False
