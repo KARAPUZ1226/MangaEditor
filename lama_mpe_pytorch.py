@@ -875,11 +875,11 @@ class LamaMPEPyTorchInpainter:
         print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={peak_val/power_mean:.2f}")
         
         # === 3. Улучшенное выделение структурных линий (без поглощения растра) ===
-        # Используем очищенное от текста изображение, чтобы текст не определялся как линии
-        gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+        # Используем ОРИГИНАЛЬНОЕ изображение для детекции линий, чтобы не потерять стертые LaMa куски рамок
+        gray_lines = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
         # Бинаризируем темные участки
-        _, binary_dark = cv2.threshold(gray_inpainted, 150, 255, cv2.THRESH_BINARY_INV)
+        _, binary_dark = cv2.threshold(gray_lines, 150, 255, cv2.THRESH_BINARY_INV)
         
         # Разрываем случайные мостики между точками растра
         kernel_cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
@@ -887,7 +887,7 @@ class LamaMPEPyTorchInpainter:
         
         # Ищем связные компоненты строго по 4 соседям (чтобы диагонали не слипались)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_separated, connectivity=4)
-        dilated_edges = np.zeros_like(gray_inpainted)
+        dilated_edges = np.zeros_like(gray_lines)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
@@ -899,6 +899,9 @@ class LamaMPEPyTorchInpainter:
         # Возвращаем линиям исходную толщину + небольшой запас
         kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
+        
+        # Исключаем маску букв из восстановленных линий, чтобы случайно не вернуть текст
+        dilated_edges[text_mask_raw > 0] = 0
         cv2.imwrite("edges_debug.png", dilated_edges)
 
         # Оставляем mask_original полной, чтобы не пропускать буквы около линий
