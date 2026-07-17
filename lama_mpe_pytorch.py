@@ -817,6 +817,9 @@ class LamaMPEPyTorchInpainter:
             x_start = max(0, cx_s - search_half)
             x_end = min(w_s, cx_s + search_half + 1)
             power_shifted[y_start:y_end, x_start:x_end] = 0
+            # Подавляем горизонтальные и вертикальные гармоники (линии рисунка)
+            power_shifted[max(0, cy_s - 2):min(h_s, cy_s + 3), :] = 0
+            power_shifted[:, max(0, cx_s - 2):min(w_s, cx_s + 3)] = 0
             
             max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
             dy = max_idx[0] - cy_s
@@ -849,6 +852,10 @@ class LamaMPEPyTorchInpainter:
             search_half = 16
             power_shifted[max(0, cy_s - search_half):min(h_s, cy_s + search_half + 1),
                           max(0, cx_s - search_half):min(w_s, cx_s + search_half + 1)] = 0
+            # Подавляем горизонтальные и вертикальные гармоники (линии рисунка)
+            power_shifted[max(0, cy_s - 2):min(h_s, cy_s + 3), :] = 0
+            power_shifted[:, max(0, cx_s - 2):min(w_s, cx_s + 3)] = 0
+            
             max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
             best_dy = max_idx[0] - cy_s
             best_dx = max_idx[1] - cx_s
