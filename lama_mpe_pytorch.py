@@ -896,6 +896,11 @@ class LamaMPEPyTorchInpainter:
         dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
         cv2.imwrite("edges_debug.png", dilated_edges)
 
+        # Исключаем все черные линии рисунка и рамки из маски стирания текста,
+        # чтобы они оставались на 100% нетронутыми и оригинальными
+        mask_original[dilated_edges > 0] = 0
+        mask_original_3d = mask_original[:, :, None]
+
         # === 4. Текстурный синтез (если найден скринтон) ===
         if has_screentone and (best_dx != 0 or best_dy != 0):
             # Это сохраняет скринтоны на доноре, но убирает текст.
