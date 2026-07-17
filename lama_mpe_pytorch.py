@@ -750,7 +750,7 @@ class LamaMPEPyTorchInpainter:
         mask_original_3d = mask_original[:, :, None]
 
         # Сохраняем отладочную маску на диск для визуальной проверки
-        cv2.imwrite("mask_debug.png", (mask_original * 255).astype(np.uint8))
+        cv2.imwrite(f"mask_debug_{height}x{width}.png", (mask_original * 255).astype(np.uint8))
 
         height, width, c = image.shape
 
