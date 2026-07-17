@@ -745,6 +745,10 @@ class LamaMPEPyTorchInpainter:
         mask_original[mask_original >= 127] = 1
         mask_original_3d = mask_original[:, :, None]
 
+        # Сохраняем отладочные маски на диск для визуальной проверки
+        cv2.imwrite("mask_debug.png", (mask_original * 255).astype(np.uint8))
+        cv2.imwrite("edges_debug.png", dilated_edges)
+
         height, width, c = image.shape
 
         # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
