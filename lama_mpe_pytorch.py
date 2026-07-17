@@ -949,16 +949,23 @@ class LamaMPEPyTorchInpainter:
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             area = stats[i, cv2.CC_STAT_AREA]
+            
             # Точки растра маленькие, линии - протяженные
             if area > 20 or w > 15 or h > 15:
-                dilated_edges[labels == i] = 255
+                comp_mask = (labels == i)
+                # Вычисляем процент пересечения компонента с маской букв
+                overlap = np.sum(comp_mask & (text_mask_raw > 0)) / (area + 1e-5)
+                
+                if overlap > 0.3:
+                    # Это буква текста (высокое перекрытие), исключаем ее полностью
+                    continue
+                else:
+                    # Это рамка кадра или контур рисунка (низкое перекрытие), защищаем его без вырезания букв
+                    dilated_edges[comp_mask] = 255
                 
         # Возвращаем линиям исходную толщину + небольшой запас
         kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
-        
-        # Исключаем маску букв из восстановленных линий, чтобы случайно не вернуть текст
-        dilated_edges[text_mask_raw > 0] = 0
         cv2.imwrite("edges_debug.png", dilated_edges)
 
         # Оставляем mask_original полной, чтобы не пропускать буквы около линий
