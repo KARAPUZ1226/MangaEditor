@@ -956,9 +956,10 @@ class LamaMPEPyTorchInpainter:
             print("[LaMa PyTorch DEBUG] No screentone detected, skipping texture synthesis")
 
         # === 5. Мягкое смешивание базовой структуры ===
-        # Отключаем размытие краев маски, так как фаза скринтона и так совпадает,
-        # а размытие портит контуры рисунка на стыке.
-        feathered_mask = mask_original_3d.astype(np.float32)
+        # Применяем Гауссово размытие для мягкого градиентного перехода (устраняет лесенки и жесткие стыки)
+        feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (7, 7), 0)
+        if len(feathered_mask.shape) == 2:
+            feathered_mask = feathered_mask[:, :, None]
 
         # Применяем шумоподавление к структуре LaMa, чтобы получить идеальные градиенты
         img_inpainted_smooth = cv2.bilateralFilter(img_inpainted, d=9, sigmaColor=35, sigmaSpace=35)
@@ -968,8 +969,8 @@ class LamaMPEPyTorchInpainter:
         
         # === 6. Наложение текстуры поверх смешанной базы ===
         if hp_texture is not None:
-            # Текстура только на фоне внутри маски, не на контурах
-            clean_texture_mask = mask_original_3d.copy()
+            # Текстура только на фоне внутри маски, плавно затухает на границах
+            clean_texture_mask = feathered_mask.copy()
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
             
             # Модулируем амплитуду текстуры по яркости LaMa-градиента (белый/черный -> 0, серый -> 1)
