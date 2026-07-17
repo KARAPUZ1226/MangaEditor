@@ -631,6 +631,11 @@ class LamaMPEPyTorchInpainter:
                 cc_text_mask[labels == i] = 255
         cc_text_mask[binary_dark == 0] = 0
         
+        # Записываем отладочные маски
+        cv2.imwrite("gray_orig_debug.png", gray_orig)
+        cv2.imwrite("binary_dark_debug.png", binary_dark * 255)
+        cv2.imwrite("cc_text_mask_debug.png", cc_text_mask)
+        
         # 2. Запуск U-Net сегментера (если загружен)
         unet_mask = np.zeros_like(gray_orig)
         if self.segmenter is not None:
