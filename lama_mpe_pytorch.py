@@ -761,20 +761,26 @@ class LamaMPEPyTorchInpainter:
             if np.sum(mask_refined >= 127) < 10:
                 mask_refined = np.zeros_like(mask)
 
-        # Детектируем длинные сплошные линии (границы кадров)
+        # Ищем длинные сплошные линии (включая наклоненные границы кадров) через связные компоненты
         gray_orig_bin = (gray_orig < 130).astype(np.uint8)
+        gray_orig_closed = cv2.morphologyEx(gray_orig_bin, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        num_l, labels_l, stats_l, _ = cv2.connectedComponentsWithStats(gray_orig_closed, connectivity=8)
         
-        # Вертикальные линии длиной от 80 пикселей
-        kernel_v = np.ones((80, 1), np.uint8)
-        lines_v = cv2.morphologyEx(gray_orig_bin, cv2.MORPH_OPEN, kernel_v)
-        lines_v = cv2.dilate(lines_v, np.ones((1, 5), np.uint8))
-        
-        # Горизонтальные линии длиной от 80 пикселей
-        kernel_h = np.ones((1, 80), np.uint8)
-        lines_h = cv2.morphologyEx(gray_orig_bin, cv2.MORPH_OPEN, kernel_h)
-        lines_h = cv2.dilate(lines_h, np.ones((5, 1), np.uint8))
-        
-        frame_lines = (lines_v | lines_h)
+        frame_lines = np.zeros_like(gray_orig)
+        for i in range(1, num_l):
+            w_comp = stats_l[i, cv2.CC_STAT_WIDTH]
+            h_comp = stats_l[i, cv2.CC_STAT_HEIGHT]
+            area_comp = stats_l[i, cv2.CC_STAT_AREA]
+            
+            # Если компонент протяженный (длина или высота больше 60 пикселей)
+            if w_comp > 60 or h_comp > 60:
+                overlap = np.sum((labels_l == i) & (text_mask_raw > 0)) / (area_comp + 1e-5)
+                # Исключаем буквы (у букв перекрытие с маской текста высокое, у рамок - близкое к нулю)
+                if overlap < 0.25:
+                    frame_lines[labels_l == i] = 255
+                    
+        # Расширяем рамки для надежного перекрытия краев
+        frame_lines = cv2.dilate(frame_lines, np.ones((3, 3), np.uint8), iterations=2)
         
         # Вычитаем рамки кадра из масок стирания и сырого текста
         mask_refined[frame_lines > 0] = 0
@@ -916,7 +922,7 @@ class LamaMPEPyTorchInpainter:
             dx = max_idx[1] - cx_s
             
             peak_val = power_shifted[max_idx]
-            power_mean = np.mean(power_shifted)
+            power_mean = np.mean(np.abs(power_shifted))
             ratio = peak_val / (power_mean + 1e-5)
             
             if ratio > best_peak_ratio:
@@ -945,7 +951,7 @@ class LamaMPEPyTorchInpainter:
             max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
             best_dy = max_idx[0] - cy_s
             best_dx = max_idx[1] - cx_s
-            best_peak_ratio = power_shifted[max_idx] / (np.mean(power_shifted) + 1e-5)
+            best_peak_ratio = power_shifted[max_idx] / (np.mean(np.abs(power_shifted)) + 1e-5)
             
         has_screentone = best_peak_ratio > 3.0
         print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={best_peak_ratio:.2f}")
