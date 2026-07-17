@@ -886,14 +886,10 @@ class LamaMPEPyTorchInpainter:
             # Гасим текстуру скринтона на линиях рисунка, оставляя их сплошными
             hp_texture = hp_texture * (1.0 - line_mask_inpainted[:, :, None])
             
-            # Фильтр яркости (модуляция): гасим текстуру на чисто белом (баблы) и чисто черном (контуры)
-            # чтобы точки скринтона не залезали на белый текст и не размывали черную обводку
-            inpainted_float = img_inpainted.astype(np.float32)
-            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
-            f_texture = np.clip(f_texture, 0.0, 1.0)
+            # f_texture удален, так как параметрический расчет растра естественно гасит точки на белом/черном
+            pass
             
             print(f"[LaMa PyTorch DEBUG] Parametric hp_texture stats: min={np.min(hp_texture)}, max={np.max(hp_texture)}, mean_abs={np.mean(np.abs(hp_texture))}")
-            print(f"[LaMa PyTorch DEBUG] f_texture stats: min={np.min(f_texture)}, max={np.max(f_texture)}, mean={np.mean(f_texture)}")
             print(f"[LaMa PyTorch DEBUG] mask_original_3d sum: {np.sum(mask_original_3d)}")
 
 
@@ -911,7 +907,7 @@ class LamaMPEPyTorchInpainter:
         # === 4. Наложение текстуры поверх смешанной базы ("Бутерброд") ===
         if best_dx != 0 or best_dy != 0:
             # Накладываем текстуру на уже смешанную базу, чтобы сохранить 100% резкость точек скринтона
-            ans = img_blended + hp_texture * mask_original_3d * f_texture
+            ans = img_blended + hp_texture * mask_original_3d
         else:
             ans = img_blended
             
