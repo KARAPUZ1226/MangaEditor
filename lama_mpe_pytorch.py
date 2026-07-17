@@ -859,59 +859,30 @@ class LamaMPEPyTorchInpainter:
             # Убираем линии из донора, чтобы они не мешали
             donor_no_lines = cv2.inpaint(donor_original, dilated_edges, 3, cv2.INPAINT_TELEA)
             
-            # Векторы двумерной решетки скринтона
-            v1x, v1y = best_dx, best_dy
-            v2x, v2y = -best_dy, best_dx # Ортогональный вектор (для квадратного растра)
+            img_donor = donor_no_lines.copy().astype(np.float32)
+            working_mask = mask_original.copy()
             
-            # Ищем один глобальный сдвиг (i, j) для всей маски, чтобы сохранить непрерывность текстуры
-            best_i, best_j = 0, 0
-            min_overlap = float('inf')
+            # Сдвиг в направлении, ПРОТИВОПОЛОЖНОМ периоду
+            M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
-            # Объединенная маска запрещенных зон (текст + контуры)
-            unhealthy_mask = ((mask_original > 0) | (dilated_edges > 0)).astype(np.float32)
-            
-            # Предвычисляем и сортируем кандидатов по расстоянию (приоритет ближним сдвигам)
-            candidates = []
-            for i in range(-6, 7):
-                for j in range(-6, 7):
-                    if i == 0 and j == 0:
-                        continue
-                    tx = i * v1x + j * v2x
-                    ty = i * v1y + j * v2y
-                    dist = tx**2 + ty**2
-                    candidates.append((dist, i, j, tx, ty))
-            candidates.sort(key=lambda x: x[0])
-            
-            # Находим сдвиг с минимальным наложением на запретные зоны
-            for dist, i, j, tx, ty in candidates:
-                M = np.float32([[1, 0, tx], [0, 1, ty]])
-                shifted_unhealthy = cv2.warpAffine(unhealthy_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
-                overlap = np.sum(shifted_unhealthy * mask_original)
-                
-                # Допускаем микро-наложение менее 50 пикселей ради сохранения локальности сдвига
-                if overlap < 50:
-                    best_i, best_j = i, j
-                    min_overlap = overlap
+            # Shift-fill: копируем текстуру из здоровых областей в маску
+            for _ in range(32):  # Больше итераций для надёжности
+                if np.sum(working_mask) == 0:
                     break
+                shifted = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height), 
+                                               borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
-                if overlap < min_overlap:
-                    min_overlap = overlap
-                    best_i, best_j = i, j
-                        
-            # Итоговый глобальный сдвиг
-            gtx = best_i * v1x + best_j * v2x
-            gty = best_i * v1y + best_j * v2y
-            
-            # Сдвигаем донора целиком на вектор решетки скринтона
-            M_global = np.float32([[1, 0, gtx], [0, 1, gty]])
-            img_donor = cv2.warpAffine(donor_no_lines, M_global, (width, height), borderMode=cv2.BORDER_REFLECT)
+                copy_map = (working_mask == 1) & (shifted_mask < 0.5)
+                img_donor[copy_map] = shifted[copy_map]
+                working_mask[copy_map] = 0
             
             # Размываем донора большим ядром для полного сглаживания точек
             donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (15, 15), 0).astype(np.float32)
             # Текстура содержит реальную амплитуду и градиент оригинального скана
-            hp_texture = img_donor.astype(np.float32) - donor_smooth
+            hp_texture = img_donor - donor_smooth
             
-            print(f"[LaMa PyTorch DEBUG] Global shift: i={best_i}, j={best_j} -> (tx={gtx}, ty={gty})")
+            print(f"[LaMa PyTorch DEBUG] Shift propagation active. Period: dx={best_dx}, dy={best_dy}")
             print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
         else:
             hp_texture = None
