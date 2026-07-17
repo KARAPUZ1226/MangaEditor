@@ -900,9 +900,9 @@ class LamaMPEPyTorchInpainter:
             for _ in range(32):  # Больше итераций для надёжности
                 if np.sum(working_mask) == 0:
                     break
-                shifted = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted = cv2.warpAffine(img_donor, M, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
                 shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height), 
-                                               borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                                               flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
                 copy_map = (working_mask == 1) & (shifted_mask < 0.5)
                 img_donor[copy_map] = shifted[copy_map]
