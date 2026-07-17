@@ -614,153 +614,68 @@ class LamaMPEPyTorchInpainter:
         text_mask_raw = np.zeros_like(mask)
         y0_box, x0_box = 0, 0
         
-        # === 0. Автоматическое уточнение маски через U-Net segmenter ===
+        # === 0. Интеллектуальное детектирование текста (U-Net + Связные компоненты) ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
+        # 1. Запуск детектора связных компонентов (высокая полнота для любых шрифтов)
+        binary_dark = (gray_orig < 145).astype(np.uint8)
+        binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
+        cc_text_mask = np.zeros_like(binary_dark)
+        for i in range(1, num_labels):
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            ar = max(w / (h + 1e-5), h / (w + 1e-5))
+            if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
+                cc_text_mask[labels == i] = 255
+        cc_text_mask[binary_dark == 0] = 0
+        
+        # 2. Запуск U-Net сегментера (если загружен)
+        unet_mask = np.zeros_like(gray_orig)
         if self.segmenter is not None:
             try:
-                # 1. Готовим изображение для U-Net (Grayscale, ресайз ТОЛЬКО области выделения пользователя)
                 ch, cw = img_original.shape[:2]
                 print(f"[LaMa PyTorch DEBUG] Crop shape: {ch}x{cw}")
-                
-                # Ищем точные границы выделения пользователя на маске
                 y_indices, x_indices = np.where(mask >= 127)
                 if len(y_indices) > 0:
                     y0_box, y1_box = y_indices.min(), y_indices.max() + 1
                     x0_box, x1_box = x_indices.min(), x_indices.max() + 1
                     print(f"[LaMa PyTorch DEBUG] BBox found: {y1_box-y0_box}x{x1_box-x0_box} at ({x0_box},{y0_box})")
-                    
-                    # Вырезаем область выделения и приводим к 256x256 (соответствует обучающей выборке U-Net)
                     bbox_gray = gray_orig[y0_box:y1_box, x0_box:x1_box]
                     bbox_resized = cv2.resize(bbox_gray, (256, 256))
-                    
                     input_blob = bbox_resized.astype(np.float32) / 255.0
-                    input_blob = np.expand_dims(input_blob, axis=0) # [1, 256, 256]
-                    input_blob = np.expand_dims(input_blob, axis=0) # [1, 1, 256, 256]
-                    
-                    # 2. Инференс U-Net
+                    input_blob = np.expand_dims(input_blob, axis=0)
+                    input_blob = np.expand_dims(input_blob, axis=0)
                     outputs = self.segmenter.run(None, {"input": input_blob})
                     logits = outputs[0][0][0]
                     probs = 1.0 / (1.0 + np.exp(-logits))
-                    
-                    # 3. Бинаризация маски U-Net (порог 0.5)
                     mask_256 = (probs > 0.5).astype(np.uint8) * 255
                     bbox_mask = cv2.resize(mask_256, (x1_box - x0_box, y1_box - y0_box), interpolation=cv2.INTER_NEAREST)
-                    
-                    # Возвращаем маску в оригинальный размер кропа
-                    unet_mask = np.zeros_like(gray_orig)
                     unet_mask[y0_box:y1_box, x0_box:x1_box] = bbox_mask
-                else:
-                    unet_mask = np.zeros_like(gray_orig)
-                
-                # 4. Умный поиск обводки:
-                # Белая обводка (яркость > 185) должна быть непосредственно рядом с буквами.
-                kernel = np.ones((3, 3), np.uint8)
-                near_text = cv2.dilate(unet_mask, kernel, iterations=2)
-                white_outline = (gray_orig > 185) & (near_text > 0)
-                
-                combined_text_mask = np.zeros_like(unet_mask)
-                combined_text_mask[unet_mask > 0] = 255
-                combined_text_mask[white_outline] = 255
-                text_mask_raw = combined_text_mask.copy()
-                
-                # Слегка расширяем объединенную маску на 2 пикселя для сглаживания краев (антиалиасинга)
-                unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=2)
-                
-                # 5. Пересекаем с исходным прямоугольным выделением пользователя
-                mask_refined = np.copy(mask)
-                mask_refined[unet_mask_refined == 0] = 0
             except Exception as e:
-                print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
-                # Откат к связным компонентам
-                binary_dark = (gray_orig < 145).astype(np.uint8)
-                binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
-                text_mask = np.zeros_like(binary_dark)
-                for i in range(1, num_labels):
-                    w = stats[i, cv2.CC_STAT_WIDTH]
-                    h = stats[i, cv2.CC_STAT_HEIGHT]
-                    ar = max(w / (h + 1e-5), h / (w + 1e-5))
-                    if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
-                        text_mask[labels == i] = 255
-                text_mask[binary_dark == 0] = 0
-                text_mask_raw = text_mask.copy()
-                kernel = np.ones((3, 3), np.uint8)
-                text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
-                mask_refined = np.copy(mask)
-                mask_refined[text_mask_dilated == 0] = 0
-        else:
-            # Откат к связным компонентам если U-Net не загружен
-            binary_dark = (gray_orig < 145).astype(np.uint8)
-            binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
-            text_mask = np.zeros_like(binary_dark)
-            for i in range(1, num_labels):
-                w = stats[i, cv2.CC_STAT_WIDTH]
-                h = stats[i, cv2.CC_STAT_HEIGHT]
-                ar = max(w / (h + 1e-5), h / (w + 1e-5))
-                if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
-                    text_mask[labels == i] = 255
-            text_mask[binary_dark == 0] = 0
-            text_mask_raw = text_mask.copy()
-            kernel = np.ones((3, 3), np.uint8)
-            text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
-            mask_refined = np.copy(mask)
-            mask_refined[text_mask_dilated == 0] = 0
+                print(f"[LaMa PyTorch] U-Net failed, using CC only: {e}")
+                
+        # 3. Объединяем результаты U-Net и связных компонентов
+        combined_text = (unet_mask > 0) | (cc_text_mask > 0)
         
-        # Если после фильтрации маска пуста (U-Net ничего не нашёл или маска слишком мелкая),
-        # запускаем интеллектуальный детектор текста и баблов.
-        if np.sum(mask_refined >= 127) < 150:
-            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            
-            # Ограничиваем область фоллбека маской пользователя (заменяем фон на серый 128)
-            gray_analysis = gray_orig.copy()
-            gray_analysis[mask == 0] = 128
-            
-            # 1. Проверяем наличие речевого бабла (большая белая область)
-            binary_white = (gray_analysis > 220).astype(np.uint8)
-            num_labels_w, labels_w, stats_w, centroids_w = cv2.connectedComponentsWithStats(binary_white, connectivity=8)
-            bubble_mask = np.zeros_like(gray_orig)
-            has_bubble = False
-            for i in range(1, num_labels_w):
-                if stats_w[i, cv2.CC_STAT_AREA] > 4000:
-                    bubble_mask[labels_w == i] = 255
-                    has_bubble = True
-            
-            # 2. Проверяем наличие букв текста (темные объекты среднего размера)
-            binary_dark = (gray_analysis < 130).astype(np.uint8)
-            binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
-            text_mask = np.zeros_like(binary_dark)
-            has_text = False
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                w = stats[i, cv2.CC_STAT_WIDTH]
-                h = stats[i, cv2.CC_STAT_HEIGHT]
-                ar = max(w / (h + 1e-5), h / (w + 1e-5))
-                if 25 < area < 3000 and ar < 3.0:
-                    text_mask[labels == i] = 255
-                    has_text = True
-            text_mask[binary_dark == 0] = 0
-            text_mask_raw = text_mask.copy()
-            
-            # Строим итоговую маску фоллбека
-            mask_fallback = np.zeros_like(mask)
-            if has_bubble:
-                kernel = np.ones((3, 3), np.uint8)
-                bubble_mask_eroded = cv2.erode(bubble_mask, kernel, iterations=2)
-                mask_fallback[bubble_mask_eroded > 0] = 255
-            elif has_text:
-                kernel = np.ones((3, 3), np.uint8)
-                text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=2)
-                mask_fallback[text_mask_dilated > 0] = 255
-            
-            mask_refined = np.copy(mask)
-            mask_refined[mask_fallback == 0] = 0
-            
-            # Если не обнаружено ни текста, ни бабла, возвращаем пустую маску (ничего не стираем)
-            if np.sum(mask_refined >= 127) < 10:
-                mask_refined = np.zeros_like(mask)
+        # 4. Умный поиск обводки вокруг объединенного текста
+        kernel = np.ones((3, 3), np.uint8)
+        near_text = cv2.dilate(combined_text.astype(np.uint8) * 255, kernel, iterations=2)
+        white_outline = (gray_orig > 185) & (near_text > 0)
+        
+        text_mask_raw = np.zeros_like(gray_orig)
+        text_mask_raw[combined_text] = 255
+        text_mask_raw[white_outline] = 255
+        
+        # 5. Слегка расширяем для сглаживания краев
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=2)
+        
+        # 6. Ограничиваем областью выделения пользователя
+        mask_refined = np.copy(mask)
+        mask_refined[text_mask_dilated == 0] = 0
+        
+        if np.sum(mask_refined >= 127) < 10:
+            mask_refined = np.zeros_like(mask)
 
         # Детектируем длинные сплошные линии (границы кадров) через HoughLinesP,
         # чтобы гарантированно не захватить текст, но надежно найти прямые рамки кадра под любым углом
