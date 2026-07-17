@@ -611,6 +611,7 @@ class LamaMPEPyTorchInpainter:
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
+        text_mask_raw = np.zeros_like(mask)
         
         # === 0. Автоматическое уточнение маски через U-Net segmenter ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
@@ -660,6 +661,7 @@ class LamaMPEPyTorchInpainter:
                 combined_text_mask = np.zeros_like(unet_mask)
                 combined_text_mask[unet_mask > 0] = 255
                 combined_text_mask[white_outline] = 255
+                text_mask_raw = combined_text_mask.copy()
                 
                 # Слегка расширяем объединенную маску на 2 пикселя для сглаживания краев (антиалиасинга)
                 unet_mask_refined = cv2.dilate(combined_text_mask, kernel, iterations=2)
@@ -681,6 +683,7 @@ class LamaMPEPyTorchInpainter:
                     if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
                         text_mask[labels == i] = 255
                 text_mask[binary_dark == 0] = 0
+                text_mask_raw = text_mask.copy()
                 kernel = np.ones((3, 3), np.uint8)
                 text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
                 mask_refined = np.copy(mask)
@@ -698,6 +701,7 @@ class LamaMPEPyTorchInpainter:
                 if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
                     text_mask[labels == i] = 255
             text_mask[binary_dark == 0] = 0
+            text_mask_raw = text_mask.copy()
             kernel = np.ones((3, 3), np.uint8)
             text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
             mask_refined = np.copy(mask)
@@ -737,6 +741,7 @@ class LamaMPEPyTorchInpainter:
                     text_mask[labels == i] = 255
                     has_text = True
             text_mask[binary_dark == 0] = 0
+            text_mask_raw = text_mask.copy()
             
             # Строим итоговую маску фоллбека
             mask_fallback = np.zeros_like(mask)
@@ -896,9 +901,7 @@ class LamaMPEPyTorchInpainter:
         dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
         cv2.imwrite("edges_debug.png", dilated_edges)
 
-        # Исключаем все черные линии рисунка и рамки из маски стирания текста,
-        # чтобы они оставались на 100% нетронутыми и оригинальными
-        mask_original[dilated_edges > 0] = 0
+        # Оставляем mask_original полной, чтобы не пропускать буквы около линий
         mask_original_3d = mask_original[:, :, None]
 
         # === 4. Текстурный синтез (если найден скринтон) ===
@@ -979,9 +982,9 @@ class LamaMPEPyTorchInpainter:
         else:
             ans = img_blended
             
-        # Восстанавливаем оригинальные линии рисунка строго вне маски текста,
-        # чтобы они оставались 100% резкими и оригинальными, исключая любое размытие LaMa
-        restore_mask = (dilated_edges > 0) & (mask_original == 0)
+        # Восстанавливаем оригинальные линии рисунка строго вне сырой маски букв (text_mask_raw == 0),
+        # чтобы вернуть резкие линии и границы кадра, но не восстановить стертый текст.
+        restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
         ans[restore_mask] = img_original[restore_mask]
             
         ans = np.clip(ans, 0, 255).astype(np.uint8)
