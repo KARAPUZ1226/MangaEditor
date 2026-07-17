@@ -885,7 +885,9 @@ class LamaMPEPyTorchInpainter:
             # Донор — ОРИГИНАЛЬНОЕ изображение, где текст заменён через простой Telea.
             # Это сохраняет скринтоны на доноре, но убирает текст.
             text_mask_u8 = (mask_original * 255).astype(np.uint8)
-            donor_original = cv2.inpaint(img_original, text_mask_u8, 3, cv2.INPAINT_TELEA)
+            # Дилатируем маску букв на доноре, чтобы гарантированно стереть белую обводку букв
+            text_mask_u8_dilated = cv2.dilate(text_mask_u8, np.ones((5, 5), np.uint8), iterations=1)
+            donor_original = cv2.inpaint(img_original, text_mask_u8_dilated, 3, cv2.INPAINT_TELEA)
             
             # Убираем линии из донора, чтобы они не мешали
             donor_no_lines = cv2.inpaint(donor_original, dilated_edges, 3, cv2.INPAINT_TELEA)
@@ -920,11 +922,9 @@ class LamaMPEPyTorchInpainter:
             print("[LaMa PyTorch DEBUG] No screentone detected, skipping texture synthesis")
 
         # === 5. Мягкое смешивание базовой структуры ===
-        mask_bin = mask_original.astype(np.float32)
-        ksize = 5 if min(height, width) >= 5 else 3
-        feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
-        if len(feathered_mask.shape) == 2:
-            feathered_mask = feathered_mask[:, :, None]
+        # Отключаем размытие краев маски, так как фаза скринтона и так совпадает,
+        # а размытие портит контуры рисунка на стыке.
+        feathered_mask = mask_original_3d.astype(np.float32)
 
         # Применяем шумоподавление к структуре LaMa, чтобы получить идеальные градиенты
         img_inpainted_smooth = cv2.bilateralFilter(img_inpainted, d=9, sigmaColor=35, sigmaSpace=35)
