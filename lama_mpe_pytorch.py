@@ -745,9 +745,8 @@ class LamaMPEPyTorchInpainter:
         mask_original[mask_original >= 127] = 1
         mask_original_3d = mask_original[:, :, None]
 
-        # Сохраняем отладочные маски на диск для визуальной проверки
+        # Сохраняем отладочную маску на диск для визуальной проверки
         cv2.imwrite("mask_debug.png", (mask_original * 255).astype(np.uint8))
-        cv2.imwrite("edges_debug.png", dilated_edges)
 
         height, width, c = image.shape
 
@@ -879,6 +878,7 @@ class LamaMPEPyTorchInpainter:
         # Возвращаем линиям исходную толщину + небольшой запас
         kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
+        cv2.imwrite("edges_debug.png", dilated_edges)
 
         # === 4. Текстурный синтез (если найден скринтон) ===
         if has_screentone and (best_dx != 0 or best_dy != 0):
