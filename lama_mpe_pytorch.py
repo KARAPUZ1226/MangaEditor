@@ -894,8 +894,14 @@ class LamaMPEPyTorchInpainter:
         
         # === 4. Наложение текстуры поверх смешанной базы ("Бутерброд") ===
         if best_dx != 0 or best_dy != 0:
-            # Накладываем текстуру на уже смешанную базу, чтобы сохранить 100% резкость точек скринтона
-            ans = img_blended + hp_texture * mask_original_3d * f_texture
+            # Исключаем попадание текстуры скринтона на линии рисунка и буквы
+            # Текстура наносится строго на фоновые области внутри маски
+            clean_texture_mask = mask_original_3d.copy()
+            clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
+            
+            # Дополнительное слияние с глобальным PatchMatch (ShiftMap) для непериодических зон
+            # Это дает гибридный подход: локальный сдвиг сетки + глобальное копирование текстуры
+            ans = img_blended + hp_texture * clean_texture_mask * f_texture
         else:
             ans = img_blended
             
