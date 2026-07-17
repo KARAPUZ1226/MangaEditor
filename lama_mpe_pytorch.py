@@ -943,5 +943,10 @@ class LamaMPEPyTorchInpainter:
         else:
             ans = img_blended
             
+        # Восстанавливаем оригинальные линии рисунка строго вне маски текста,
+        # чтобы они оставались 100% резкими и оригинальными, исключая любое размытие LaMa
+        restore_mask = (dilated_edges > 0) & (mask_original == 0)
+        ans[restore_mask] = img_original[restore_mask]
+            
         ans = np.clip(ans, 0, 255).astype(np.uint8)
         return ans
