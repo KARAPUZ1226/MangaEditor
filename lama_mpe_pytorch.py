@@ -693,25 +693,52 @@ class LamaMPEPyTorchInpainter:
             mask_refined = np.copy(mask)
             mask_refined[text_mask_dilated == 0] = 0
         
-        # Если после фильтрации маска пуста (U-Net ничего не нашёл),
-        # откатываемся к адаптивному порогу связных компонентов вместо полного прямоугольника
-        if np.sum(mask_refined >= 127) < 10:
+        # Если после фильтрации маска пуста (U-Net ничего не нашёл или маска слишком мелкая),
+        # запускаем интеллектуальный детектор текста и баблов.
+        if np.sum(mask_refined >= 127) < 150:
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            binary_dark = (gray_orig < 145).astype(np.uint8)
+            
+            # 1. Проверяем наличие речевого бабла (большая белая область)
+            binary_white = (gray_orig > 220).astype(np.uint8)
+            num_labels_w, labels_w, stats_w, centroids_w = cv2.connectedComponentsWithStats(binary_white, connectivity=8)
+            bubble_mask = np.zeros_like(gray_orig)
+            has_bubble = False
+            for i in range(1, num_labels_w):
+                if stats_w[i, cv2.CC_STAT_AREA] > 4000:
+                    bubble_mask[labels_w == i] = 255
+                    has_bubble = True
+            
+            # 2. Проверяем наличие букв текста (темные объекты среднего размера)
+            binary_dark = (gray_orig < 130).astype(np.uint8)
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
             text_mask = np.zeros_like(binary_dark)
+            has_text = False
             for i in range(1, num_labels):
-                # Текст имеет средний размер, исключаем огромные фоновые контуры и линии рук
-                if 20 < stats[i, cv2.CC_STAT_AREA] < 5000:
+                area = stats[i, cv2.CC_STAT_AREA]
+                w = stats[i, cv2.CC_STAT_WIDTH]
+                h = stats[i, cv2.CC_STAT_HEIGHT]
+                ar = max(w / (h + 1e-5), h / (w + 1e-5))
+                if 25 < area < 3000 and ar < 3.0:
                     text_mask[labels == i] = 255
-            kernel = np.ones((3, 3), np.uint8)
-            text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=2)
-            mask_refined = np.copy(mask)
-            mask_refined[text_mask_dilated == 0] = 0
+                    has_text = True
             
-            # Если и так пусто, только тогда берем весь прямоугольник
+            # Строим итоговую маску фоллбека
+            mask_fallback = np.zeros_like(mask)
+            if has_bubble:
+                kernel = np.ones((3, 3), np.uint8)
+                bubble_mask_eroded = cv2.erode(bubble_mask, kernel, iterations=2)
+                mask_fallback[bubble_mask_eroded > 0] = 255
+            elif has_text:
+                kernel = np.ones((3, 3), np.uint8)
+                text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=2)
+                mask_fallback[text_mask_dilated > 0] = 255
+            
+            mask_refined = np.copy(mask)
+            mask_refined[mask_fallback == 0] = 0
+            
+            # Если не обнаружено ни текста, ни бабла, возвращаем пустую маску (ничего не стираем)
             if np.sum(mask_refined >= 127) < 10:
-                mask_refined = mask
+                mask_refined = np.zeros_like(mask)
 
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
