@@ -843,49 +843,57 @@ class LamaMPEPyTorchInpainter:
             # Убираем линии из донора, чтобы они не мешали
             donor_no_lines = cv2.inpaint(donor_original, dilated_edges, 3, cv2.INPAINT_TELEA)
             
-            img_donor = donor_no_lines.copy().astype(np.float32)
-            
-            # Находим координаты всех пикселей маски
-            mask_y, mask_x = np.where(mask_original == 1)
-            
             # Векторы двумерной решетки скринтона
             v1x, v1y = best_dx, best_dy
             v2x, v2y = -best_dy, best_dx # Ортогональный вектор (для квадратного растра)
             
-            # Предвычисляем порядок обхода (от ближайших узлов к дальним)
-            R = 60
-            candidates = []
-            for i in range(-R, R + 1):
-                for j in range(-R, R + 1):
+            # Ищем один глобальный сдвиг (i, j) для всей маски, чтобы сохранить непрерывность текстуры
+            best_i, best_j = 0, 0
+            min_overlap = float('inf')
+            best_dist = float('inf')
+            
+            # Объединенная маска запрещенных зон (текст + контуры)
+            unhealthy_mask = ((mask_original > 0) | (dilated_edges > 0)).astype(np.float32)
+            
+            # Сканируем кандидатов (шаги по сетке скринтона)
+            for i in range(-20, 21):
+                for j in range(-20, 21):
                     if i == 0 and j == 0:
                         continue
-                    dist_sq = (i * v1x + j * v2x)**2 + (i * v1y + j * v2y)**2
-                    candidates.append((dist_sq, i, j))
-            
-            candidates.sort(key=lambda x: x[0])
-            sorted_candidates = [(i, j) for d, i, j in candidates]
-            
-            # Для каждого пикселя маски ищем абсолютно ближайшего донора
-            for y, x in zip(mask_y, mask_x):
-                for i, j in sorted_candidates:
-                    nx = x + i * v1x + j * v2x
-                    ny = y + i * v1y + j * v2y
+                    tx = i * v1x + j * v2x
+                    ty = i * v1y + j * v2y
                     
-                    if 0 <= nx < width and 0 <= ny < height:
-                        if mask_original[ny, nx] == 0 and dilated_edges[ny, nx] == 0:
-                            img_donor[y, x] = donor_no_lines[ny, nx]
-                            break
+                    # Проверяем, насколько сдвинутая маска ложится на здоровые пиксели
+                    M = np.float32([[1, 0, tx], [0, 1, ty]])
+                    shifted_unhealthy = cv2.warpAffine(unhealthy_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                    
+                    # Пересекаем с оригинальной маской текста
+                    overlap = np.sum(shifted_unhealthy * mask_original)
+                    dist = tx**2 + ty**2
+                    
+                    if overlap < min_overlap or (overlap == min_overlap and dist < best_dist):
+                        min_overlap = overlap
+                        best_i, best_j = i, j
+                        best_dist = dist
+                        
+            # Итоговый глобальный сдвиг
+            gtx = best_i * v1x + best_j * v2x
+            gty = best_i * v1y + best_j * v2y
+            
+            # Сдвигаем донора целиком на вектор решетки скринтона
+            M_global = np.float32([[1, 0, gtx], [0, 1, gty]])
+            img_donor = cv2.warpAffine(donor_no_lines, M_global, (width, height), borderMode=cv2.BORDER_REFLECT)
             
             # Размываем донора большим ядром для полного сглаживания точек
             donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (15, 15), 0).astype(np.float32)
             # Текстура содержит реальную амплитуду и градиент оригинального скана
-            hp_texture = img_donor - donor_smooth
+            hp_texture = img_donor.astype(np.float32) - donor_smooth
             
+            print(f"[LaMa PyTorch DEBUG] Global shift: i={best_i}, j={best_j} -> (tx={gtx}, ty={gty})")
             print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
         else:
             hp_texture = None
             print("[LaMa PyTorch DEBUG] No screentone detected, skipping texture synthesis")
-
 
         # === 5. Мягкое смешивание базовой структуры ===
         mask_bin = mask_original.astype(np.float32)
@@ -894,17 +902,20 @@ class LamaMPEPyTorchInpainter:
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
-        # LaMa даёт структуру (градиенты), оригинал — текстуру вокруг
-        img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+        # Применяем шумоподавление к структуре LaMa, чтобы получить идеальные градиенты
+        img_inpainted_smooth = cv2.bilateralFilter(img_inpainted, d=9, sigmaColor=35, sigmaSpace=35)
+
+        # Смешиваем шумоподавленные базовые структуры
+        img_blended = img_inpainted_smooth.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
         
         # === 6. Наложение текстуры поверх смешанной базы ===
         if hp_texture is not None:
-            # Текстура только на фоне внутри маски, не на линиях
+            # Текстура только на фоне внутри маски, не на контурах
             clean_texture_mask = mask_original_3d.copy()
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
             
-            # Модуляция f_texture удалена: донор сохраняет оригинальный размер точек и светлоту
-            ans = img_blended + hp_texture * clean_texture_mask
+            # Мягкое наложение текстуры (коэффициент 0.85), чтобы не перекрывать полностью результат LaMa
+            ans = img_blended + hp_texture * clean_texture_mask * 0.85
         else:
             ans = img_blended
             
