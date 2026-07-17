@@ -807,20 +807,31 @@ class LamaMPEPyTorchInpainter:
         
         print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={peak_val/power_mean:.2f}")
         
-        # === 3. Выделение структурных линий ===
-        # Используем оригинал для поиска линий, т.к. он чётче
-        detected_edges = cv2.Canny(gray_orig, 30, 100)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(detected_edges, connectivity=8)
-        dilated_edges = np.zeros_like(gray_orig)
+        # === 3. Улучшенное выделение структурных линий (без поглощения растра) ===
+        # Используем очищенное от текста изображение, чтобы текст не определялся как линии
+        gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+        
+        # Бинаризируем темные участки
+        _, binary_dark = cv2.threshold(gray_inpainted, 150, 255, cv2.THRESH_BINARY_INV)
+        
+        # Разрываем случайные мостики между точками растра
+        kernel_cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        binary_separated = cv2.erode(binary_dark, kernel_cross, iterations=1)
+        
+        # Ищем связные компоненты строго по 4 соседям (чтобы диагонали не слипались)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_separated, connectivity=4)
+        dilated_edges = np.zeros_like(gray_inpainted)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             area = stats[i, cv2.CC_STAT_AREA]
-            ar = max(w / (h + 1e-5), h / (w + 1e-5))
-            if area > 35 or ar > 1.8 or w > 10 or h > 10:
+            # Точки растра маленькие, линии - протяженные
+            if area > 20 or w > 15 or h > 15:
                 dilated_edges[labels == i] = 255
-        # Узкая дилатация — сохраняем больше фона
-        dilated_edges = cv2.dilate(dilated_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+                
+        # Возвращаем линиям исходную толщину + небольшой запас
+        kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
 
         # === 4. Текстурный синтез (если найден скринтон) ===
         if has_screentone and (best_dx != 0 or best_dy != 0):
@@ -837,32 +848,38 @@ class LamaMPEPyTorchInpainter:
             # Находим координаты всех пикселей маски
             mask_y, mask_x = np.where(mask_original == 1)
             
-            # Для каждого пикселя маски ищем донора вдоль вектора периода
+            # Векторы двумерной решетки скринтона
+            v1x, v1y = best_dx, best_dy
+            v2x, v2y = -best_dy, best_dx # Ортогональный вектор (для квадратного растра)
+            
+            # Предвычисляем порядок обхода (от ближайших узлов к дальним)
+            R = 60
+            candidates = []
+            for i in range(-R, R + 1):
+                for j in range(-R, R + 1):
+                    if i == 0 and j == 0:
+                        continue
+                    dist_sq = (i * v1x + j * v2x)**2 + (i * v1y + j * v2y)**2
+                    candidates.append((dist_sq, i, j))
+            
+            candidates.sort(key=lambda x: x[0])
+            sorted_candidates = [(i, j) for d, i, j in candidates]
+            
+            # Для каждого пикселя маски ищем абсолютно ближайшего донора
             for y, x in zip(mask_y, mask_x):
-                found = False
-                for step in range(1, 15):
-                    for direction in (1, -1):
-                        k = step * direction
-                        nx = x + k * best_dx
-                        ny = y + k * best_dy
-                        
-                        if 0 <= nx < width and 0 <= ny < height:
-                            # Точка должна быть строго вне маски текста И не на линии контура
-                            if mask_original[ny, nx] == 0 and dilated_edges[ny, nx] == 0:
-                                img_donor[y, x] = donor_no_lines[ny, nx]
-                                found = True
-                                break
-                    if found:
-                        break
+                for i, j in sorted_candidates:
+                    nx = x + i * v1x + j * v2x
+                    ny = y + i * v1y + j * v2y
+                    
+                    if 0 <= nx < width and 0 <= ny < height:
+                        if mask_original[ny, nx] == 0 and dilated_edges[ny, nx] == 0:
+                            img_donor[y, x] = donor_no_lines[ny, nx]
+                            break
             
-            # High-pass текстура = донор с текстурой - размытый донор (без текстуры)
-            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (7, 7), 0).astype(np.float32)
+            # Размываем донора большим ядром для полного сглаживания точек
+            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (15, 15), 0).astype(np.float32)
+            # Текстура содержит реальную амплитуду и градиент оригинального скана
             hp_texture = img_donor - donor_smooth
-            
-            # Модуляция: текстура сильнее в серых зонах, слабее на чистом белом/чёрном
-            inpainted_float = img_inpainted.astype(np.float32)
-            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
-            f_texture = np.clip(f_texture, 0.0, 1.0)
             
             print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
         else:
@@ -886,7 +903,8 @@ class LamaMPEPyTorchInpainter:
             clean_texture_mask = mask_original_3d.copy()
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
             
-            ans = img_blended + hp_texture * clean_texture_mask * f_texture
+            # Модуляция f_texture удалена: донор сохраняет оригинальный размер точек и светлоту
+            ans = img_blended + hp_texture * clean_texture_mask
         else:
             ans = img_blended
             
