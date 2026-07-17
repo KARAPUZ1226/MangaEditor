@@ -693,9 +693,25 @@ class LamaMPEPyTorchInpainter:
             mask_refined = np.copy(mask)
             mask_refined[text_mask_dilated == 0] = 0
         
-        # Если после фильтрации маска пуста, откатываемся к оригиналу
+        # Если после фильтрации маска пуста (U-Net ничего не нашёл),
+        # откатываемся к адаптивному порогу связных компонентов вместо полного прямоугольника
         if np.sum(mask_refined >= 127) < 10:
-            mask_refined = mask
+            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+            binary_dark = (gray_orig < 145).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+            text_mask = np.zeros_like(binary_dark)
+            for i in range(1, num_labels):
+                # Текст имеет средний размер, исключаем огромные фоновые контуры и линии рук
+                if 20 < stats[i, cv2.CC_STAT_AREA] < 5000:
+                    text_mask[labels == i] = 255
+            kernel = np.ones((3, 3), np.uint8)
+            text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=2)
+            mask_refined = np.copy(mask)
+            mask_refined[text_mask_dilated == 0] = 0
+            
+            # Если и так пусто, только тогда берем весь прямоугольник
+            if np.sum(mask_refined >= 127) < 10:
+                mask_refined = mask
 
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
@@ -850,31 +866,37 @@ class LamaMPEPyTorchInpainter:
             # Ищем один глобальный сдвиг (i, j) для всей маски, чтобы сохранить непрерывность текстуры
             best_i, best_j = 0, 0
             min_overlap = float('inf')
-            best_dist = float('inf')
             
             # Объединенная маска запрещенных зон (текст + контуры)
             unhealthy_mask = ((mask_original > 0) | (dilated_edges > 0)).astype(np.float32)
             
-            # Сканируем кандидатов (шаги по сетке скринтона)
-            for i in range(-20, 21):
-                for j in range(-20, 21):
+            # Предвычисляем и сортируем кандидатов по расстоянию (приоритет ближним сдвигам)
+            candidates = []
+            for i in range(-6, 7):
+                for j in range(-6, 7):
                     if i == 0 and j == 0:
                         continue
                     tx = i * v1x + j * v2x
                     ty = i * v1y + j * v2y
-                    
-                    # Проверяем, насколько сдвинутая маска ложится на здоровые пиксели
-                    M = np.float32([[1, 0, tx], [0, 1, ty]])
-                    shifted_unhealthy = cv2.warpAffine(unhealthy_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
-                    
-                    # Пересекаем с оригинальной маской текста
-                    overlap = np.sum(shifted_unhealthy * mask_original)
                     dist = tx**2 + ty**2
-                    
-                    if overlap < min_overlap or (overlap == min_overlap and dist < best_dist):
-                        min_overlap = overlap
-                        best_i, best_j = i, j
-                        best_dist = dist
+                    candidates.append((dist, i, j, tx, ty))
+            candidates.sort(key=lambda x: x[0])
+            
+            # Находим сдвиг с минимальным наложением на запретные зоны
+            for dist, i, j, tx, ty in candidates:
+                M = np.float32([[1, 0, tx], [0, 1, ty]])
+                shifted_unhealthy = cv2.warpAffine(unhealthy_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                overlap = np.sum(shifted_unhealthy * mask_original)
+                
+                # Допускаем микро-наложение менее 50 пикселей ради сохранения локальности сдвига
+                if overlap < 50:
+                    best_i, best_j = i, j
+                    min_overlap = overlap
+                    break
+                
+                if overlap < min_overlap:
+                    min_overlap = overlap
+                    best_i, best_j = i, j
                         
             # Итоговый глобальный сдвиг
             gtx = best_i * v1x + best_j * v2x
