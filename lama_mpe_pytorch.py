@@ -671,11 +671,16 @@ class LamaMPEPyTorchInpainter:
                 print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
                 # Откат к связным компонентам
                 binary_dark = (gray_orig < 145).astype(np.uint8)
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+                binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
                 text_mask = np.zeros_like(binary_dark)
                 for i in range(1, num_labels):
-                    if stats[i, cv2.CC_STAT_AREA] > 35:
+                    w = stats[i, cv2.CC_STAT_WIDTH]
+                    h = stats[i, cv2.CC_STAT_HEIGHT]
+                    ar = max(w / (h + 1e-5), h / (w + 1e-5))
+                    if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
                         text_mask[labels == i] = 255
+                text_mask[binary_dark == 0] = 0
                 kernel = np.ones((3, 3), np.uint8)
                 text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
                 mask_refined = np.copy(mask)
@@ -683,11 +688,16 @@ class LamaMPEPyTorchInpainter:
         else:
             # Откат к связным компонентам если U-Net не загружен
             binary_dark = (gray_orig < 145).astype(np.uint8)
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+            binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
             text_mask = np.zeros_like(binary_dark)
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] > 35:
+                w = stats[i, cv2.CC_STAT_WIDTH]
+                h = stats[i, cv2.CC_STAT_HEIGHT]
+                ar = max(w / (h + 1e-5), h / (w + 1e-5))
+                if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
                     text_mask[labels == i] = 255
+            text_mask[binary_dark == 0] = 0
             kernel = np.ones((3, 3), np.uint8)
             text_mask_dilated = cv2.dilate(text_mask, kernel, iterations=4)
             mask_refined = np.copy(mask)
@@ -714,7 +724,8 @@ class LamaMPEPyTorchInpainter:
             
             # 2. Проверяем наличие букв текста (темные объекты среднего размера)
             binary_dark = (gray_analysis < 130).astype(np.uint8)
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
+            binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
             text_mask = np.zeros_like(binary_dark)
             has_text = False
             for i in range(1, num_labels):
@@ -725,6 +736,7 @@ class LamaMPEPyTorchInpainter:
                 if 25 < area < 3000 and ar < 3.0:
                     text_mask[labels == i] = 255
                     has_text = True
+            text_mask[binary_dark == 0] = 0
             
             # Строим итоговую маску фоллбека
             mask_fallback = np.zeros_like(mask)
