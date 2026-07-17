@@ -761,26 +761,17 @@ class LamaMPEPyTorchInpainter:
             if np.sum(mask_refined >= 127) < 10:
                 mask_refined = np.zeros_like(mask)
 
-        # Ищем длинные сплошные линии (включая наклоненные границы кадров) через связные компоненты
-        gray_orig_bin = (gray_orig < 130).astype(np.uint8)
-        gray_orig_closed = cv2.morphologyEx(gray_orig_bin, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-        num_l, labels_l, stats_l, _ = cv2.connectedComponentsWithStats(gray_orig_closed, connectivity=8)
-        
+        # Детектируем длинные сплошные линии (границы кадров) через HoughLinesP,
+        # чтобы гарантированно не захватить текст, но надежно найти прямые рамки кадра под любым углом
         frame_lines = np.zeros_like(gray_orig)
-        for i in range(1, num_l):
-            w_comp = stats_l[i, cv2.CC_STAT_WIDTH]
-            h_comp = stats_l[i, cv2.CC_STAT_HEIGHT]
-            area_comp = stats_l[i, cv2.CC_STAT_AREA]
-            
-            # Если компонент протяженный (длина или высота больше 60 пикселей)
-            if w_comp > 60 or h_comp > 60:
-                overlap = np.sum((labels_l == i) & (text_mask_raw > 0)) / (area_comp + 1e-5)
-                # Исключаем буквы (у букв перекрытие с маской текста высокое, у рамок - близкое к нулю)
-                if overlap < 0.25:
-                    frame_lines[labels_l == i] = 255
-                    
-        # Расширяем рамки для надежного перекрытия краев
-        frame_lines = cv2.dilate(frame_lines, np.ones((3, 3), np.uint8), iterations=2)
+        edges = cv2.Canny(gray_orig, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=60, maxLineGap=10)
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                cv2.line(frame_lines, (x1, y1), (x2, y2), 255, 5)
+        # Слегка расширяем рамки для надежного перекрытия краев
+        frame_lines = cv2.dilate(frame_lines, np.ones((3, 3), np.uint8), iterations=1)
         
         # Вычитаем рамки кадра из масок стирания и сырого текста
         mask_refined[frame_lines > 0] = 0
