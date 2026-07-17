@@ -674,8 +674,8 @@ class LamaMPEPyTorchInpainter:
         text_mask_raw[combined_text] = 255
         text_mask_raw[white_outline] = 255
         
-        # 5. Слегка расширяем для сглаживания краев
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=2)
+        # 5. Слегка расширяем для сглаживания краев и полного удаления белых ореолов
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=4)
         
         # 6. Ограничиваем областью выделения пользователя
         mask_refined = np.copy(mask)
@@ -970,8 +970,8 @@ class LamaMPEPyTorchInpainter:
             f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
             f_texture = np.clip(f_texture, 0.0, 1.0)
             
-            # Мягкое наложение текстуры (коэффициент 0.85), чтобы не перекрывать полностью результат LaMa
-            ans = img_blended + hp_texture * clean_texture_mask * f_texture * 0.85
+            # Наложение текстуры с коэффициентом 1.0 для полного слияния с оригинальным растром
+            ans = img_blended + hp_texture * clean_texture_mask * f_texture * 1.0
         else:
             ans = img_blended
             
