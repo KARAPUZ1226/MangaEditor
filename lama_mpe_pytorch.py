@@ -882,11 +882,19 @@ class LamaMPEPyTorchInpainter:
 
         # === 4. Текстурный синтез (если найден скринтон) ===
         if has_screentone and (best_dx != 0 or best_dy != 0):
-            # Донор — ОРИГИНАЛЬНОЕ изображение, где текст заменён через простой Telea.
             # Это сохраняет скринтоны на доноре, но убирает текст.
+            # Детектируем баблы в кропе, чтобы исключить их из здоровых доноров текстуры
+            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+            binary_white = (gray_orig > 220).astype(np.uint8)
+            num_labels_w, labels_w, stats_w, _ = cv2.connectedComponentsWithStats(binary_white, connectivity=8)
+            bubble_mask = np.zeros_like(gray_orig)
+            for i in range(1, num_labels_w):
+                if stats_w[i, cv2.CC_STAT_AREA] > 4000:
+                    bubble_mask[labels_w == i] = 1
+
             text_mask_u8 = (mask_original * 255).astype(np.uint8)
             # Дилатируем маску букв на доноре, чтобы гарантированно стереть белую обводку букв
-            text_mask_u8_dilated = cv2.dilate(text_mask_u8, np.ones((5, 5), np.uint8), iterations=1)
+            text_mask_u8_dilated = cv2.dilate(text_mask_u8, np.ones((7, 7), np.uint8), iterations=2)
             donor_original = cv2.inpaint(img_original, text_mask_u8_dilated, 3, cv2.INPAINT_TELEA)
             
             # Убираем линии из донора, чтобы они не мешали
@@ -894,6 +902,7 @@ class LamaMPEPyTorchInpainter:
             
             img_donor = donor_no_lines.copy().astype(np.float32)
             working_mask = mask_original.copy()
+            donor_mask = (mask_original | bubble_mask).copy()
             
             # Сдвиг в направлении, ПРОТИВОПОЛОЖНОМ периоду
             M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
@@ -903,11 +912,12 @@ class LamaMPEPyTorchInpainter:
                 if np.sum(working_mask) == 0:
                     break
                 shifted = cv2.warpAffine(img_donor, M, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
-                shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height), 
+                shifted_mask = cv2.warpAffine(donor_mask.astype(np.float32), M, (width, height), 
                                                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
                 copy_map = (working_mask == 1) & (shifted_mask < 0.5)
                 img_donor[copy_map] = shifted[copy_map]
+                donor_mask[copy_map] = 0
                 working_mask[copy_map] = 0
             
             # Размываем донора большим ядром для полного сглаживания точек
