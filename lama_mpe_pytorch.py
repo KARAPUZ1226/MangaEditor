@@ -815,11 +815,9 @@ class LamaMPEPyTorchInpainter:
             img_inpainted = img_inpainted[0:height, 0:width]
 
         # === 2. FFT-based поиск периода скринтона на ОРИГИНАЛЕ ===
-        # Скринтоны ищем на gray_orig (исходное изображение), но только вне маски текста.
-        # Это критически важно: на img_inpainted скринтонов уже нет.
-        
-        # Создаём маску "живых" пикселей на оригинале
-        live_mask_orig = (mask_original == 0).astype(np.float32)
+        # Сканируем 9 областей кропа, чтобы найти область с самой чистой текстурой без текста
+        sub_size = min(256, height, width)
+        half_sub = sub_size // 2
         
         # Находим центр выделения для локального анализа
         y_indices, x_indices = np.where(mask_original == 1)
@@ -828,51 +826,110 @@ class LamaMPEPyTorchInpainter:
             cx_box = int(x_indices.mean())
         else:
             cy_box, cx_box = height // 2, width // 2
+            
+        best_peak_ratio = 0.0
+        best_dy = 0
+        best_dx = 0
         
-        sub_size = 256  # Достаточно для FFT
-        y0_sub = max(0, cy_box - sub_size // 2)
-        y1_sub = min(height, cy_box + sub_size // 2)
-        x0_sub = max(0, cx_box - sub_size // 2)
-        x1_sub = min(width, cx_box + sub_size // 2)
+        # 3x3 сетка центров окон для поиска чистого скринтона
+        grid_points = [
+            (cy_box - half_sub, cx_box - half_sub),
+            (cy_box - half_sub, cx_box),
+            (cy_box - half_sub, cx_box + half_sub),
+            (cy_box, cx_box - half_sub),
+            (cy_box, cx_box),
+            (cy_box, cx_box + half_sub),
+            (cy_box + half_sub, cx_box - half_sub),
+            (cy_box + half_sub, cx_box),
+            (cy_box + half_sub, cx_box + half_sub)
+        ]
         
-        gray_sub = gray_orig[y0_sub:y1_sub, x0_sub:x1_sub].astype(np.float32)
-        mask_sub = live_mask_orig[y0_sub:y1_sub, x0_sub:x1_sub]
-        
-        # Нормализуем и маскируем текст
-        gray_sub -= gray_sub.mean()
-        gray_sub *= mask_sub  # Обнуляем текстовую область
-        
-        # Автокорреляция через FFT
-        f_gray = np.fft.fft2(gray_sub)
-        f_conj = np.conj(f_gray)
-        power = np.fft.ifft2(f_gray * f_conj).real
-        
-        # Ищем пиксели периодичности (исключаем нулевой сдвиг и мелкие сдвиги)
-        h_sub, w_sub = gray_sub.shape
-        cy, cx = h_sub // 2, w_sub // 2
-        
-        # Сдвигаем ноль в центр для удобства
-        power_shifted = np.fft.fftshift(power)
-        
-        # Обнуляем центральную зону (нулевой и мелкие сдвиги)
-        search_half = 16
-        y_start = max(0, cy - search_half)
-        y_end = min(h_sub, cy + search_half + 1)
-        x_start = max(0, cx - search_half)
-        x_end = min(w_sub, cx + search_half + 1)
-        power_shifted[y_start:y_end, x_start:x_end] = 0
-        
-        # Находим пик максимума — это и есть период скринтона
-        max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
-        best_dy = max_idx[0] - cy
-        best_dx = max_idx[1] - cx
-        
-        # Проверяем, что период реальный (сильный пик)
-        peak_val = power_shifted[max_idx]
-        power_mean = np.mean(power_shifted)
-        has_screentone = peak_val > power_mean * 3.0  # Пик в 3+ раза сильнее среднего = есть скринтон
-        
-        print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={peak_val/power_mean:.2f}")
+        for cy, cx in grid_points:
+            y0_sub = max(0, cy - half_sub)
+            y1_sub = min(height, cy + half_sub)
+            x0_sub = max(0, cx - half_sub)
+            x1_sub = min(width, cx + half_sub)
+            
+            # Корректируем размеры до ровного квадрата sub_size x sub_size
+            if (y1_sub - y0_sub) < sub_size:
+                if y0_sub == 0:
+                    y1_sub = min(height, sub_size)
+                else:
+                    y0_sub = max(0, y1_sub - sub_size)
+            if (x1_sub - x0_sub) < sub_size:
+                if x0_sub == 0:
+                    x1_sub = min(width, sub_size)
+                else:
+                    x0_sub = max(0, x1_sub - sub_size)
+                    
+            h_s, w_s = y1_sub - y0_sub, x1_sub - x0_sub
+            if h_s < 64 or w_s < 64:
+                continue
+                
+            # Считаем процент текста в окне
+            mask_area = np.sum(mask_original[y0_sub:y1_sub, x0_sub:x1_sub] > 0)
+            if mask_area > h_s * w_s * 0.15:
+                continue
+                
+            gray_sub = gray_orig[y0_sub:y1_sub, x0_sub:x1_sub].astype(np.float32)
+            mask_sub = (mask_original[y0_sub:y1_sub, x0_sub:x1_sub] == 0).astype(np.float32)
+            
+            # Маскируем и центрируем
+            gray_sub -= gray_sub.mean()
+            gray_sub *= mask_sub
+            
+            # FFT
+            f_gray = np.fft.fft2(gray_sub)
+            f_conj = np.conj(f_gray)
+            power = np.fft.ifft2(f_gray * f_conj).real
+            power_shifted = np.fft.fftshift(power)
+            
+            cy_s, cx_s = h_s // 2, w_s // 2
+            search_half = 16
+            y_start = max(0, cy_s - search_half)
+            y_end = min(h_s, cy_s + search_half + 1)
+            x_start = max(0, cx_s - search_half)
+            x_end = min(w_s, cx_s + search_half + 1)
+            power_shifted[y_start:y_end, x_start:x_end] = 0
+            
+            max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
+            dy = max_idx[0] - cy_s
+            dx = max_idx[1] - cx_s
+            
+            peak_val = power_shifted[max_idx]
+            power_mean = np.mean(power_shifted)
+            ratio = peak_val / (power_mean + 1e-5)
+            
+            if ratio > best_peak_ratio:
+                best_peak_ratio = ratio
+                best_dy = dy
+                best_dx = dx
+                
+        # Если ни одно окно не подошло, берем центр без ограничений на маску
+        if best_peak_ratio == 0.0:
+            y0_sub = max(0, height // 2 - half_sub)
+            y1_sub = min(height, height // 2 + half_sub)
+            x0_sub = max(0, width // 2 - half_sub)
+            x1_sub = min(width, width // 2 + half_sub)
+            h_s, w_s = y1_sub - y0_sub, x1_sub - x0_sub
+            gray_sub = gray_orig[y0_sub:y1_sub, x0_sub:x1_sub].astype(np.float32)
+            gray_sub -= gray_sub.mean()
+            gray_sub *= (mask_original[y0_sub:y1_sub, x0_sub:x1_sub] == 0)
+            f_gray = np.fft.fft2(gray_sub)
+            f_conj = np.conj(f_gray)
+            power = np.fft.ifft2(f_gray * f_conj).real
+            power_shifted = np.fft.fftshift(power)
+            cy_s, cx_s = h_s // 2, w_s // 2
+            search_half = 16
+            power_shifted[max(0, cy_s - search_half):min(h_s, cy_s + search_half + 1),
+                          max(0, cx_s - search_half):min(w_s, cx_s + search_half + 1)] = 0
+            max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
+            best_dy = max_idx[0] - cy_s
+            best_dx = max_idx[1] - cx_s
+            best_peak_ratio = power_shifted[max_idx] / (np.mean(power_shifted) + 1e-5)
+            
+        has_screentone = best_peak_ratio > 3.0
+        print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={best_peak_ratio:.2f}")
         
         # === 3. Улучшенное выделение структурных линий (без поглощения растра) ===
         # Используем ОРИГИНАЛЬНОЕ изображение для детекции линий, чтобы не потерять стертые LaMa куски рамок
