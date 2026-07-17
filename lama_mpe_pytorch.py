@@ -752,7 +752,7 @@ class LamaMPEPyTorchInpainter:
         height, width, c = image.shape
 
         # Сохраняем отладочную маску на диск для визуальной проверки
-        cv2.imwrite(f"mask_debug_{height}x{width}.png", (mask_original * 255).astype(np.uint8))
+        cv2.imwrite(f"mask_debug_{y0_box}_{x0_box}.png", (mask_original * 255).astype(np.uint8))
 
         # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
         pad_size = 8
