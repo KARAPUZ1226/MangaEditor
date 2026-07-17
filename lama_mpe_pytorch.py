@@ -612,6 +612,7 @@ class LamaMPEPyTorchInpainter:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
         text_mask_raw = np.zeros_like(mask)
+        y0_box, x0_box = 0, 0
         
         # === 0. Автоматическое уточнение маски через U-Net segmenter ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
@@ -768,8 +769,10 @@ class LamaMPEPyTorchInpainter:
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=60, maxLineGap=10)
         if lines is not None:
             for line in lines:
-                x1, y1, x2, y2 = line[0]
-                cv2.line(frame_lines, (x1, y1), (x2, y2), 255, 5)
+                coords = line.flatten()
+                if len(coords) == 4:
+                    x1, y1, x2, y2 = coords
+                    cv2.line(frame_lines, (x1, y1), (x2, y2), 255, 5)
         # Слегка расширяем рамки для надежного перекрытия краев
         frame_lines = cv2.dilate(frame_lines, np.ones((3, 3), np.uint8), iterations=1)
         
