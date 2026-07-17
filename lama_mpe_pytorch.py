@@ -761,6 +761,25 @@ class LamaMPEPyTorchInpainter:
             if np.sum(mask_refined >= 127) < 10:
                 mask_refined = np.zeros_like(mask)
 
+        # Детектируем длинные сплошные линии (границы кадров)
+        gray_orig_bin = (gray_orig < 130).astype(np.uint8)
+        
+        # Вертикальные линии длиной от 80 пикселей
+        kernel_v = np.ones((80, 1), np.uint8)
+        lines_v = cv2.morphologyEx(gray_orig_bin, cv2.MORPH_OPEN, kernel_v)
+        lines_v = cv2.dilate(lines_v, np.ones((1, 5), np.uint8))
+        
+        # Горизонтальные линии длиной от 80 пикселей
+        kernel_h = np.ones((1, 80), np.uint8)
+        lines_h = cv2.morphologyEx(gray_orig_bin, cv2.MORPH_OPEN, kernel_h)
+        lines_h = cv2.dilate(lines_h, np.ones((5, 1), np.uint8))
+        
+        frame_lines = (lines_v | lines_h)
+        
+        # Вычитаем рамки кадра из масок стирания и сырого текста
+        mask_refined[frame_lines > 0] = 0
+        text_mask_raw[frame_lines > 0] = 0
+
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
         mask_original[mask_original >= 127] = 1
@@ -831,17 +850,17 @@ class LamaMPEPyTorchInpainter:
         best_dy = 0
         best_dx = 0
         
-        # 3x3 сетка центров окон для поиска чистого скринтона
+        # Регулярная сетка по всему кропу (не привязана к координатам текста)
         grid_points = [
-            (cy_box - half_sub, cx_box - half_sub),
-            (cy_box - half_sub, cx_box),
-            (cy_box - half_sub, cx_box + half_sub),
-            (cy_box, cx_box - half_sub),
-            (cy_box, cx_box),
-            (cy_box, cx_box + half_sub),
-            (cy_box + half_sub, cx_box - half_sub),
-            (cy_box + half_sub, cx_box),
-            (cy_box + half_sub, cx_box + half_sub)
+            (height // 4, width // 4),
+            (height // 4, width // 2),
+            (height // 4, 3 * width // 4),
+            (height // 2, width // 4),
+            (height // 2, width // 2),
+            (height // 2, 3 * width // 4),
+            (3 * height // 4, width // 4),
+            (3 * height // 4, width // 2),
+            (3 * height // 4, 3 * width // 4)
         ]
         
         for cy, cx in grid_points:
