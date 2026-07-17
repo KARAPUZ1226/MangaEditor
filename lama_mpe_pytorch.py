@@ -745,13 +745,14 @@ class LamaMPEPyTorchInpainter:
             img_inpainted = img_inpainted[0:height, 0:width]
 
         # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
-        gray_original = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        # Выделяем линии по очищенной версии (после LaMa), чтобы поймать контуры и снаружи, и прорисованные изнутри
+        gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
         
         # 1. Выделяем структурные линии рисунка через Canny + анализ связных компонентов
         # Это позволяет со 100% точностью отделить мелкие круглые точки скринтона от любых контуров и штриховки
-        detected_edges = cv2.Canny(gray_original, 30, 100)
+        detected_edges = cv2.Canny(gray_inpainted, 30, 100)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(detected_edges, connectivity=8)
-        dilated_edges = np.zeros_like(gray_original)
+        dilated_edges = np.zeros_like(gray_inpainted)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
@@ -778,7 +779,7 @@ class LamaMPEPyTorchInpainter:
         x0_sub = max(0, cx_box - sub_size // 2)
         x1_sub = min(width, cx_box + sub_size // 2)
         
-        gray_sub = gray_original[y0_sub:y1_sub, x0_sub:x1_sub]
+        gray_sub = gray_inpainted[y0_sub:y1_sub, x0_sub:x1_sub]
         mask_sub = live_mask[y0_sub:y1_sub, x0_sub:x1_sub]
         h_sub, w_sub = gray_sub.shape
         
@@ -830,13 +831,11 @@ class LamaMPEPyTorchInpainter:
             img_donor = img_inpainted_no_lines.copy()
             working_mask = mask_original.copy()
             donor_mask = mask_original.copy()
-            donor_mask[dilated_edges > 0] = 1
             
             img_smooth_bgr = cv2.GaussianBlur(img_inpainted_no_lines, (7, 7), 0)
             img_donor_smooth = img_smooth_bgr.copy()
             working_mask_smooth = mask_original.copy()
             donor_mask_smooth = mask_original.copy()
-            donor_mask_smooth[dilated_edges > 0] = 1
             
             M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
