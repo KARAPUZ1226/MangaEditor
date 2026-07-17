@@ -618,15 +618,16 @@ class LamaMPEPyTorchInpainter:
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
         # 1. Запуск детектора связных компонентов (высокая полнота для любых шрифтов)
+        # Работаем по сырой бинаризации, чтобы буквы не слипались в одну широкую строку с высоким aspect ratio
         binary_dark = (gray_orig < 145).astype(np.uint8)
-        binary_dark_closed = cv2.morphologyEx(binary_dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark_closed, connectivity=8)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
         cc_text_mask = np.zeros_like(binary_dark)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             ar = max(w / (h + 1e-5), h / (w + 1e-5))
-            if stats[i, cv2.CC_STAT_AREA] > 35 and ar < 3.0:
+            # Для отдельных символов порог площади ниже (от 15 пикселей), а отношение сторон шире (до 3.5)
+            if stats[i, cv2.CC_STAT_AREA] > 15 and ar < 3.5:
                 cc_text_mask[labels == i] = 255
         cc_text_mask[binary_dark == 0] = 0
         
