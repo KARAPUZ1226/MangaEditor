@@ -823,13 +823,16 @@ class LamaMPEPyTorchInpainter:
         # Если сдвиг найден, накладываем текстуру скринтона
         print(f"[LaMa PyTorch DEBUG] Best shift found: dx={best_dx}, dy={best_dy}")
         if best_dx != 0 or best_dy != 0:
+            # Стираем все контуры и линии рисунка на доноре, заменяя их фоном, чтобы они физически не переносились
+            img_inpainted_no_lines = cv2.inpaint(img_inpainted, dilated_edges, 3, cv2.INPAINT_TELEA)
+            
             # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
-            img_donor = img_inpainted.copy()
+            img_donor = img_inpainted_no_lines.copy()
             working_mask = mask_original.copy()
             donor_mask = mask_original.copy()
             donor_mask[dilated_edges > 0] = 1
             
-            img_smooth_bgr = cv2.GaussianBlur(img_inpainted, (7, 7), 0)
+            img_smooth_bgr = cv2.GaussianBlur(img_inpainted_no_lines, (7, 7), 0)
             img_donor_smooth = img_smooth_bgr.copy()
             working_mask_smooth = mask_original.copy()
             donor_mask_smooth = mask_original.copy()
