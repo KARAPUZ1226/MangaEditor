@@ -848,12 +848,26 @@ class LamaMPEPyTorchInpainter:
             
             # 4. Модулируем размер точек по сглаженной карте градиентов LaMa (img_inpainted)
             img_smooth_bgr = cv2.GaussianBlur(img_inpainted, (7, 7), 0)
+            
+            # Калибровка средней яркости для компенсации возможных засветов от LaMa
+            gray_orig_smooth = cv2.GaussianBlur(gray_original, (7, 7), 0)
+            gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+            gray_inpainted_smooth = cv2.GaussianBlur(gray_inpainted, (7, 7), 0)
+            
+            mean_healthy = np.mean(gray_orig_smooth[live_mask == 1]) if np.sum(live_mask) > 0 else 180.0
+            mean_inpainted = np.mean(gray_inpainted_smooth[mask_original == 1]) if np.sum(mask_original) > 0 else mean_healthy
+            scale = mean_healthy / (mean_inpainted + 1e-5)
+            
             synth_screentone = np.zeros_like(img_inpainted, dtype=np.float32)
             
             for c_idx in range(3):
-                # Темные области (ближе к 0) -> точки больше (порог выше -> больше черного)
-                # Светлые области (ближе к 255) -> точки меньше (порог ниже -> меньше черного)
-                thresh_map = 1.0 - (img_smooth_bgr[:, :, c_idx].astype(np.float32) / 255.0)
+                # Нормализуем и калибруем яркость под фон
+                L = img_smooth_bgr[:, :, c_idx].astype(np.float32) / 255.0
+                L_calibrated = np.clip(L * scale, 0.0, 1.0)
+                
+                # Точный нелинейный пересчет порога (аппроксимация CDF косинусной решетки)
+                thresh_map = -1.6707 * L_calibrated**3 + 2.5047 * L_calibrated**2 - 1.8617 * L_calibrated + 1.0147
+                thresh_map = np.clip(thresh_map, 0.0, 1.0)
                 
                 channel_synth = np.ones((height, width), dtype=np.float32) * 255.0
                 channel_synth[S_norm < thresh_map] = 0.0
