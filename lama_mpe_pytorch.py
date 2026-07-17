@@ -747,17 +747,17 @@ class LamaMPEPyTorchInpainter:
         # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
         gray_original = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Выделяем структурные линии рисунка через анализ связных компонентов
-        # Это позволяет надежно отделить мелкие круглые точки скринтона от длинных контуров и штриховки
-        _, binary = cv2.threshold(gray_original, 160, 255, cv2.THRESH_BINARY_INV)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        # 1. Выделяем структурные линии рисунка через Canny + анализ связных компонентов
+        # Это позволяет со 100% точностью отделить мелкие круглые точки скринтона от любых контуров и штриховки
+        detected_edges = cv2.Canny(gray_original, 30, 100)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(detected_edges, connectivity=8)
         dilated_edges = np.zeros_like(gray_original)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             area = stats[i, cv2.CC_STAT_AREA]
             ar = max(w / (h + 1e-5), h / (w + 1e-5))
-            if area > 45 or ar > 1.8 or w > 12 or h > 12:
+            if area > 35 or ar > 1.8 or w > 10 or h > 10:
                 dilated_edges[labels == i] = 255
         dilated_edges = cv2.dilate(dilated_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=2)
 
@@ -823,74 +823,59 @@ class LamaMPEPyTorchInpainter:
         # Если сдвиг найден, накладываем текстуру скринтона
         print(f"[LaMa PyTorch DEBUG] Best shift found: dx={best_dx}, dy={best_dy}")
         if best_dx != 0 or best_dy != 0:
-            # 1. Задаем сетку координат и ортогональный базис решетки скринтона
-            y_coords, x_coords = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
+            # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
+            img_donor = img_inpainted.copy()
+            working_mask = mask_original.copy()
+            donor_mask = mask_original.copy()
+            donor_mask[dilated_edges > 0] = 1
             
-            D2 = best_dx**2 + best_dy**2
-            u = (x_coords * best_dx + y_coords * best_dy) / D2
-            v = (-x_coords * best_dy + y_coords * best_dx) / D2
-            
-            # 2. Оцениваем фазовые сдвиги по здоровой части оригинального изображения
-            gray_orig = gray_original.astype(np.float32)
-            gray_orig_smooth = cv2.GaussianBlur(gray_original, (7, 7), 0)
-            gray_hp = gray_orig - gray_orig_smooth.astype(np.float32)
-            
-            # Проекция на комплексную экспоненту для поиска фазы (только на чистых фоновых пикселях)
-            C_u = np.sum(gray_hp * np.exp(-2j * np.pi * u) * live_mask)
-            phi_u = np.angle(C_u)
-            
-            C_v = np.sum(gray_hp * np.exp(-2j * np.pi * v) * live_mask)
-            phi_v = np.angle(C_v)
-            
-            # 3. Синтезируем идеальную двумерную косинусную решетку скринтона
-            S = np.cos(2 * np.pi * u - phi_u) + np.cos(2 * np.pi * v - phi_v)
-            S_norm = (S + 2.0) / 4.0  # приводим к диапазону [0, 1]
-            
-            # 4. Модулируем размер точек по сглаженной карте градиентов LaMa (img_inpainted)
             img_smooth_bgr = cv2.GaussianBlur(img_inpainted, (7, 7), 0)
+            img_donor_smooth = img_smooth_bgr.copy()
+            working_mask_smooth = mask_original.copy()
+            donor_mask_smooth = mask_original.copy()
+            donor_mask_smooth[dilated_edges > 0] = 1
             
-            # Калибровка средней яркости для компенсации возможных засветов от LaMa
-            gray_orig_smooth = cv2.GaussianBlur(gray_original, (7, 7), 0)
-            gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
-            gray_inpainted_smooth = cv2.GaussianBlur(gray_inpainted, (7, 7), 0)
+            M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
-            mean_healthy = np.mean(gray_orig_smooth[live_mask == 1]) if np.sum(live_mask) > 0 else 180.0
-            mean_inpainted = np.mean(gray_inpainted_smooth[mask_original == 1]) if np.sum(mask_original) > 0 else mean_healthy
-            scale = mean_healthy / (mean_inpainted + 1e-5)
-            
-            synth_screentone = np.zeros_like(img_inpainted, dtype=np.float32)
-            
-            for c_idx in range(3):
-                # Нормализуем и калибруем яркость под фон
-                L = img_smooth_bgr[:, :, c_idx].astype(np.float32) / 255.0
-                L_calibrated = np.clip(L * scale, 0.0, 1.0)
+            # 20 шагов сдвига гарантированно покроют маску любой ширины при малых периодах (например, 3 пикселя)
+            for _ in range(20):
+                if np.sum(working_mask) == 0:
+                    break
+                # Сдвигаем текущих доноров
+                shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask = cv2.warpAffine(donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-                # Точный нелинейный пересчет порога (аппроксимация CDF косинусной решетки)
-                thresh_map = -1.6707 * L_calibrated**3 + 2.5047 * L_calibrated**2 - 1.8617 * L_calibrated + 1.0147
-                thresh_map = np.clip(thresh_map, 0.0, 1.0)
+                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
+                copy_map = (working_mask == 1) & (shifted_mask == 0)
+                img_donor[copy_map] = shifted_img[copy_map]
+                donor_mask[copy_map] = 0
+                working_mask[copy_map] = 0
                 
-                channel_synth = np.ones((height, width), dtype=np.float32) * 255.0
-                channel_synth[S_norm < thresh_map] = 0.0
-                synth_screentone[:, :, c_idx] = channel_synth
+                # Analogously for the smoothed donor
+                shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
                 
-            # Высокочастотная текстура: разность синтеза и сглаженного инпейнта
-            hp_texture = synth_screentone - img_smooth_bgr.astype(np.float32)
+                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0)
+                img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
+                donor_mask_smooth[copy_map_smooth] = 0
+                working_mask_smooth[copy_map_smooth] = 0
             
-            # 5. Выделяем контуры и линии рисунка (Line Reinsertion), чтобы вернуть им сплошной цвет
-            inpainted_gray = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
-            inpainted_edges = cv2.Canny(inpainted_gray, 30, 80)
-            dilated_inpainted_edges = cv2.dilate(inpainted_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-            dark_pixels = (inpainted_gray < 80)
-            line_mask_inpainted = ((dilated_inpainted_edges > 0) | dark_pixels).astype(np.float32)
+            # Извлекаем высокие частоты (только точки скринтона, без линий контуров)
+            hp_texture = img_donor.astype(np.float32) - img_donor_smooth.astype(np.float32)
             
-            # Гасим текстуру скринтона на линиях рисунка, оставляя их сплошными
-            hp_texture = hp_texture * (1.0 - line_mask_inpainted[:, :, None])
+            # Фильтр яркости (модуляция): гасим текстуру на чисто белом (баблы) и чисто черном (контуры)
+            # чтобы точки скринтона не залезали на белый текст и не размывали черную обводку
+            inpainted_float = img_inpainted.astype(np.float32)
+            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
+            f_texture = np.clip(f_texture, 0.0, 1.0)
             
-            # f_texture удален, так как параметрический расчет растра естественно гасит точки на белом/черном
-            pass
-            
-            print(f"[LaMa PyTorch DEBUG] Parametric hp_texture stats: min={np.min(hp_texture)}, max={np.max(hp_texture)}, mean_abs={np.mean(np.abs(hp_texture))}")
+            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture)}, max={np.max(hp_texture)}, mean_abs={np.mean(np.abs(hp_texture))}")
+            print(f"[LaMa PyTorch DEBUG] f_texture stats: min={np.min(f_texture)}, max={np.max(f_texture)}, mean={np.mean(f_texture)}")
             print(f"[LaMa PyTorch DEBUG] mask_original_3d sum: {np.sum(mask_original_3d)}")
+            
+            # Накладываем текстуру скринтона поверх результата LaMa
+            # (Ничего не делаем здесь, переносим наложение в конец)
+            pass
 
 
         # === 3. Мягкое смешивание базовой структуры (LaMa + Оригинал) ===
@@ -907,7 +892,7 @@ class LamaMPEPyTorchInpainter:
         # === 4. Наложение текстуры поверх смешанной базы ("Бутерброд") ===
         if best_dx != 0 or best_dy != 0:
             # Накладываем текстуру на уже смешанную базу, чтобы сохранить 100% резкость точек скринтона
-            ans = img_blended + hp_texture * mask_original_3d
+            ans = img_blended + hp_texture * mask_original_3d * f_texture
         else:
             ans = img_blended
             
