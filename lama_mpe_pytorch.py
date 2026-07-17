@@ -948,8 +948,13 @@ class LamaMPEPyTorchInpainter:
             clean_texture_mask = mask_original_3d.copy()
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
             
+            # Модулируем амплитуду текстуры по яркости LaMa-градиента (белый/черный -> 0, серый -> 1)
+            inpainted_float = img_inpainted_smooth.astype(np.float32)
+            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
+            f_texture = np.clip(f_texture, 0.0, 1.0)
+            
             # Мягкое наложение текстуры (коэффициент 0.85), чтобы не перекрывать полностью результат LaMa
-            ans = img_blended + hp_texture * clean_texture_mask * 0.85
+            ans = img_blended + hp_texture * clean_texture_mask * f_texture * 0.85
         else:
             ans = img_blended
             
