@@ -617,17 +617,18 @@ class LamaMPEPyTorchInpainter:
         # === 0. Интеллектуальное детектирование текста (U-Net + Связные компоненты) ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Запуск детектора связных компонентов (высокая полнота для любых шрифтов)
-        # Работаем по сырой бинаризации, чтобы буквы не слипались в одну широкую строку с высоким aspect ratio
-        binary_dark = (gray_orig < 145).astype(np.uint8)
+        # 1. Запуск детектора связных компонентов (сглаживание медианным фильтром от шумов/растра)
+        gray_smooth = cv2.medianBlur(gray_orig, 5)
+        binary_dark = (gray_smooth < 140).astype(np.uint8)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
         cc_text_mask = np.zeros_like(binary_dark)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             ar = max(w / (h + 1e-5), h / (w + 1e-5))
-            # Для отдельных символов порог площади ниже (от 15 пикселей), а отношение сторон шире (до 3.5)
-            if stats[i, cv2.CC_STAT_AREA] > 15 and ar < 3.5:
+            area = stats[i, cv2.CC_STAT_AREA]
+            # Ограничиваем максимальный размер символа (w < 45, h < 45) для отсечения фолд-линий одежды и рамок
+            if area > 15 and w < 45 and h < 45 and ar < 3.0:
                 cc_text_mask[labels == i] = 255
         cc_text_mask[binary_dark == 0] = 0
         
@@ -683,23 +684,8 @@ class LamaMPEPyTorchInpainter:
         if np.sum(mask_refined >= 127) < 10:
             mask_refined = np.zeros_like(mask)
 
-        # Детектируем длинные сплошные линии (границы кадров) через HoughLinesP,
-        # чтобы гарантированно не захватить текст, но надежно найти прямые рамки кадра под любым углом
-        frame_lines = np.zeros_like(gray_orig)
-        edges = cv2.Canny(gray_orig, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=60, maxLineGap=10)
-        if lines is not None:
-            for line in lines:
-                coords = line.flatten()
-                if len(coords) == 4:
-                    x1, y1, x2, y2 = coords
-                    cv2.line(frame_lines, (x1, y1), (x2, y2), 255, 5)
-        # Слегка расширяем рамки для надежного перекрытия краев
-        frame_lines = cv2.dilate(frame_lines, np.ones((3, 3), np.uint8), iterations=1)
-        
-        # Вычитаем рамки кадра из масок стирания и сырого текста
-        mask_refined[frame_lines > 0] = 0
-        text_mask_raw[frame_lines > 0] = 0
+        # HoughLinesP и вычитание удалены, защита рамок теперь строится 
+        # исключительно на финальном этапе через overlap-фильтрацию dilated_edges
 
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
