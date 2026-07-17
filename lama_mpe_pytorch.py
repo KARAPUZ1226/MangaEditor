@@ -613,11 +613,12 @@ class LamaMPEPyTorchInpainter:
         img_original = np.copy(image)
         
         # === 0. Автоматическое уточнение маски через U-Net segmenter ===
+        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        
         if self.segmenter is not None:
             try:
                 # 1. Готовим изображение для U-Net (Grayscale, ресайз ТОЛЬКО области выделения пользователя)
                 ch, cw = img_original.shape[:2]
-                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
                 print(f"[LaMa PyTorch DEBUG] Crop shape: {ch}x{cw}")
                 
                 # Ищем точные границы выделения пользователя на маске
@@ -669,7 +670,6 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa PyTorch] U-Net segmenter failed: {e}, falling back to adaptive threshold")
                 # Откат к связным компонентам
-                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
                 binary_dark = (gray_orig < 145).astype(np.uint8)
                 num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
                 text_mask = np.zeros_like(binary_dark)
@@ -682,7 +682,6 @@ class LamaMPEPyTorchInpainter:
                 mask_refined[text_mask_dilated == 0] = 0
         else:
             # Откат к связным компонентам если U-Net не загружен
-            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
             binary_dark = (gray_orig < 145).astype(np.uint8)
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
             text_mask = np.zeros_like(binary_dark)
@@ -712,10 +711,14 @@ class LamaMPEPyTorchInpainter:
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Предобработка: Двусторонний фильтр (Bilateral Filter) для размытия скринтонов
-        # Он сглаживает мелкоточечные шумы (скринтоны), но оставляет контурные линии рисунка.
-        # Модели (LaMa) намного проще восстанавливать сглаженный серый градиент, чем сетку точек.
-        image_smooth = cv2.bilateralFilter(image_rgb, d=9, sigmaColor=50, sigmaSpace=50)
+        # Предобработка: ОЧЕНЬ слабый bilateral filter или его отсутствие.
+        # Скринтоны должны остаться видимыми для LaMa, иначе модель не сможет их восстановить.
+        # Если скринтоны сильно мелкие — можно включить, но с d=5 и малыми сигмами.
+        use_bilateral = False  # Поставь True, если LaMa слишком шумит на скринтонах
+        if use_bilateral:
+            image_smooth = cv2.bilateralFilter(image_rgb, d=5, sigmaColor=25, sigmaSpace=25)
+        else:
+            image_smooth = image_rgb.copy()
 
         if pad_h > 0 or pad_w > 0:
             image_padded = cv2.copyMakeBorder(image_smooth, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
@@ -744,15 +747,71 @@ class LamaMPEPyTorchInpainter:
         if pad_h > 0 or pad_w > 0:
             img_inpainted = img_inpainted[0:height, 0:width]
 
-        # === 2. Поиск вектора сдвига текстурной сетки и частотное слияние ===
-        # Выделяем линии по очищенной версии (после LaMa), чтобы поймать контуры и снаружи, и прорисованные изнутри
-        gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+        # === 2. FFT-based поиск периода скринтона на ОРИГИНАЛЕ ===
+        # Скринтоны ищем на gray_orig (исходное изображение), но только вне маски текста.
+        # Это критически важно: на img_inpainted скринтонов уже нет.
         
-        # 1. Выделяем структурные линии рисунка через Canny + анализ связных компонентов
-        # Это позволяет со 100% точностью отделить мелкие круглые точки скринтона от любых контуров и штриховки
-        detected_edges = cv2.Canny(gray_inpainted, 30, 100)
+        # Создаём маску "живых" пикселей на оригинале
+        live_mask_orig = (mask_original == 0).astype(np.float32)
+        
+        # Находим центр выделения для локального анализа
+        y_indices, x_indices = np.where(mask_original == 1)
+        if len(y_indices) > 0:
+            cy_box = int(y_indices.mean())
+            cx_box = int(x_indices.mean())
+        else:
+            cy_box, cx_box = height // 2, width // 2
+        
+        sub_size = 256  # Достаточно для FFT
+        y0_sub = max(0, cy_box - sub_size // 2)
+        y1_sub = min(height, cy_box + sub_size // 2)
+        x0_sub = max(0, cx_box - sub_size // 2)
+        x1_sub = min(width, cx_box + sub_size // 2)
+        
+        gray_sub = gray_orig[y0_sub:y1_sub, x0_sub:x1_sub].astype(np.float32)
+        mask_sub = live_mask_orig[y0_sub:y1_sub, x0_sub:x1_sub]
+        
+        # Нормализуем и маскируем текст
+        gray_sub -= gray_sub.mean()
+        gray_sub *= mask_sub  # Обнуляем текстовую область
+        
+        # Автокорреляция через FFT
+        f_gray = np.fft.fft2(gray_sub)
+        f_conj = np.conj(f_gray)
+        power = np.fft.ifft2(f_gray * f_conj).real
+        
+        # Ищем пиксели периодичности (исключаем нулевой сдвиг и мелкие сдвиги)
+        h_sub, w_sub = gray_sub.shape
+        cy, cx = h_sub // 2, w_sub // 2
+        
+        # Сдвигаем ноль в центр для удобства
+        power_shifted = np.fft.fftshift(power)
+        
+        # Обнуляем центральную зону (нулевой и мелкие сдвиги)
+        search_half = 16
+        y_start = max(0, cy - search_half)
+        y_end = min(h_sub, cy + search_half + 1)
+        x_start = max(0, cx - search_half)
+        x_end = min(w_sub, cx + search_half + 1)
+        power_shifted[y_start:y_end, x_start:x_end] = 0
+        
+        # Находим пик максимума — это и есть период скринтона
+        max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
+        best_dy = max_idx[0] - cy
+        best_dx = max_idx[1] - cx
+        
+        # Проверяем, что период реальный (сильный пик)
+        peak_val = power_shifted[max_idx]
+        power_mean = np.mean(power_shifted)
+        has_screentone = peak_val > power_mean * 3.0  # Пик в 3+ раза сильнее среднего = есть скринтон
+        
+        print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={peak_val/power_mean:.2f}")
+        
+        # === 3. Выделение структурных линий ===
+        # Используем оригинал для поиска линий, т.к. он чётче
+        detected_edges = cv2.Canny(gray_orig, 30, 100)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(detected_edges, connectivity=8)
-        dilated_edges = np.zeros_like(gray_inpainted)
+        dilated_edges = np.zeros_like(gray_orig)
         for i in range(1, num_labels):
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
@@ -760,146 +819,73 @@ class LamaMPEPyTorchInpainter:
             ar = max(w / (h + 1e-5), h / (w + 1e-5))
             if area > 35 or ar > 1.8 or w > 10 or h > 10:
                 dilated_edges[labels == i] = 255
-        dilated_edges = cv2.dilate(dilated_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=2)
+        # Узкая дилатация — сохраняем больше фона
+        dilated_edges = cv2.dilate(dilated_edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
 
-        # Маска "живых" (невыделенных) пикселей: 1.0 = фон, 0.0 = закрашенная область или структурная линия рисунка
-        live_mask = ((mask_original == 0) & (dilated_edges == 0)).astype(np.float32)
-        
-        # Находим центр выделения пользователя для локального поиска сдвига текстуры
-        y_indices, x_indices = np.where(mask_original == 1)
-        if len(y_indices) > 0:
-            cy_box = int(y_indices.mean())
-            cx_box = int(x_indices.mean())
-        else:
-            cy_box, cx_box = height // 2, width // 2
+        # === 4. Текстурный синтез (если найден скринтон) ===
+        if has_screentone and (best_dx != 0 or best_dy != 0):
+            # Донор — ОРИГИНАЛЬНОЕ изображение, где текст заменён через простой Telea.
+            # Это сохраняет скринтоны на доноре, но убирает текст.
+            text_mask_u8 = (mask_original * 255).astype(np.uint8)
+            donor_original = cv2.inpaint(img_original, text_mask_u8, 3, cv2.INPAINT_TELEA)
             
-        sub_size = 512
-        y0_sub = max(0, cy_box - sub_size // 2)
-        y1_sub = min(height, cy_box + sub_size // 2)
-        x0_sub = max(0, cx_box - sub_size // 2)
-        x1_sub = min(width, cx_box + sub_size // 2)
-        
-        gray_sub = gray_inpainted[y0_sub:y1_sub, x0_sub:x1_sub]
-        mask_sub = live_mask[y0_sub:y1_sub, x0_sub:x1_sub]
-        h_sub, w_sub = gray_sub.shape
-        
-        best_err = float('inf')
-        best_dx, best_dy = 0, 0
-        search_range = range(-16, 17)
-        
-        for dx in search_range:
-            for dy in search_range:
-                # Исключаем мелкие и строго вертикальные/горизонтальные сдвиги,
-                # заставляя алгоритм искать диагональную сетку скринтона
-                if abs(dx) <= 1 or abs(dy) <= 1:
-                    continue
-                
-                # Координаты пересечения оригинального и смещенного окон
-                y_start_orig = max(0, -dy)
-                y_end_orig = min(h_sub, h_sub - dy)
-                x_start_orig = max(0, -dx)
-                x_end_orig = min(w_sub, w_sub - dx)
-                
-                y_start_shift = max(0, dy)
-                y_end_shift = min(h_sub, h_sub + dy)
-                x_start_shift = max(0, dx)
-                x_end_shift = min(w_sub, w_sub + dx)
-                
-                orig_part = gray_sub[y_start_orig:y_end_orig, x_start_orig:x_end_orig]
-                shift_part = gray_sub[y_start_shift:y_end_shift, x_start_shift:x_end_shift]
-                
-                m_orig = mask_sub[y_start_orig:y_end_orig, x_start_orig:x_end_orig]
-                m_shift = mask_sub[y_start_shift:y_end_shift, x_start_shift:x_end_shift]
-                
-                valid_pixels = m_orig * m_shift
-                n_pixels = np.sum(valid_pixels)
-                
-                if n_pixels > 200:
-                    diff = np.abs(orig_part.astype(np.float32) - shift_part.astype(np.float32))
-                    err = np.sum(diff * valid_pixels) / n_pixels
-                    if err < best_err:
-                        best_err = err
-                        best_dx, best_dy = dx, dy
+            # Убираем линии из донора, чтобы они не мешали
+            donor_no_lines = cv2.inpaint(donor_original, dilated_edges, 3, cv2.INPAINT_TELEA)
+            
+            img_donor = donor_no_lines.copy().astype(np.float32)
+            
+            # Находим координаты всех пикселей маски
+            mask_y, mask_x = np.where(mask_original == 1)
+            
+            # Для каждого пикселя маски ищем донора вдоль вектора периода
+            for y, x in zip(mask_y, mask_x):
+                found = False
+                for step in range(1, 15):
+                    for direction in (1, -1):
+                        k = step * direction
+                        nx = x + k * best_dx
+                        ny = y + k * best_dy
                         
-        # Если сдвиг найден, накладываем текстуру скринтона
-        print(f"[LaMa PyTorch DEBUG] Best shift found: dx={best_dx}, dy={best_dy}")
-        if best_dx != 0 or best_dy != 0:
-            # Стираем все контуры и линии рисунка на доноре, заменяя их фоном, чтобы они физически не переносились
-            img_inpainted_no_lines = cv2.inpaint(img_inpainted, dilated_edges, 3, cv2.INPAINT_TELEA)
+                        if 0 <= nx < width and 0 <= ny < height:
+                            # Точка должна быть строго вне маски текста И не на линии контура
+                            if mask_original[ny, nx] == 0 and dilated_edges[ny, nx] == 0:
+                                img_donor[y, x] = donor_no_lines[ny, nx]
+                                found = True
+                                break
+                    if found:
+                        break
             
-            # Использовать строго 2D маски (H, W), чтобы исключить раздувание размерности в NumPy до (H, W, H)
-            img_donor = img_inpainted_no_lines.copy()
-            working_mask = mask_original.copy()
-            donor_mask = mask_original.copy()
+            # High-pass текстура = донор с текстурой - размытый донор (без текстуры)
+            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (7, 7), 0).astype(np.float32)
+            hp_texture = img_donor - donor_smooth
             
-            img_smooth_bgr = cv2.GaussianBlur(img_inpainted_no_lines, (7, 7), 0)
-            img_donor_smooth = img_smooth_bgr.copy()
-            working_mask_smooth = mask_original.copy()
-            donor_mask_smooth = mask_original.copy()
-            
-            M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
-            
-            # 20 шагов сдвига гарантированно покроют маску любой ширины при малых периодах (например, 3 пикселя)
-            for _ in range(20):
-                if np.sum(working_mask) == 0:
-                    break
-                # Сдвигаем текущих доноров
-                shifted_img = cv2.warpAffine(img_donor, M, (width, height), borderMode=cv2.BORDER_REFLECT)
-                shifted_mask = cv2.warpAffine(donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
-                
-                # Копируем только те пиксели, которые сейчас в маске, но в сдвинутой версии были здоровыми
-                copy_map = (working_mask == 1) & (shifted_mask == 0)
-                img_donor[copy_map] = shifted_img[copy_map]
-                donor_mask[copy_map] = 0
-                working_mask[copy_map] = 0
-                
-                # Analogously for the smoothed donor
-                shifted_smooth = cv2.warpAffine(img_donor_smooth, M, (width, height), borderMode=cv2.BORDER_REFLECT)
-                shifted_mask_smooth = cv2.warpAffine(donor_mask_smooth, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1)
-                
-                copy_map_smooth = (working_mask_smooth == 1) & (shifted_mask_smooth == 0)
-                img_donor_smooth[copy_map_smooth] = shifted_smooth[copy_map_smooth]
-                donor_mask_smooth[copy_map_smooth] = 0
-                working_mask_smooth[copy_map_smooth] = 0
-            
-            # Извлекаем высокие частоты (только точки скринтона, без линий контуров)
-            hp_texture = img_donor.astype(np.float32) - img_donor_smooth.astype(np.float32)
-            
-            # Фильтр яркости (модуляция): гасим текстуру на чисто белом (баблы) и чисто черном (контуры)
-            # чтобы точки скринтона не залезали на белый текст и не размывали черную обводку
+            # Модуляция: текстура сильнее в серых зонах, слабее на чистом белом/чёрном
             inpainted_float = img_inpainted.astype(np.float32)
             f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
             f_texture = np.clip(f_texture, 0.0, 1.0)
             
-            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture)}, max={np.max(hp_texture)}, mean_abs={np.mean(np.abs(hp_texture))}")
-            print(f"[LaMa PyTorch DEBUG] f_texture stats: min={np.min(f_texture)}, max={np.max(f_texture)}, mean={np.mean(f_texture)}")
-            print(f"[LaMa PyTorch DEBUG] mask_original_3d sum: {np.sum(mask_original_3d)}")
-            
-            # Накладываем текстуру скринтона поверх результата LaMa
-            # (Ничего не делаем здесь, переносим наложение в конец)
-            pass
+            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
+        else:
+            hp_texture = None
+            print("[LaMa PyTorch DEBUG] No screentone detected, skipping texture synthesis")
 
 
-        # === 3. Мягкое смешивание базовой структуры (LaMa + Оригинал) ===
+        # === 5. Мягкое смешивание базовой структуры ===
         mask_bin = mask_original.astype(np.float32)
         ksize = 5 if min(height, width) >= 5 else 3
         feathered_mask = cv2.GaussianBlur(mask_bin, (ksize, ksize), 0)
-        
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
-        # Смешиваем базовые структуры (гладкие слои)
+        # LaMa даёт структуру (градиенты), оригинал — текстуру вокруг
         img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
         
-        # === 4. Наложение текстуры поверх смешанной базы ("Бутерброд") ===
-        if best_dx != 0 or best_dy != 0:
-            # Исключаем попадание текстуры скринтона на линии рисунка и буквы
-            # Текстура наносится строго на фоновые области внутри маски
+        # === 6. Наложение текстуры поверх смешанной базы ===
+        if hp_texture is not None:
+            # Текстура только на фоне внутри маски, не на линиях
             clean_texture_mask = mask_original_3d.copy()
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
             
-            # Дополнительное слияние с глобальным PatchMatch (ShiftMap) для непериодических зон
-            # Это дает гибридный подход: локальный сдвиг сетки + глобальное копирование текстуры
             ans = img_blended + hp_texture * clean_texture_mask * f_texture
         else:
             ans = img_blended
