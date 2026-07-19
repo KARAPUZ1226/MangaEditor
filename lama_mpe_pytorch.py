@@ -959,7 +959,7 @@ class LamaMPEPyTorchInpainter:
                 img_donor = img_donor_f.astype(np.uint8)
 
             if img_donor is not None:
-                donor_smooth = cv2.GaussianBlur(img_donor, (7, 7), 0).astype(np.float32)
+                donor_smooth = cv2.GaussianBlur(img_donor, (5, 5), 0).astype(np.float32)
                 hp_texture = img_donor.astype(np.float32) - donor_smooth
                 print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
 
@@ -971,13 +971,14 @@ class LamaMPEPyTorchInpainter:
         img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
 
         if hp_texture is not None:
-            # Пороги из оригинала: где ярко — нет точек, где серо — точки
-            gray_orig_smooth = cv2.GaussianBlur(
-                cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY), (31, 31), 0)
-            brightness_map = cv2.inpaint(gray_orig_smooth, text_mask_u8, 30, cv2.INPAINT_NS).astype(np.float32)
+            # Карта яркости берётся строго из LaMa (img_inpainted).
+            # LaMa правильно нарисовала, где белые облака, где серый скринтон, а где чёрные ветки.
+            lama_gray_smooth = cv2.GaussianBlur(
+                cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
             
-            f_white = np.clip((155.0 - brightness_map) / 30.0, 0, 1)
-            f_black = np.clip((brightness_map - 20.0) / 30.0, 0, 1)
+            # Точки скринтона накладываются ТОЛЬКО на серый скринтон (яркость 50..160)
+            f_white = np.clip((160.0 - lama_gray_smooth) / 30.0, 0, 1)  # гаснет 130→160 к белому
+            f_black = np.clip((lama_gray_smooth - 30.0) / 25.0, 0, 1)   # гаснет 55→30 к чёрному
             f_texture = (f_white * f_black)[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
