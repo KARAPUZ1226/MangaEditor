@@ -958,21 +958,27 @@ class LamaMPEPyTorchInpainter:
             hp_texture = None
             print("[LaMa PyTorch DEBUG] No screentone detected, skipping texture synthesis")
 
-        # === 5. Смешивание результата ===
+        # === 5. Гибридное смешивание: LaMa = структура, Донор = только точки ===
         feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
+        # LaMa даёт структуру (ветки, облака, градиенты) — используем БЕЗ сглаживания
+        img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+
         if hp_texture is not None:
-            # Скринтон найден — используем донора НАПРЯМУЮ (как Фотошоп Content-Aware Fill).
-            # Донор уже содержит правильные точки и градиенты, разбирать-собирать не нужно.
-            # Принудительно в grayscale для чистоты
-            donor_gray = cv2.cvtColor(img_donor.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-            img_donor_clean = cv2.cvtColor(donor_gray, cv2.COLOR_GRAY2BGR).astype(np.float32)
-            ans = img_donor_clean * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
+            # LaMa указывает ГДЕ класть точки: серый = скринтон, белый/чёрный = нет точек
+            lama_gray = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            # Плавное затухание у белого (облака) и чёрного (ветки/линии)
+            f_white = np.clip((225.0 - lama_gray) / 50.0, 0, 1)  # гасим к белому
+            f_black = np.clip((lama_gray - 25.0) / 50.0, 0, 1)   # гасим к чёрному
+            f_texture = (f_white * f_black)[:, :, np.newaxis]
+            
+            clean_texture_mask = feathered_mask * f_texture
+            # Не кладём точки поверх линий рисунка
+            clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
+            ans = img_blended + hp_texture * clean_texture_mask
         else:
-            # Нет скринтона — используем LaMa
-            img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
             ans = img_blended
             
         # Восстанавливаем оригинальные линии рисунка строго вне сырой маски букв (text_mask_raw == 0),
