@@ -6,6 +6,13 @@ import numpy as np
 import cv2
 import os
 
+try:
+    from patchmatch import patch_match
+    HAS_PATCHMATCH = patch_match.patchmatch_available
+except Exception as e:
+    HAS_PATCHMATCH = False
+    print(f"[LaMa PyTorch] PyPatchMatch not available: {e}")
+
 def set_requires_grad(module, value):
     for param in module.parameters():
         param.requires_grad = value
@@ -907,56 +914,54 @@ class LamaMPEPyTorchInpainter:
         # Оставляем mask_original полной, чтобы не пропускать буквы около линий
         mask_original_3d = mask_original[:, :, None]
 
-        # === 4. Текстурный синтез: 4-направленный Clone Stamp ===
-        # Shift-propagation оригинальных пикселей в 4 направлениях периода.
-        # Каждая итерация копирует реальные точки из ближайших чистых зон со ВСЕХ сторон.
-        
+        # === 4. Текстурный синтез: PyPatchMatch (Photoshop Content-Aware Fill) ===
         text_mask_u8 = (mask_original * 255).astype(np.uint8)
         text_mask_dilated = cv2.dilate(text_mask_u8, np.ones((7, 7), np.uint8), iterations=2)
         
-        if has_screentone and (best_dx != 0 or best_dy != 0):
-            # Донор = оригинал. Текст внутри маски будет перезаписан чистыми пикселями.
-            img_donor = img_original.copy().astype(np.float32)
-            working_mask = (text_mask_dilated // 255).astype(np.uint8)
+        hp_texture = None
+        if has_screentone or HAS_PATCHMATCH:
+            img_donor = None
+            if HAS_PATCHMATCH:
+                try:
+                    # PyPatchMatch ищет случайные патчи в окружении и сшивает их (Content-Aware Fill)
+                    img_donor = patch_match.inpaint(img_original, text_mask_dilated, patch_size=3)
+                    print("[LaMa PyTorch DEBUG] PyPatchMatch inpainting successful!")
+                except Exception as pm_err:
+                    print(f"[LaMa PyTorch DEBUG] PyPatchMatch failed, fallback to shift: {pm_err}")
             
-            # 4 вектора сдвига: основной период + перпендикулярный, в обоих направлениях
-            shifts = [
-                (-best_dx, -best_dy),   # основной вперёд
-                (best_dx, best_dy),      # основной назад
-                (best_dy, -best_dx),     # перпендикулярный 1
-                (-best_dy, best_dx),     # перпендикулярный 2
-            ]
-            
-            for iteration in range(64):
-                if np.sum(working_mask) == 0:
-                    break
-                filled_any = False
-                for sdx, sdy in shifts:
+            if img_donor is None and has_screentone and (best_dx != 0 or best_dy != 0):
+                # Фолбэк: 4-направленный shift-propagation
+                img_donor_f = img_original.copy().astype(np.float32)
+                working_mask = (text_mask_dilated // 255).astype(np.uint8)
+                shifts = [
+                    (-best_dx, -best_dy), (best_dx, best_dy),
+                    (best_dy, -best_dx), (-best_dy, best_dx),
+                ]
+                for iteration in range(64):
                     if np.sum(working_mask) == 0:
                         break
-                    M = np.float32([[1, 0, sdx], [0, 1, sdy]])
-                    shifted = cv2.warpAffine(img_donor, M, (width, height),
-                                             flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
-                    shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height),
-                                                  flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
-                    
-                    copy_map = (working_mask == 1) & (shifted_mask < 0.5)
-                    if np.any(copy_map):
-                        img_donor[copy_map] = shifted[copy_map]
-                        working_mask[copy_map] = 0
-                        filled_any = True
-                if not filled_any:
-                    break
-            
-            # Извлекаем ТОЛЬКО точки из заполненного донора
-            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (7, 7), 0).astype(np.float32)
-            hp_texture = img_donor - donor_smooth
-            
-            remaining = np.sum(working_mask)
-            print(f"[LaMa PyTorch DEBUG] 4-dir shift done in {iteration+1} iters, unfilled={remaining}")
-            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
-        else:
-            hp_texture = None
+                    filled_any = False
+                    for sdx, sdy in shifts:
+                        if np.sum(working_mask) == 0:
+                            break
+                        M = np.float32([[1, 0, sdx], [0, 1, sdy]])
+                        shifted = cv2.warpAffine(img_donor_f, M, (width, height),
+                                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+                        shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height),
+                                                      flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                        copy_map = (working_mask == 1) & (shifted_mask < 0.5)
+                        if np.any(copy_map):
+                            img_donor_f[copy_map] = shifted[copy_map]
+                            working_mask[copy_map] = 0
+                            filled_any = True
+                    if not filled_any:
+                        break
+                img_donor = img_donor_f.astype(np.uint8)
+
+            if img_donor is not None:
+                donor_smooth = cv2.GaussianBlur(img_donor, (7, 7), 0).astype(np.float32)
+                hp_texture = img_donor.astype(np.float32) - donor_smooth
+                print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
 
         # === 5. Финальное совмещение: LaMa = структура, Донор = текстура ===
         feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
