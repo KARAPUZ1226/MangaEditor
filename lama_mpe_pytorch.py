@@ -914,62 +914,48 @@ class LamaMPEPyTorchInpainter:
         # Оставляем mask_original полной, чтобы не пропускать буквы около линий
         mask_original_3d = mask_original[:, :, None]
 
-        # === 4. Текстурный синтез: PyPatchMatch (Photoshop Content-Aware Fill) ===
+        # === 4. Мгновенный локальный синтез растра (FFT Period Shift) ===
         text_mask_u8 = (mask_original * 255).astype(np.uint8)
         text_mask_dilated = cv2.dilate(text_mask_u8, np.ones((7, 7), np.uint8), iterations=2)
         
         hp_texture = None
-        if has_screentone or HAS_PATCHMATCH:
-            # Вычисляем физический размер периода растра из FFT
-            if best_dx != 0 or best_dy != 0:
-                period_len = int(np.round(np.sqrt(best_dx**2 + best_dy**2)))
-            else:
-                period_len = 15
-            pm_patch_size = max(11, period_len if period_len % 2 == 1 else period_len + 1)
-
-            img_donor = None
-            if HAS_PATCHMATCH:
-                try:
-                    # PyPatchMatch сшивает полноразмерные патчи целых растровых точек (размера pm_patch_size)
-                    img_donor = patch_match.inpaint(img_original, text_mask_dilated, patch_size=pm_patch_size)
-                    print(f"[LaMa PyTorch DEBUG] PyPatchMatch inpainting successful! (patch_size={pm_patch_size})")
-                except Exception as pm_err:
-                    print(f"[LaMa PyTorch DEBUG] PyPatchMatch failed, fallback to shift: {pm_err}")
+        if has_screentone and (best_dx != 0 or best_dy != 0):
+            # Извлекаем точки высокой частоты НАПРЯМУЮ из оригинала вокруг бабла
+            orig_smooth = cv2.GaussianBlur(img_original, (5, 5), 0).astype(np.float32)
+            hp_orig = img_original.astype(np.float32) - orig_smooth
             
-            if img_donor is None and has_screentone and (best_dx != 0 or best_dy != 0):
-                # Фолбэк: 4-направленный shift-propagation
-                img_donor_f = img_original.copy().astype(np.float32)
-                working_mask = (text_mask_dilated // 255).astype(np.uint8)
-                shifts = [
-                    (-best_dx, -best_dy), (best_dx, best_dy),
-                    (best_dy, -best_dx), (-best_dy, best_dx),
-                ]
-                for iteration in range(64):
-                    if np.sum(working_mask) == 0:
-                        break
-                    filled_any = False
-                    for sdx, sdy in shifts:
-                        if np.sum(working_mask) == 0:
-                            break
-                        M = np.float32([[1, 0, sdx], [0, 1, sdy]])
-                        shifted = cv2.warpAffine(img_donor_f, M, (width, height),
-                                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
-                        shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height),
-                                                      flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
-                        copy_map = (working_mask == 1) & (shifted_mask < 0.5)
-                        if np.any(copy_map):
-                            img_donor_f[copy_map] = shifted[copy_map]
-                            working_mask[copy_map] = 0
-                            filled_any = True
-                    if not filled_any:
-                        break
-                img_donor = img_donor_f.astype(np.uint8)
-
-            if img_donor is not None:
-                k_size = pm_patch_size if pm_patch_size % 2 == 1 else pm_patch_size + 1
-                donor_smooth = cv2.GaussianBlur(img_donor, (k_size, k_size), 0).astype(np.float32)
-                hp_texture = img_donor.astype(np.float32) - donor_smooth
-                print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
+            hp_texture = np.zeros_like(hp_orig)
+            mask_to_fill = (text_mask_dilated > 0)
+            
+            # 2D базис решётки скринтона (основной вектор + перпендикулярный)
+            v1 = (best_dx, best_dy)
+            v2 = (-best_dy, best_dx)
+            
+            # Поиск спиралью от ближнего к дальнему окружению бабла
+            period_shifts = []
+            for r in range(1, 30):
+                for k1 in range(-r, r + 1):
+                    for k2 in range(-r, r + 1):
+                        if abs(k1) == r or abs(k2) == r:
+                            sx = k1 * v1[0] + k2 * v2[0]
+                            sy = k1 * v1[1] + k2 * v2[1]
+                            period_shifts.append((sx, sy))
+            
+            for sx, sy in period_shifts:
+                if not np.any(mask_to_fill):
+                    break
+                M = np.float32([[1, 0, sx], [0, 1, sy]])
+                shifted_hp = cv2.warpAffine(hp_orig, M, (width, height), borderMode=cv2.BORDER_REFLECT)
+                shifted_mask = cv2.warpAffine(text_mask_dilated.astype(np.float32), M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                
+                # Копируем только из здоровых зон вне текста
+                copy_map = mask_to_fill & (shifted_mask < 0.5)
+                if np.any(copy_map):
+                    hp_texture[copy_map] = shifted_hp[copy_map]
+                    mask_to_fill[copy_map] = False
+            
+            print(f"[LaMa PyTorch DEBUG] Local FFT-Period shift complete! Unfilled pixels={np.sum(mask_to_fill)}")
+            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
 
         # === 5. Финальное совмещение: LaMa = структура, Донор = текстура ===
         feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
