@@ -909,8 +909,12 @@ class LamaMPEPyTorchInpainter:
 
         # === 4. Текстурный синтез (если найден скринтон) ===
         if has_screentone and (best_dx != 0 or best_dy != 0):
-            # Это сохраняет скринтоны на доноре, но убирает текст.
-            # Детектируем баблы в кропе, чтобы исключить их из здоровых доноров текстуры
+            # Извлекаем точки НАПРЯМУЮ из оригинала (не из Telea-inpaint, который мылит)
+            orig_smooth = cv2.GaussianBlur(img_original, (3, 3), 0).astype(np.float32)
+            hp_original = img_original.astype(np.float32) - orig_smooth
+            # hp_original: идеальные точки СНАРУЖИ маски, мусор (текст) ВНУТРИ
+
+            # Маска «грязных» зон: текст + баблы
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
             binary_white = (gray_orig > 220).astype(np.uint8)
             num_labels_w, labels_w, stats_w, _ = cv2.connectedComponentsWithStats(binary_white, connectivity=8)
@@ -919,38 +923,26 @@ class LamaMPEPyTorchInpainter:
                 if stats_w[i, cv2.CC_STAT_AREA] > 4000:
                     bubble_mask[labels_w == i] = 1
 
-            text_mask_u8 = (mask_original * 255).astype(np.uint8)
-            # Дилатируем маску букв на доноре, чтобы гарантированно стереть белую обводку букв
-            text_mask_u8_dilated = cv2.dilate(text_mask_u8, np.ones((7, 7), np.uint8), iterations=2)
-            donor_original = cv2.inpaint(img_original, text_mask_u8_dilated, 3, cv2.INPAINT_TELEA)
-            
-            # Убираем линии из донора, чтобы они не мешали
-            donor_no_lines = cv2.inpaint(donor_original, dilated_edges, 3, cv2.INPAINT_TELEA)
-            
-            img_donor = donor_no_lines.copy().astype(np.float32)
+            # Shift-propagate ТОЛЬКО high-pass (точки) из чистых зон в маску
+            hp_donor = hp_original.copy()
             working_mask = mask_original.copy()
-            donor_mask = (mask_original | bubble_mask).copy()
+            dirty_mask = (mask_original | bubble_mask).copy()
             
-            # Сдвиг в направлении, ПРОТИВОПОЛОЖНОМ периоду
             M = np.float32([[1, 0, -best_dx], [0, 1, -best_dy]])
             
-            # Shift-fill: копируем текстуру из здоровых областей в маску
-            for _ in range(32):  # Больше итераций для надёжности
+            for _ in range(48):
                 if np.sum(working_mask) == 0:
                     break
-                shifted = cv2.warpAffine(img_donor, M, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
-                shifted_mask = cv2.warpAffine(donor_mask.astype(np.float32), M, (width, height), 
+                shifted = cv2.warpAffine(hp_donor, M, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+                shifted_mask = cv2.warpAffine(dirty_mask.astype(np.float32), M, (width, height),
                                                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
                 copy_map = (working_mask == 1) & (shifted_mask < 0.5)
-                img_donor[copy_map] = shifted[copy_map]
-                donor_mask[copy_map] = 0
+                hp_donor[copy_map] = shifted[copy_map]
+                dirty_mask[copy_map] = 0
                 working_mask[copy_map] = 0
             
-            # Размываем донора малым ядром (5x5) — ровно по размеру точки растра, без захвата градиентов облаков
-            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (5, 5), 0).astype(np.float32)
-            # Текстура содержит реальную амплитуду и градиент оригинального скана
-            hp_texture = img_donor - donor_smooth
+            hp_texture = hp_donor
             
             print(f"[LaMa PyTorch DEBUG] Shift propagation active. Period: dx={best_dx}, dy={best_dy}")
             print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
@@ -969,9 +961,9 @@ class LamaMPEPyTorchInpainter:
         if hp_texture is not None:
             # LaMa указывает ГДЕ класть точки: серый = скринтон, белый/чёрный = нет точек
             lama_gray = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            # Плавное затухание у белого (облака) и чёрного (ветки/линии)
-            f_white = np.clip((225.0 - lama_gray) / 50.0, 0, 1)  # гасим к белому
-            f_black = np.clip((lama_gray - 25.0) / 50.0, 0, 1)   # гасим к чёрному
+            # Агрессивное затухание: точки строго в зоне ~55-115, всё светлее = чисто
+            f_white = np.clip((140.0 - lama_gray) / 25.0, 0, 1)  # гаснет 115→140
+            f_black = np.clip((lama_gray - 30.0) / 25.0, 0, 1)   # гаснет 55→30
             f_texture = (f_white * f_black)[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
