@@ -907,35 +907,66 @@ class LamaMPEPyTorchInpainter:
         # Оставляем mask_original полной, чтобы не пропускать буквы около линий
         mask_original_3d = mask_original[:, :, None]
 
-        # === 4. Текстурный синтез: Clone Stamp-подход ===
-        # Вместо shift-propagation в одном направлении (тупой тайлинг),
-        # используем NS inpaint оригинала — он берёт реальные пиксели со ВСЕХ сторон,
-        # как кисть точечного удаления в Photoshop.
+        # === 4. Текстурный синтез: 4-направленный Clone Stamp ===
+        # Shift-propagation оригинальных пикселей в 4 направлениях периода.
+        # Каждая итерация копирует реальные точки из ближайших чистых зон со ВСЕХ сторон.
         
         text_mask_u8 = (mask_original * 255).astype(np.uint8)
-        # Дилатируем маску для полного удаления обводки букв
         text_mask_dilated = cv2.dilate(text_mask_u8, np.ones((7, 7), np.uint8), iterations=2)
         
-        # NS inpaint оригинала — заполняет текстовую область реальными пикселями из окружения
-        # Радиус 20 покрывает 1+ период скринтона, позволяя NS схватить паттерн точек
-        filled_original = cv2.inpaint(img_original, text_mask_dilated, 20, cv2.INPAINT_NS)
-        
-        # Извлекаем ТОЛЬКО текстуру (точки) из заполненного оригинала
-        filled_smooth = cv2.GaussianBlur(filled_original, (7, 7), 0).astype(np.float32)
-        hp_texture = filled_original.astype(np.float32) - filled_smooth
-        
-        print(f"[LaMa PyTorch DEBUG] NS inpaint texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
+        if has_screentone and (best_dx != 0 or best_dy != 0):
+            # Донор = оригинал. Текст внутри маски будет перезаписан чистыми пикселями.
+            img_donor = img_original.copy().astype(np.float32)
+            working_mask = (text_mask_dilated // 255).astype(np.uint8)
+            
+            # 4 вектора сдвига: основной период + перпендикулярный, в обоих направлениях
+            shifts = [
+                (-best_dx, -best_dy),   # основной вперёд
+                (best_dx, best_dy),      # основной назад
+                (best_dy, -best_dx),     # перпендикулярный 1
+                (-best_dy, best_dx),     # перпендикулярный 2
+            ]
+            
+            for iteration in range(64):
+                if np.sum(working_mask) == 0:
+                    break
+                filled_any = False
+                for sdx, sdy in shifts:
+                    if np.sum(working_mask) == 0:
+                        break
+                    M = np.float32([[1, 0, sdx], [0, 1, sdy]])
+                    shifted = cv2.warpAffine(img_donor, M, (width, height),
+                                             flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+                    shifted_mask = cv2.warpAffine(working_mask.astype(np.float32), M, (width, height),
+                                                  flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                    
+                    copy_map = (working_mask == 1) & (shifted_mask < 0.5)
+                    if np.any(copy_map):
+                        img_donor[copy_map] = shifted[copy_map]
+                        working_mask[copy_map] = 0
+                        filled_any = True
+                if not filled_any:
+                    break
+            
+            # Извлекаем ТОЛЬКО точки из заполненного донора
+            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (7, 7), 0).astype(np.float32)
+            hp_texture = img_donor - donor_smooth
+            
+            remaining = np.sum(working_mask)
+            print(f"[LaMa PyTorch DEBUG] 4-dir shift done in {iteration+1} iters, unfilled={remaining}")
+            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
+        else:
+            hp_texture = None
 
-        # === 5. Финальное совмещение: LaMa = структура, NS-оригинал = текстура ===
+        # === 5. Финальное совмещение: LaMa = структура, Донор = текстура ===
         feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
-        # LaMa даёт структуру (градиенты, формы)
         img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
 
-        if has_screentone:
-            # Пороги из ОРИГИНАЛА: где было ярко — нет точек, где серо — точки
+        if hp_texture is not None:
+            # Пороги из оригинала: где ярко — нет точек, где серо — точки
             gray_orig_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY), (31, 31), 0)
             brightness_map = cv2.inpaint(gray_orig_smooth, text_mask_u8, 30, cv2.INPAINT_NS).astype(np.float32)
