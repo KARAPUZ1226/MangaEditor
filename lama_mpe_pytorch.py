@@ -735,6 +735,9 @@ class LamaMPEPyTorchInpainter:
             img_inpainted = (img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
 
         img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
+        # Принудительно конвертируем в grayscale и обратно, чтобы убить цветной тон на ч/б манге
+        gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+        img_inpainted = cv2.cvtColor(gray_inpainted, cv2.COLOR_GRAY2BGR)
 
         # Обрезаем паддинг обратно
         if pad_h > 0 or pad_w > 0:
@@ -944,8 +947,8 @@ class LamaMPEPyTorchInpainter:
                 donor_mask[copy_map] = 0
                 working_mask[copy_map] = 0
             
-            # Размываем донора большим ядром для полного сглаживания точек
-            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (15, 15), 0).astype(np.float32)
+            # Размываем донора малым ядром (5x5) — ровно по размеру точки растра, без захвата градиентов облаков
+            donor_smooth = cv2.GaussianBlur(img_donor.astype(np.uint8), (5, 5), 0).astype(np.float32)
             # Текстура содержит реальную амплитуду и градиент оригинального скана
             hp_texture = img_donor - donor_smooth
             
@@ -957,12 +960,12 @@ class LamaMPEPyTorchInpainter:
 
         # === 5. Мягкое смешивание базовой структуры ===
         # Применяем Гауссово размытие для мягкого градиентного перехода (устраняет лесенки и жесткие стыки)
-        feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (7, 7), 0)
+        feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
-        # Применяем шумоподавление к структуре LaMa, чтобы получить идеальные градиенты
-        img_inpainted_smooth = cv2.bilateralFilter(img_inpainted, d=9, sigmaColor=35, sigmaSpace=35)
+        # Лёгкое шумоподавление LaMa-базы (медиан 3x3 не мылит градиенты облаков)
+        img_inpainted_smooth = cv2.medianBlur(img_inpainted, 3)
 
         # Смешиваем шумоподавленные базовые структуры
         img_blended = img_inpainted_smooth.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
@@ -973,13 +976,8 @@ class LamaMPEPyTorchInpainter:
             clean_texture_mask = feathered_mask.copy()
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
             
-            # Модулируем амплитуду текстуры по яркости LaMa-градиента (белый/черный -> 0, серый -> 1)
-            inpainted_float = img_inpainted_smooth.astype(np.float32)
-            f_texture = 1.0 - (np.abs(inpainted_float - 127.5) / 127.5) ** 2
-            f_texture = np.clip(f_texture, 0.0, 1.0)
-            
-            # Наложение текстуры с коэффициентом 1.0 для полного слияния с оригинальным растром
-            ans = img_blended + hp_texture * clean_texture_mask * f_texture * 1.0
+            # Наложение текстуры без модуляции — скринтон присутствует на ВСЕХ яркостях
+            ans = img_blended + hp_texture * clean_texture_mask * 1.0
         else:
             ans = img_blended
             
