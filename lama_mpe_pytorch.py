@@ -958,27 +958,21 @@ class LamaMPEPyTorchInpainter:
             hp_texture = None
             print("[LaMa PyTorch DEBUG] No screentone detected, skipping texture synthesis")
 
-        # === 5. Мягкое смешивание базовой структуры ===
-        # Применяем Гауссово размытие для мягкого градиентного перехода (устраняет лесенки и жесткие стыки)
+        # === 5. Смешивание результата ===
         feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
         if len(feathered_mask.shape) == 2:
             feathered_mask = feathered_mask[:, :, None]
 
-        # Лёгкое шумоподавление LaMa-базы (медиан 3x3 не мылит градиенты облаков)
-        img_inpainted_smooth = cv2.medianBlur(img_inpainted, 3)
-
-        # Смешиваем шумоподавленные базовые структуры
-        img_blended = img_inpainted_smooth.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
-        
-        # === 6. Наложение текстуры поверх смешанной базы ===
         if hp_texture is not None:
-            # Текстура только на фоне внутри маски, плавно затухает на границах
-            clean_texture_mask = feathered_mask.copy()
-            clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
-            
-            # Наложение текстуры без модуляции — скринтон присутствует на ВСЕХ яркостях
-            ans = img_blended + hp_texture * clean_texture_mask * 1.0
+            # Скринтон найден — используем донора НАПРЯМУЮ (как Фотошоп Content-Aware Fill).
+            # Донор уже содержит правильные точки и градиенты, разбирать-собирать не нужно.
+            # Принудительно в grayscale для чистоты
+            donor_gray = cv2.cvtColor(img_donor.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+            img_donor_clean = cv2.cvtColor(donor_gray, cv2.COLOR_GRAY2BGR).astype(np.float32)
+            ans = img_donor_clean * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
         else:
+            # Нет скринтона — используем LaMa
+            img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
             ans = img_blended
             
         # Восстанавливаем оригинальные линии рисунка строго вне сырой маски букв (text_mask_raw == 0),
