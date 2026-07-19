@@ -920,12 +920,19 @@ class LamaMPEPyTorchInpainter:
         
         hp_texture = None
         if has_screentone or HAS_PATCHMATCH:
+            # Вычисляем физический размер периода растра из FFT
+            if best_dx != 0 or best_dy != 0:
+                period_len = int(np.round(np.sqrt(best_dx**2 + best_dy**2)))
+            else:
+                period_len = 15
+            pm_patch_size = max(11, period_len if period_len % 2 == 1 else period_len + 1)
+
             img_donor = None
             if HAS_PATCHMATCH:
                 try:
-                    # PyPatchMatch ищет случайные патчи в окружении и сшивает их (Content-Aware Fill)
-                    img_donor = patch_match.inpaint(img_original, text_mask_dilated, patch_size=3)
-                    print("[LaMa PyTorch DEBUG] PyPatchMatch inpainting successful!")
+                    # PyPatchMatch сшивает полноразмерные патчи целых растровых точек (размера pm_patch_size)
+                    img_donor = patch_match.inpaint(img_original, text_mask_dilated, patch_size=pm_patch_size)
+                    print(f"[LaMa PyTorch DEBUG] PyPatchMatch inpainting successful! (patch_size={pm_patch_size})")
                 except Exception as pm_err:
                     print(f"[LaMa PyTorch DEBUG] PyPatchMatch failed, fallback to shift: {pm_err}")
             
@@ -959,7 +966,8 @@ class LamaMPEPyTorchInpainter:
                 img_donor = img_donor_f.astype(np.uint8)
 
             if img_donor is not None:
-                donor_smooth = cv2.GaussianBlur(img_donor, (5, 5), 0).astype(np.float32)
+                k_size = pm_patch_size if pm_patch_size % 2 == 1 else pm_patch_size + 1
+                donor_smooth = cv2.GaussianBlur(img_donor, (k_size, k_size), 0).astype(np.float32)
                 hp_texture = img_donor.astype(np.float32) - donor_smooth
                 print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
 
@@ -972,13 +980,12 @@ class LamaMPEPyTorchInpainter:
 
         if hp_texture is not None:
             # Карта яркости берётся строго из LaMa (img_inpainted).
-            # LaMa правильно нарисовала, где белые облака, где серый скринтон, а где чёрные ветки.
             lama_gray_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
             
-            # Точки скринтона накладываются ТОЛЬКО на серый скринтон (яркость 50..160)
-            f_white = np.clip((160.0 - lama_gray_smooth) / 30.0, 0, 1)  # гаснет 130→160 к белому
-            f_black = np.clip((lama_gray_smooth - 30.0) / 25.0, 0, 1)   # гаснет 55→30 к чёрному
+            # Точки скринтона накладываются на весь диапазон растра (15..242), гаснут только у чистой белой бумаги (>242)
+            f_white = np.clip((242.0 - lama_gray_smooth) / 20.0, 0, 1)  # гаснет 222→242 перед белым
+            f_black = np.clip((lama_gray_smooth - 15.0) / 20.0, 0, 1)   # гаснет 35→15 перед тушью
             f_texture = (f_white * f_black)[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
