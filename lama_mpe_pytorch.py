@@ -927,8 +927,14 @@ class LamaMPEPyTorchInpainter:
             hp_texture = np.zeros_like(hp_orig)
             mask_to_fill = (text_mask_dilated > 0)
             
-            # Запрещаем брать доноры из букв И из чёрных линий/веток!
-            dirty_donor_mask = ((text_mask_dilated > 0) | (dilated_edges > 0)).astype(np.float32)
+            # Запрещаем брать доноры из букв, чёрных линий, белых облаков и тёмных теней
+            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+            dirty_donor_mask = (
+                (text_mask_dilated > 0) | 
+                (dilated_edges > 0) | 
+                (gray_orig > 195) | 
+                (gray_orig < 45)
+            ).astype(np.float32)
             
             # 2D базис решётки скринтона (основной вектор + перпендикулярный)
             v1 = (best_dx, best_dy)
@@ -951,7 +957,7 @@ class LamaMPEPyTorchInpainter:
                 shifted_hp = cv2.warpAffine(hp_orig, M, (width, height), borderMode=cv2.BORDER_REFLECT)
                 shifted_dirty = cv2.warpAffine(dirty_donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
-                # Копируем ТОЛЬКО из чистых зон небес (без текста и без чёрных веток)
+                # Копируем ТОЛЬКО из 100% чистых участков серого растрового неба
                 copy_map = mask_to_fill & (shifted_dirty < 0.5)
                 if np.any(copy_map):
                     hp_texture[copy_map] = shifted_hp[copy_map]
@@ -972,9 +978,10 @@ class LamaMPEPyTorchInpainter:
             lama_gray_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
             
-            # 100% полная контрастность растра на всём диапазоне (5..248), гаснет только перед чистой бумагой (>248) или сплошной тушью (<5)
-            f_white = np.clip((248.0 - lama_gray_smooth) / 10.0, 0, 1)  # гаснет только у чистой белой бумаги (>248)
-            f_black = np.clip((lama_gray_smooth - 5.0) / 10.0, 0, 1)   # гаснет только у сплошной туши (<5)
+            # Точки скринтона накладываются СТРОГО на серый растр неба (75..165)
+            # Белые облака (>190) и чёрные ветки/тени (<50) остаются 100% чистыми от точек!
+            f_white = np.clip((190.0 - lama_gray_smooth) / 25.0, 0, 1)  # гаснет 165→190 к белому облаку
+            f_black = np.clip((lama_gray_smooth - 50.0) / 25.0, 0, 1)   # гаснет 75→50 к тёмным теням
             f_texture = (f_white * f_black)[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
