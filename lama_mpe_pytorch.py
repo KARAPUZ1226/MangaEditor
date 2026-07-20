@@ -640,24 +640,34 @@ class LamaMPEPyTorchInpainter:
             seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
             if self.segmenter is not None and box_h >= 8 and box_w >= 8:
                 try:
-                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
+                    # Сохраняем пропорции текста (aspect ratio) через квадратный паддинг,
+                    # чтобы вытянутые строки не искажали форму иероглифов при сжатии до 256x256
+                    max_side = max(box_h, box_w)
+                    square = np.full((max_side, max_side), 255, dtype=np.uint8)
+                    y_off = (max_side - box_h) // 2
+                    x_off = (max_side - box_w) // 2
+                    square[y_off:y_off+box_h, x_off:x_off+box_w] = crop_gray
+                    
+                    square_256 = cv2.resize(square, (256, 256), interpolation=cv2.INTER_AREA)
+                    inp = (square_256.astype(np.float32) / 255.0)[None, None, :, :]
                     
                     outputs = self.segmenter.run(None, {"input": inp})
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                     
-                    seg_256 = (probs > 0.3).astype(np.uint8) * 255
-                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                    # Порог 0.15 забирает все края символов и тонкие штрихи
+                    seg_256 = (probs > 0.15).astype(np.uint8) * 255
+                    seg_square = cv2.resize(seg_256, (max_side, max_side), interpolation=cv2.INTER_NEAREST)
+                    seg_mask_box = seg_square[y_off:y_off+box_h, x_off:x_off+box_w]
                 except Exception as e:
                     print(f"[LaMa] Segmenter box error: {e}")
 
-            # Фолбэк на случай если сегментатор ничего не вернул: только тёмные штрихи (< 100)
+            # Если сегментатор ничего не вернул — фолбэк на тёмные штрихи (< 120)
             if np.sum(seg_mask_box > 0) < 10:
-                seg_mask_box = (crop_gray < 100).astype(np.uint8) * 255
+                seg_mask_box = (crop_gray < 120).astype(np.uint8) * 255
 
-            # Дилатация 2px для покрытия белых обводок без слипания растровых точек
-            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=2)
+            # Дилатация 3px накрывает белые обводки (fuchidori) и края букв
+            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=3)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
