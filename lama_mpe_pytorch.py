@@ -687,6 +687,9 @@ class LamaMPEPyTorchInpainter:
         if self.use_mpe:
             try:
                 hp_texture = self._extract_screentone_texture(image, dirty_donor_mask)
+                if hp_texture is not None:
+                    # Ограничиваем амплитуду растровой текстуры, чтобы исключить тёмные пятна от линий донора
+                    hp_texture = np.clip(hp_texture, -35.0, 35.0)
             except Exception as e:
                 hp_texture = None
 
@@ -735,12 +738,16 @@ class LamaMPEPyTorchInpainter:
 
         ans = np.clip(ans, 0, 255).astype(np.uint8)
 
-        # === 4. Закалка резкости линий и чистый белый цвет ===
+        # === 4. Закалка резкости линий и 100% строгое ч/б без цветных артефактов ===
         ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
         inpaint_zone = (mask_original_3d > 0)
         very_dark  = (ans_gray < 100)[:, :, None] & inpaint_zone
         very_light = (ans_gray > 220)[:, :, None] & inpaint_zone
         ans[np.repeat(very_dark,  3, axis=2)] = 0
         ans[np.repeat(very_light, 3, axis=2)] = 255
+
+        # Строго убираем любые цветовые шумы (зелёные/красные точки) для манги
+        ans_bw = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
+        ans = cv2.cvtColor(ans_bw, cv2.COLOR_GRAY2BGR)
 
         return ans
