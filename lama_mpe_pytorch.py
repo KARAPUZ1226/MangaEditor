@@ -637,41 +637,45 @@ class LamaMPEPyTorchInpainter:
             crop_user = image[y_min:y_max, x_min:x_max]
             crop_gray = cv2.cvtColor(crop_user, cv2.COLOR_BGR2GRAY)
 
-            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
-            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
-                try:
-                    # Сохраняем пропорции текста (aspect ratio) через квадратный паддинг,
-                    # чтобы вытянутые строки не искажали форму иероглифов при сжатии до 256x256
-                    max_side = max(box_h, box_w)
-                    square = np.full((max_side, max_side), 255, dtype=np.uint8)
-                    y_off = (max_side - box_h) // 2
-                    x_off = (max_side - box_w) // 2
-                    square[y_off:y_off+box_h, x_off:x_off+box_w] = crop_gray
-                    
-                    square_256 = cv2.resize(square, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (square_256.astype(np.float32) / 255.0)[None, None, :, :]
-                    
-                    outputs = self.segmenter.run(None, {"input": inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    
-                    # Порог 0.05 забирает абсолютно все символы и мелкие знаки (!?), не затрагивая рисованные детали
-                    seg_256 = (probs > 0.05).astype(np.uint8) * 255
-                    seg_square = cv2.resize(seg_256, (max_side, max_side), interpolation=cv2.INTER_NEAREST)
-                    seg_mask_box = seg_square[y_off:y_off+box_h, x_off:x_off+box_w]
-                except Exception as e:
-                    print(f"[LaMa] Segmenter box error: {e}")
-
-            # Исключаем изолированный шумок меньше 5px
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seg_mask_box, connectivity=8)
-            cleaned_seg_box = np.zeros_like(seg_mask_box)
+            # 1. Извлекаем все тёмные чернила символов внутри выделения пользователя (crop_gray < 140)
+            dark_ink = (crop_gray < 140).astype(np.uint8) * 255
+            
+            # 2. Исключаем отдельно стоящие круглые пуговицы/детали рисунка вне текста
+            # Символы текста соединены в строки или имеют нерегулярную форму. Пуговицы — круглые.
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            text_ink_box = np.zeros_like(dark_ink)
+            
             for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] >= 5:
-                    cleaned_seg_box[labels == i] = 255
-            seg_mask_box = cleaned_seg_box
+                area = stats[i, cv2.CC_STAT_AREA]
+                w_c = stats[i, cv2.CC_STAT_WIDTH]
+                h_c = stats[i, cv2.CC_STAT_HEIGHT]
+                
+                # Точки скринтона (< 8px) игнорируем
+                if area < 8:
+                    continue
+                    
+                # Пуговица: круглый компонент (aspect ratio ~1.0), гладкий со всех сторон, 15..200px
+                aspect = max(w_c / max(1, h_c), h_c / max(1, w_c))
+                is_round_button = (aspect < 1.35) and (15 <= area <= 250) and (abs(w_c - h_c) <= 3)
+                
+                # Проверяем окружение: если вокруг компонента нет других тёмных пикселей (букв) — это одиночная пуговица!
+                if is_round_button:
+                    cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
+                    margin = 25
+                    y1_m = max(0, cy_i - margin)
+                    y2_m = min(box_h, cy_i + margin)
+                    x1_m = max(0, cx_i - margin)
+                    x2_m = min(box_w, cx_i + margin)
+                    nearby_dark = np.sum(dark_ink[y1_m:y2_m, x1_m:x2_m] > 0) - area
+                    if nearby_dark < 40:
+                        # Одиночная пуговица — СОХРАНЯЕМ Её (не включаем в маску стирания)!
+                        print(f"[LaMa] Protected isolated button at ({cx_i}, {cy_i}), area={area}")
+                        continue
+                
+                text_ink_box[labels == i] = 255
 
-            # Дилатация 2px точно покрывает белые обводки (fuchidori) вокруг букв, не трогая пуговицы
-            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=2)
+            # 3. Дилатация 4px точно накрывает белые обводки (fuchidori) букв
+            seg_mask_dilated = cv2.dilate(text_ink_box, kernel_3, iterations=4)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
