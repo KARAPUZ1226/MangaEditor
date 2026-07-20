@@ -637,10 +637,9 @@ class LamaMPEPyTorchInpainter:
             crop_user = image[y_min:y_max, x_min:x_max]
             crop_gray = cv2.cvtColor(crop_user, cv2.COLOR_BGR2GRAY)
 
-            seg_mask_box = None
+            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
             if self.segmenter is not None and box_h >= 8 and box_w >= 8:
                 try:
-                    # Сегментатор обучен на кропах текста 256x256
                     crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
                     inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
                     
@@ -648,19 +647,17 @@ class LamaMPEPyTorchInpainter:
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                     
-                    seg_256 = (probs > 0.4).astype(np.uint8) * 255
+                    seg_256 = (probs > 0.2).astype(np.uint8) * 255
                     seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
                 except Exception as e:
                     print(f"[LaMa] Segmenter box error: {e}")
-                    seg_mask_box = None
 
-            # Если сегментатор не вернул текст — используем контрастное выделение букв
-            if seg_mask_box is None or np.sum(seg_mask_box > 0) < 10:
-                dark_pixels = (crop_gray < 150).astype(np.uint8) * 255
-                seg_mask_box = dark_pixels
+            # Объединяем прогноз нейросети с темными штрихами букв (crop_gray < 170)
+            dark_pixels = (crop_gray < 170).astype(np.uint8) * 255
+            combined_box = seg_mask_box | dark_pixels
 
-            # Дилатация 3px для гарантии покрытия белых обводок (fuchidori) и сглаживания
-            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=3)
+            # Дилатация 4px полностью накрывает белые обводки (fuchidori) и полутона
+            seg_mask_dilated = cv2.dilate(combined_box, kernel_3, iterations=4)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
