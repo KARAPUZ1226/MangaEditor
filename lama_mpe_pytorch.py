@@ -621,45 +621,68 @@ class LamaMPEPyTorchInpainter:
         text_mask_raw = np.zeros_like(mask)
         y0_box, x0_box = 0, 0
         
-        # === 0. Детектирование текста по белой обводке (характерная черта манги) ===
-        # Главный признак текста манги — толстая белая обводка вокруг чёрных букв.
-        # Линии рисунка и одежды этой обводки не имеют.
+        # === 0. Детектирование текста: "Окружён белым со всех сторон" ===
+        # Ключевое отличие текста от контуров рисунка:
+        #  - Буква (ふちどり): белая обводка окружает её СО ВСЕХ СТОРОН (3-4 из 4 направлений)
+        #  - Контур одежды:   белое только С ОДНОЙ СТОРОНЫ (внутри рукава)
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        
-        # Только внутри выделения пользователя
         user_mask_bool = mask >= 127
         
-        # 1. Тёмные пиксели (потенциальные буквы)
-        dark_pixels = ((gray_orig < 90) & user_mask_bool).astype(np.uint8)
+        # 1. Тёмные кандидаты внутри выделения
+        dark = ((gray_orig < 85) & user_mask_bool)
         
-        # 2. Светлые пиксели (потенциальная белая обводка)
-        white_pixels = (gray_orig > 195).astype(np.uint8)
-        white_nearby = cv2.dilate(white_pixels, np.ones((11, 11), np.uint8))
+        # 2. Проверяем наличие белого в каждом из 4 направлений (радиус 5px)
+        r = 5
+        def wh(dy, dx):
+            return np.roll(np.roll(gray_orig > 195, -dy * r, axis=0), -dx * r, axis=1)
         
-        # 3. Текст = тёмные пиксели рядом с белой обводкой
-        text_candidates = (dark_pixels & (white_nearby > 0)).astype(np.uint8)
+        surrounded = (wh(1,0).astype(np.int8) + wh(-1,0).astype(np.int8) +
+                      wh(0,1).astype(np.int8) + wh(0,-1).astype(np.int8)) >= 3
         
-        # 4. Фильтрация связных компонентов по размеру (убираем мелкие точки растра)
+        text_candidates = (dark & surrounded).astype(np.uint8)
+        
+        # 3. CC-фильтр: убираем мелкие точки скринтона и крупные тёмные области
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_candidates, connectivity=8)
         text_mask_raw = np.zeros_like(gray_orig)
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            if area > 30 and w < 120 and h < 120:
+            w_c  = stats[i, cv2.CC_STAT_WIDTH]
+            h_c  = stats[i, cv2.CC_STAT_HEIGHT]
+            if 40 < area < 5000 and w_c < 100 and h_c < 100:
                 text_mask_raw[labels == i] = 255
         
-        # 5. Минимальное расширение — накрываем только саму белую обводку (не одежду!)
-        kernel = np.ones((3, 3), np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=2)
+        # 4. U-Net как дополнительный детектор (низкий порог — максимальный охват)
+        if self.segmenter is not None:
+            try:
+                y_idx, x_idx = np.where(user_mask_bool)
+                if len(y_idx) > 0:
+                    y0b, y1b = y_idx.min(), y_idx.max() + 1
+                    x0b, x1b = x_idx.min(), x_idx.max() + 1
+                    patch = cv2.resize(gray_orig[y0b:y1b, x0b:x1b], (256, 256))
+                    blob = patch.astype(np.float32) / 255.0
+                    blob = blob[None, None, :, :]
+                    logits = self.segmenter.run(None, {"input": blob})[0][0][0]
+                    probs = 1.0 / (1.0 + np.exp(-logits))
+                    unet256 = (probs > 0.45).astype(np.uint8) * 255
+                    unet_patch = cv2.resize(unet256, (x1b - x0b, y1b - y0b), interpolation=cv2.INTER_NEAREST)
+                    unet_full = np.zeros_like(gray_orig)
+                    unet_full[y0b:y1b, x0b:x1b] = unet_patch
+                    # Добавляем U-Net к маске только там, где он И детектор белой обводки согласны
+                    unet_confirmed = (unet_full > 0) & surrounded & user_mask_bool
+                    text_mask_raw[unet_confirmed] = 255
+                    print(f"[LaMa] U-Net добавил {int(unet_confirmed.sum())} px")
+            except Exception as e:
+                print(f"[LaMa] U-Net пропущен: {e}")
         
-        # 6. Ограничиваем выделением пользователя
+        # 5. Минимальная дилатация — только чтобы накрыть белую обводку
+        kernel = np.ones((3, 3), np.uint8)
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=3)
+        
+        # 6. Ограничиваем выделением пользователя; если ничего не нашли → полная маска
         mask_refined = np.copy(mask)
         mask_refined[text_mask_dilated == 0] = 0
-        
-        # Если детектор ничего не нашёл — используем полную маску пользователя
         if np.sum(mask_refined >= 127) < 50:
-            print("[LaMa PyTorch DEBUG] White-outline detector found nothing, using full user mask")
+            print("[LaMa] Детектор не нашёл текст — используем полную маску")
             mask_refined = np.copy(mask)
         
         mask_original = np.copy(mask_refined)
