@@ -624,37 +624,19 @@ class LamaMPEPyTorchInpainter:
         # === 0. Интеллектуальное детектирование текста (U-Net + Связные компоненты) ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Запуск детектора связных компонентов (сглаживание медианным фильтром от шумов/растра)
-        gray_smooth = cv2.medianBlur(gray_orig, 5)
-        binary_dark = (gray_smooth < 140).astype(np.uint8)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
-        cc_text_mask = np.zeros_like(binary_dark)
-        for i in range(1, num_labels):
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            ar = max(w / (h + 1e-5), h / (w + 1e-5))
-            area = stats[i, cv2.CC_STAT_AREA]
-            # Ограничиваем максимальный размер символа (w < 45, h < 45) для отсечения фолд-линий одежды и рамок
-            if area > 15 and w < 45 and h < 45 and ar < 3.0:
-                cc_text_mask[labels == i] = 255
-        cc_text_mask[binary_dark == 0] = 0
-        
-        # Записываем отладочные маски
-        cv2.imwrite("gray_orig_debug.png", gray_orig)
-        cv2.imwrite("binary_dark_debug.png", binary_dark * 255)
-        cv2.imwrite("cc_text_mask_debug.png", cc_text_mask)
-        
-        # 2. Запуск U-Net сегментера (если загружен)
+        # 1. Запуск U-Net сегментера текста и связных компонентов СТРОГО внутри BBox текста
         unet_mask = np.zeros_like(gray_orig)
-        if self.segmenter is not None:
-            try:
-                ch, cw = img_original.shape[:2]
-                print(f"[LaMa PyTorch DEBUG] Crop shape: {ch}x{cw}")
-                y_indices, x_indices = np.where(mask >= 127)
-                if len(y_indices) > 0:
-                    y0_box, y1_box = y_indices.min(), y_indices.max() + 1
-                    x0_box, x1_box = x_indices.min(), x_indices.max() + 1
-                    print(f"[LaMa PyTorch DEBUG] BBox found: {y1_box-y0_box}x{x1_box-x0_box} at ({x0_box},{y0_box})")
+        cc_text_mask = np.zeros_like(gray_orig)
+        y0_box, x0_box = 0, 0
+        
+        y_indices, x_indices = np.where(mask >= 127)
+        if len(y_indices) > 0:
+            y0_box, y1_box = y_indices.min(), y_indices.max() + 1
+            x0_box, x1_box = x_indices.min(), x_indices.max() + 1
+            
+            # 1a. U-Net сегментация в области BBox
+            if self.segmenter is not None:
+                try:
                     bbox_gray = gray_orig[y0_box:y1_box, x0_box:x1_box]
                     bbox_resized = cv2.resize(bbox_gray, (256, 256))
                     input_blob = bbox_resized.astype(np.float32) / 255.0
@@ -663,34 +645,44 @@ class LamaMPEPyTorchInpainter:
                     outputs = self.segmenter.run(None, {"input": input_blob})
                     logits = outputs[0][0][0]
                     probs = 1.0 / (1.0 + np.exp(-logits))
-                    mask_256 = (probs > 0.5).astype(np.uint8) * 255
+                    mask_256 = (probs > 0.4).astype(np.uint8) * 255
                     bbox_mask = cv2.resize(mask_256, (x1_box - x0_box, y1_box - y0_box), interpolation=cv2.INTER_NEAREST)
                     unet_mask[y0_box:y1_box, x0_box:x1_box] = bbox_mask
-            except Exception as e:
-                print(f"[LaMa PyTorch] U-Net failed, using CC only: {e}")
-                
-        # 3. Объединяем результаты U-Net и связных компонентов
+                except Exception as e:
+                    print(f"[LaMa PyTorch] U-Net failed: {e}")
+                    
+            # 1b. Поиск символов текста через CC СТРОГО внутри BBox (не задевая глобальный растр)
+            bbox_gray = gray_orig[y0_box:y1_box, x0_box:x1_box]
+            bbox_dark = (bbox_gray < 130).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bbox_dark, connectivity=8)
+            cc_sub = np.zeros_like(bbox_dark)
+            for i in range(1, num_labels):
+                w = stats[i, cv2.CC_STAT_WIDTH]
+                h = stats[i, cv2.CC_STAT_HEIGHT]
+                ar = max(w / (h + 1e-5), h / (w + 1e-5))
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area > 10 and w < 50 and h < 50 and ar < 3.5:
+                    cc_sub[labels == i] = 255
+            cc_text_mask[y0_box:y1_box, x0_box:x1_box] = cc_sub
+            
         combined_text = (unet_mask > 0) | (cc_text_mask > 0)
         
-        # 4. Точная маска текста с умным расширением белых обводок
+        # 2. Умное расширение маски текста (захват букв + 15px белых обводок)
         kernel3 = np.ones((3, 3), np.uint8)
         if np.sum(combined_text) > 0:
-            # Расширяем сам текст на 6px
             near_text = cv2.dilate(combined_text.astype(np.uint8) * 255, kernel3, iterations=6)
-            
-            # Находим белые обводки (ореолы букв) около текста
             white_outline = (gray_orig > 175) & (near_text > 0)
             
             text_mask_raw = np.zeros_like(gray_orig)
             text_mask_raw[combined_text] = 255
             text_mask_raw[white_outline] = 255
             
-            # Расширяем маску еще на 6px, чтобы 100% полностью закрыть края обводки
-            text_mask_dilated = cv2.dilate(text_mask_raw, kernel3, iterations=6)
+            # Расширяем маску на 7px, чтобы 100% покрыть белые обводки без остатка
+            text_mask_dilated = cv2.dilate(text_mask_raw, kernel3, iterations=7)
         else:
             text_mask_dilated = np.copy(mask)
 
-        # 5. Ограничиваем маску выделением пользователя (строго по контуру текста!)
+        # 3. Маска инпеинта режется СТРОГО по контуру букв (сохраняя тело и рисунок!)
         mask_refined = np.copy(mask)
         if np.sum(text_mask_dilated > 0) > 0:
             mask_refined[text_mask_dilated == 0] = 0
