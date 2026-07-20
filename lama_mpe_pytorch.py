@@ -972,12 +972,10 @@ class LamaMPEPyTorchInpainter:
             lama_gray_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
             
-            # Точки скринтона накладываются на весь диапазон растра (15..242), гаснут только у чистой белой бумаги (>242)
-            f_white = np.clip((242.0 - lama_gray_smooth) / 20.0, 0, 1)  # гаснет 222→242 перед белым
-            f_black = np.clip((lama_gray_smooth - 15.0) / 20.0, 0, 1)   # гаснет 35→15 перед тушью
-            f_texture_raw = (f_white * f_black)[:, :, np.newaxis]
-            # Плавное сглаживание карты амплитуды растра, убирающее резкие стыки
-            f_texture = cv2.GaussianBlur(f_texture_raw, (9, 9), 0)[:, :, np.newaxis]
+            # 100% полная контрастность растра на всём диапазоне (5..248), гаснет только перед чистой бумагой (>248) или сплошной тушью (<5)
+            f_white = np.clip((248.0 - lama_gray_smooth) / 10.0, 0, 1)  # гаснет только у чистой белой бумаги (>248)
+            f_black = np.clip((lama_gray_smooth - 5.0) / 10.0, 0, 1)   # гаснет только у сплошной туши (<5)
+            f_texture = (f_white * f_black)[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
