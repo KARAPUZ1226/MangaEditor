@@ -640,16 +640,23 @@ class LamaMPEPyTorchInpainter:
             area = stats[i, cv2.CC_STAT_AREA]
             w_c = stats[i, cv2.CC_STAT_WIDTH]
             h_c = stats[i, cv2.CC_STAT_HEIGHT]
-            
             comp_mask = (labels == i)
+            
             touches_border = np.any(comp_mask & border_mask)
             
-            # Если компонент касается границы выходящими длинными штрихами — это контур одежды/рисунка
-            if touches_border and (w_c > 30 or h_c > 30 or area > 250):
+            # Проверяем, является ли компонент тонкой непрерывной линией рисунка (например, контур одежды),
+            # которая идет сквозь границу выделения
+            aspect_ratio = max(w_c / (h_c + 1e-5), h_c / (w_c + 1e-5))
+            min_dim = min(w_c, h_c)
+            
+            # Тонкая линия рисунка: узкая толщина (<= 6px) AND вытянутая (ratio > 3.0) AND касается границы
+            is_thin_drawing_line = touches_border and (min_dim <= 6) and (aspect_ratio > 3.0)
+            
+            if is_thin_drawing_line:
                 continue
             
-            # Оставляем только символы/иероглифы
-            if 10 < area < 12000:
+            # Всё остальное (включая плашки ■, тире —, иероглифы, буквы) — это ТЕКСТ
+            if area > 4:
                 text_mask_raw[comp_mask] = 255
         
         # 3. Накрываем белые обводки (fuchidori) букв небольшой дилатацией (4px)
@@ -981,15 +988,23 @@ class LamaMPEPyTorchInpainter:
             # Используем ОРИГИНАЛЬНУЮ яркость для гейтинга текстуры:
             # если в оригинале белый (одежда, рамка) — текстура не накладывается
             orig_gray_smooth = cv2.GaussianBlur(
-                gray_orig, (15, 15), 0).astype(np.float32)
-            f_white = np.clip((225.0 - orig_gray_smooth) / 20.0, 0, 1)  # гаснет 205->225
+                gray_orig, (7, 7), 0).astype(np.float32)
+            f_white = np.clip((210.0 - orig_gray_smooth) / 20.0, 0, 1)  # 190->210
             f_black = np.clip((lama_gray_smooth - 20.0) / 20.0, 0, 1)   # гаснет 40->20
             
             # Текстура растра НЕ должна накладываться на тёмные линии рисунка (чтобы не перекрывать их)
             lama_gray_raw = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
-            f_not_line = np.clip((lama_gray_raw.astype(np.float32) - 40.0) / 70.0, 0, 1)
+            f_not_line = np.clip((lama_gray_raw.astype(np.float32) - 50.0) / 70.0, 0, 1)
             
-            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis] * f_not_line[:, :, np.newaxis]
+            # Проверяем оригинальное присутствие текстуры (stddev):
+            # Если в оригинале белая одежда или плоский цвет (stddev < 1.8) -> гасим текстуру!
+            orig_gray_f = gray_orig.astype(np.float32)
+            mean_gray = cv2.GaussianBlur(orig_gray_f, (11, 11), 0)
+            variance = cv2.GaussianBlur((orig_gray_f - mean_gray)**2, (11, 11), 0)
+            stddev = np.sqrt(np.clip(variance, 0, None))
+            f_has_variance = np.clip((stddev - 1.6) / 3.0, 0, 1)
+            
+            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis] * f_not_line[:, :, np.newaxis] * f_has_variance[:, :, np.newaxis]
             
             # Заменяем подложку в зоне скринтона на 100% гладкий градиент без мусора текста
             base_bg = img_inpainted.astype(np.float32) * (1.0 - f_texture) + img_inpainted_smooth * f_texture
