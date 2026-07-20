@@ -621,30 +621,14 @@ class LamaMPEPyTorchInpainter:
         text_mask_raw = np.zeros_like(mask)
         y0_box, x0_box = 0, 0
         
-        # === 0. Интеллектуальное детектирование текста (U-Net + Связные компоненты) ===
+        # === 0. Интеллектуальное детектирование текста (только U-Net) ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Запуск детектора связных компонентов (сглаживание медианным фильтром от шумов/растра)
-        gray_smooth = cv2.medianBlur(gray_orig, 5)
-        binary_dark = (gray_smooth < 140).astype(np.uint8)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_dark, connectivity=8)
-        cc_text_mask = np.zeros_like(binary_dark)
-        for i in range(1, num_labels):
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            ar = max(w / (h + 1e-5), h / (w + 1e-5))
-            area = stats[i, cv2.CC_STAT_AREA]
-            # Ограничиваем максимальный размер символа (w < 45, h < 45) для отсечения фолд-линий одежды и рамок
-            if area > 15 and w < 45 and h < 45 and ar < 3.0:
-                cc_text_mask[labels == i] = 255
-        cc_text_mask[binary_dark == 0] = 0
+        # CC-детектор отключён: он ловит линии одежды и складки как "текст".
+        # Полностью полагаемся на U-Net сегментер.
+        cc_text_mask = np.zeros_like(gray_orig)
         
-        # Записываем отладочные маски
-        cv2.imwrite("gray_orig_debug.png", gray_orig)
-        cv2.imwrite("binary_dark_debug.png", binary_dark * 255)
-        cv2.imwrite("cc_text_mask_debug.png", cc_text_mask)
-        
-        # 2. Запуск U-Net сегментера (если загружен)
+        # Запуск U-Net сегментера (если загружен)
         unet_mask = np.zeros_like(gray_orig)
         if self.segmenter is not None:
             try:
@@ -667,10 +651,10 @@ class LamaMPEPyTorchInpainter:
                     bbox_mask = cv2.resize(mask_256, (x1_box - x0_box, y1_box - y0_box), interpolation=cv2.INTER_NEAREST)
                     unet_mask[y0_box:y1_box, x0_box:x1_box] = bbox_mask
             except Exception as e:
-                print(f"[LaMa PyTorch] U-Net failed, using CC only: {e}")
+                print(f"[LaMa PyTorch] U-Net failed: {e}")
                 
-        # 3. Объединяем результаты U-Net и связных компонентов
-        combined_text = (unet_mask > 0) | (cc_text_mask > 0)
+        # Объединяем: только U-Net (CC отключён)
+        combined_text = (unet_mask > 0)
         
         # 4. Умный поиск обводки вокруг объединенного текста
         kernel = np.ones((3, 3), np.uint8)
