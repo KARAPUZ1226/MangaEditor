@@ -649,9 +649,9 @@ class LamaMPEPyTorchInpainter:
             if area > 30 and w < 120 and h < 120:
                 text_mask_raw[labels == i] = 255
         
-        # 5. Расширяем маску чтобы накрыть саму белую обводку
+        # 5. Минимальное расширение — накрываем только саму белую обводку (не одежду!)
         kernel = np.ones((3, 3), np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=6)
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=2)
         
         # 6. Ограничиваем выделением пользователя
         mask_refined = np.copy(mask)
@@ -973,7 +973,11 @@ class LamaMPEPyTorchInpainter:
             # Дополнительно подстрахуемся яркостью от LaMa
             lama_gray_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
-            f_white = np.clip((240.0 - lama_gray_smooth) / 20.0, 0, 1)  # гаснет 220->240
+            # Используем ОРИГИНАЛЬНУЮ яркость для гейтинга текстуры:
+            # если в оригинале белый (одежда, рамка) — текстура не накладывается
+            orig_gray_smooth = cv2.GaussianBlur(
+                gray_orig, (15, 15), 0).astype(np.float32)
+            f_white = np.clip((225.0 - orig_gray_smooth) / 20.0, 0, 1)  # гаснет 205->225
             f_black = np.clip((lama_gray_smooth - 20.0) / 20.0, 0, 1)   # гаснет 40->20
             
             f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis]
@@ -997,12 +1001,12 @@ class LamaMPEPyTorchInpainter:
                 
             ans = np.clip(ans, 0, 255).astype(np.uint8)
             
-            # Возвращаем чёткость линий: очень тёмные пиксели → чистый чёрный,
-            # очень светлые → чистый белый (только внутри зоны текста)
+            # Возвращаем чёткость линий: снэп только внутри зоны найденного текста
+            # (text_mask_raw), а не всего выделения пользователя
             ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
-            text_zone = mask_original_3d > 0
+            text_zone = (text_mask_dilated > 0)[:, :, None]
             very_dark  = (ans_gray < 85)[:, :, None] & text_zone
-            very_light = (ans_gray > 210)[:, :, None] & text_zone
+            very_light = (ans_gray > 215)[:, :, None] & text_zone
             ans[np.repeat(very_dark,  3, axis=2)] = 0
             ans[np.repeat(very_light, 3, axis=2)] = 255
             
