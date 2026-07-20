@@ -617,11 +617,14 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Структурный чистый пайплайн: выделение букв -> защита деталей -> точное FMM восстановление скринтона."""
+        """Чистый пайплайн по оригинальной архитектуре пользователя:
+        1. Обученный U-Net выдаёт маску букв и обводки ровно так, как обучен (без доп. расширений).
+        2. LaMa дорисовывает линии и тон под маской U-Net.
+        3. Защита тонов: чистый белый (>250) остаётся белым, чистый чёрный (<15) остаётся чёрной линией.
+        """
         img_original = np.copy(image)
         height, width = image.shape[:2]
         user_mask_bool = mask >= 127
-        kernel_3 = np.ones((3, 3), np.uint8)
 
         mask_refined = np.zeros((height, width), dtype=np.uint8)
 
@@ -637,58 +640,86 @@ class LamaMPEPyTorchInpainter:
             crop_user = image[y_min:y_max, x_min:x_max]
             crop_gray = cv2.cvtColor(crop_user, cv2.COLOR_BGR2GRAY)
 
-            # 2. Выделяем тёмные штрихи символов (crop_gray < 135)
-            dark_ink = (crop_gray < 135).astype(np.uint8) * 255
+            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
             
-            # 3. Фильтруем пуговицы и изолированные детали одежды вне текста
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-            text_ink_box = np.zeros_like(dark_ink)
-            
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                w_c = stats[i, cv2.CC_STAT_WIDTH]
-                h_c = stats[i, cv2.CC_STAT_HEIGHT]
-                
-                # Мелкий шумок < 6px игнорируем
-                if area < 6:
-                    continue
+            # Прогоняем через U-Net сегментатор с сохранением пропорций
+            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
+                try:
+                    max_side = max(box_h, box_w)
+                    square = np.full((max_side, max_side), 255, dtype=np.uint8)
+                    y_off = (max_side - box_h) // 2
+                    x_off = (max_side - box_w) // 2
+                    square[y_off:y_off+box_h, x_off:x_off+box_w] = crop_gray
                     
-                aspect = max(w_c / max(1, h_c), h_c / max(1, w_c))
-                is_round_button = (aspect < 1.35) and (12 <= area <= 300) and (abs(w_c - h_c) <= 4)
-                
-                # Проверяем окружение: если вокруг нет букв — это пуговица/деталь одежды!
-                if is_round_button:
-                    cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
-                    margin = 25
-                    y1_m = max(0, cy_i - margin)
-                    y2_m = min(box_h, cy_i + margin)
-                    x1_m = max(0, cx_i - margin)
-                    x2_m = min(box_w, cx_i + margin)
-                    nearby_dark = np.sum(dark_ink[y1_m:y2_m, x1_m:x2_m] > 0) - area
-                    if nearby_dark < 35:
-                        # Защищаем пуговицу (не стираем)
-                        print(f"[Cleaner] Protected button at ({cx_i}, {cy_i}), area={area}")
-                        continue
-                
-                text_ink_box[labels == i] = 255
+                    square_256 = cv2.resize(square, (256, 256), interpolation=cv2.INTER_AREA)
+                    inp = (square_256.astype(np.float32) / 255.0)[None, None, :, :]
+                    
+                    outputs = self.segmenter.run(None, {"input": inp})
+                    logits = outputs[0][0, 0]
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                    
+                    # Прямой вывод нейросети так, как она обучена (без доп. дилатаций и вмешательств)
+                    seg_256 = (probs > 0.5).astype(np.uint8) * 255
+                    seg_square = cv2.resize(seg_256, (max_side, max_side), interpolation=cv2.INTER_NEAREST)
+                    seg_mask_box = seg_square[y_off:y_off+box_h, x_off:x_off+box_w]
+                except Exception as e:
+                    print(f"[LaMa] U-Net segmenter error: {e}")
 
-            # 4. Дилатация 3px покрывает белые обводки (fuchidori)
-            seg_mask_dilated = cv2.dilate(text_ink_box, kernel_3, iterations=3)
-            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
+            # Страховка (если рамка пустая)
+            if np.sum(seg_mask_box > 0) < 5:
+                seg_mask_box = (crop_gray < 110).astype(np.uint8) * 255
+
+            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_box
             mask_refined[~user_mask_bool] = 0
 
-        # Страховка: если выделить не удалось — берём выделение с минимальной дилатацией
+        # Страховка
         if np.sum(mask_refined > 0) < 5:
-            mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
+            mask_refined = mask.copy()
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
 
-        # 5. Восстановление растра скринтона и линий через Fast Marching Telea
-        # FMM идеально сохраняет растровые точки скринтона и соединяет линии без серого мыла LaMa
-        ans = cv2.inpaint(img_original, mask_refined, 3, cv2.INPAINT_TELEA)
+        # 2. LaMa дорисовывает линии и тона на маске U-Net
+        pad_h = (8 - height % 8) % 8
+        pad_w = (8 - width % 8) % 8
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # 6. Строгое ч/б без цветного шума
-        ans = cv2.cvtColor(cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+        if pad_h > 0 or pad_w > 0:
+            image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            mask_padded = cv2.copyMakeBorder(mask_refined, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+        else:
+            image_padded = image_rgb
+            mask_padded = mask_refined
+
+        img_t = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze(0).float().div_(255.).to(self.device)
+        mask_t = torch.from_numpy(mask_padded).unsqueeze(0).unsqueeze(0).float().div_(255.).to(self.device)
+        mask_t = (mask_t >= 0.5).float()
+
+        with torch.no_grad():
+            img_t *= (1 - mask_t)
+            out = self.model(img_t, mask_t).to(torch.float32)
+            result = (out.cpu().squeeze(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
+
+        if pad_h > 0 or pad_w > 0:
+            result = result[:height, :width]
+        result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+
+        # 3. Мягкое смешивание по чистой маске U-Net
+        m = (mask_refined > 0).astype(np.float32)[:, :, None]
+        ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
+        ans = np.clip(ans, 0, 255).astype(np.uint8)
+
+        # 4. Защита тонов: если оригинал чисто белый (>250) — остаётся 255, если чёрный контур (<15) — остаётся 0
+        ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
+        orig_gray = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        
+        inpaint_zone = (mask_refined > 0)
+        pure_white = (orig_gray >= 250) & inpaint_zone
+        pure_black = (orig_gray <= 15) & inpaint_zone
+        
+        ans_gray[pure_white] = 255
+        ans_gray[pure_black] = 0
+
+        ans = cv2.cvtColor(ans_gray, cv2.COLOR_GRAY2BGR)
         return ans
 
 
