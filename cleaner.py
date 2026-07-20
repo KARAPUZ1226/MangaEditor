@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 
-from lama_mpe_pytorch import LamaMPEPyTorchInpainter as LaMaInpainter
+from manga_inpaintor_model import MangaInpaintorInpainter as LaMaInpainter
 
 
 def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainter=None, text_segmenter=None):
