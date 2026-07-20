@@ -619,71 +619,59 @@ class LamaMPEPyTorchInpainter:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
         text_mask_raw = np.zeros_like(mask)
-        y0_box, x0_box = 0, 0
-        
-        # === 0. Детектирование текста: "Окружён белым со всех сторон" ===
-        # Ключевое отличие текста от контуров рисунка:
-        #  - Буква (ふちどり): белая обводка окружает её СО ВСЕХ СТОРОН (3-4 из 4 направлений)
-        #  - Контур одежды:   белое только С ОДНОЙ СТОРОНЫ (внутри рукава)
+          # === 0. Детектирование текста: для каждого тёмного компонента проверяем, ===
+        # === есть ли у него белый ореол (кольцо). Текст = да, линии рисунка = нет ===
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         user_mask_bool = mask >= 127
         
-        # 1. Тёмные кандидаты внутри выделения
-        dark = ((gray_orig < 85) & user_mask_bool)
+        # 1. Медиан-фильтр убивает растровые точки, оставляет буквы и линии
+        gray_smooth = cv2.medianBlur(gray_orig, 5)
+        dark_mask = ((gray_smooth < 130) & user_mask_bool).astype(np.uint8)
         
-        # 2. Проверяем наличие белого в каждом из 4 направлений (радиус 5px)
-        r = 5
-        def wh(dy, dx):
-            return np.roll(np.roll(gray_orig > 195, -dy * r, axis=0), -dx * r, axis=1)
-        
-        surrounded = (wh(1,0).astype(np.int8) + wh(-1,0).astype(np.int8) +
-                      wh(0,1).astype(np.int8) + wh(0,-1).astype(np.int8)) >= 3
-        
-        text_candidates = (dark & surrounded).astype(np.uint8)
-        
-        # 3. CC-фильтр: убираем мелкие точки скринтона и крупные тёмные области
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_candidates, connectivity=8)
+        # 2. CC-анализ тёмных компонентов
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
         text_mask_raw = np.zeros_like(gray_orig)
+        kernel_ring = np.ones((7, 7), np.uint8)
+        
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
             w_c  = stats[i, cv2.CC_STAT_WIDTH]
             h_c  = stats[i, cv2.CC_STAT_HEIGHT]
-            if 40 < area < 5000 and w_c < 100 and h_c < 100:
-                text_mask_raw[labels == i] = 255
+            ar   = max(w_c / (h_c + 1e-5), h_c / (w_c + 1e-5))
+            density = area / (w_c * h_c + 1e-5)
+            
+            # Размерные фильтры: текстовые символы 10-50px, не слишком вытянуты
+            if not (40 < area < 4000 and w_c < 55 and h_c < 55 and ar < 2.8 and density > 0.12):
+                continue
+            
+            # 3. Проверка "белого кольца": расширяем компонент, вычисляем кольцо,
+            #    смотрим долю белых пикселей в кольце
+            comp_mask = (labels == i).astype(np.uint8)
+            dilated_comp = cv2.dilate(comp_mask, kernel_ring, iterations=1)
+            ring = (dilated_comp > 0) & (comp_mask == 0)
+            ring_pixels = gray_orig[ring]
+            
+            if len(ring_pixels) > 5:
+                white_fraction = np.mean(ring_pixels > 185)
+                if white_fraction > 0.25:
+                    # ≥25% кольца — белое → это буква с обводкой
+                    text_mask_raw[labels == i] = 255
         
-        # 4. U-Net как дополнительный детектор (низкий порог — максимальный охват)
-        if self.segmenter is not None:
-            try:
-                y_idx, x_idx = np.where(user_mask_bool)
-                if len(y_idx) > 0:
-                    y0b, y1b = y_idx.min(), y_idx.max() + 1
-                    x0b, x1b = x_idx.min(), x_idx.max() + 1
-                    patch = cv2.resize(gray_orig[y0b:y1b, x0b:x1b], (256, 256))
-                    blob = patch.astype(np.float32) / 255.0
-                    blob = blob[None, None, :, :]
-                    logits = self.segmenter.run(None, {"input": blob})[0][0][0]
-                    probs = 1.0 / (1.0 + np.exp(-logits))
-                    unet256 = (probs > 0.45).astype(np.uint8) * 255
-                    unet_patch = cv2.resize(unet256, (x1b - x0b, y1b - y0b), interpolation=cv2.INTER_NEAREST)
-                    unet_full = np.zeros_like(gray_orig)
-                    unet_full[y0b:y1b, x0b:x1b] = unet_patch
-                    # Добавляем U-Net к маске только там, где он И детектор белой обводки согласны
-                    unet_confirmed = (unet_full > 0) & surrounded & user_mask_bool
-                    text_mask_raw[unet_confirmed] = 255
-                    print(f"[LaMa] U-Net добавил {int(unet_confirmed.sum())} px")
-            except Exception as e:
-                print(f"[LaMa] U-Net пропущен: {e}")
-        
-        # 5. Минимальная дилатация — только чтобы накрыть белую обводку
+        # 4. Расширяем маску чтобы покрыть саму белую обводку
         kernel = np.ones((3, 3), np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=3)
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=4)
         
-        # 6. Ограничиваем выделением пользователя; если ничего не нашли → полная маска
+        # 5. Ограничиваем выделением пользователя
         mask_refined = np.copy(mask)
         mask_refined[text_mask_dilated == 0] = 0
-        if np.sum(mask_refined >= 127) < 50:
-            print("[LaMa] Детектор не нашёл текст — используем полную маску")
-            mask_refined = np.copy(mask)
+        
+        detected_px = np.sum(mask_refined >= 127)
+        print(f"[LaMa] Детектор нашёл {detected_px} px текста")
+        
+        # Если не нашли текст — возвращаем оригинал без изменений (безопасно!)
+        if detected_px < 100:
+            print("[LaMa] Текст не найден — возвращаю оригинал без изменений")
+            return img_original
         
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
@@ -693,7 +681,8 @@ class LamaMPEPyTorchInpainter:
         height, width, c = image.shape
 
         # Сохраняем отладочную маску на диск для визуальной проверки
-        cv2.imwrite(f"mask_debug_{y0_box}_{x0_box}.png", (mask_original * 255).astype(np.uint8))
+        cv2.imwrite("mask_debug_0_0.png", (mask_original * 255).astype(np.uint8))
+        cv2.imwrite("text_mask_raw_debug.png", text_mask_raw)
 
         # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
         pad_size = 8
