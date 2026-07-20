@@ -621,14 +621,46 @@ class LamaMPEPyTorchInpainter:
         text_mask_raw = np.zeros_like(mask)
         y0_box, x0_box = 0, 0
         
-        # === 0. Детектирование текста отключено — используем маску пользователя напрямую ===
-        # U-Net и CC дают ложные срабатывания на реальных кандзи и линиях пиджака.
-        # Пользователь сам выделяет зону текста — доверяем ему полностью.
+        # === 0. Детектирование текста по белой обводке (характерная черта манги) ===
+        # Главный признак текста манги — толстая белая обводка вокруг чёрных букв.
+        # Линии рисунка и одежды этой обводки не имеют.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        text_mask_dilated = mask.copy()  # полная маска пользователя
-        text_mask_raw = mask.copy()
         
+        # Только внутри выделения пользователя
+        user_mask_bool = mask >= 127
+        
+        # 1. Тёмные пиксели (потенциальные буквы)
+        dark_pixels = ((gray_orig < 90) & user_mask_bool).astype(np.uint8)
+        
+        # 2. Светлые пиксели (потенциальная белая обводка)
+        white_pixels = (gray_orig > 195).astype(np.uint8)
+        white_nearby = cv2.dilate(white_pixels, np.ones((11, 11), np.uint8))
+        
+        # 3. Текст = тёмные пиксели рядом с белой обводкой
+        text_candidates = (dark_pixels & (white_nearby > 0)).astype(np.uint8)
+        
+        # 4. Фильтрация связных компонентов по размеру (убираем мелкие точки растра)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_candidates, connectivity=8)
+        text_mask_raw = np.zeros_like(gray_orig)
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            if area > 30 and w < 120 and h < 120:
+                text_mask_raw[labels == i] = 255
+        
+        # 5. Расширяем маску чтобы накрыть саму белую обводку
+        kernel = np.ones((3, 3), np.uint8)
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=6)
+        
+        # 6. Ограничиваем выделением пользователя
         mask_refined = np.copy(mask)
+        mask_refined[text_mask_dilated == 0] = 0
+        
+        # Если детектор ничего не нашёл — используем полную маску пользователя
+        if np.sum(mask_refined >= 127) < 50:
+            print("[LaMa PyTorch DEBUG] White-outline detector found nothing, using full user mask")
+            mask_refined = np.copy(mask)
         
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
