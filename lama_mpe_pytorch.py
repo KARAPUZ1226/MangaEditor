@@ -927,13 +927,14 @@ class LamaMPEPyTorchInpainter:
             hp_texture = np.zeros_like(hp_orig)
             mask_to_fill = (text_mask_dilated > 0)
             
-            # Запрещаем брать доноры из букв, чёрных линий, белых облаков и тёмных теней
+            # Расширяем маски грязных зон (буквы и контуры) ровно настолько, чтобы захватить их невидимые ореолы сглаживания
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((5, 5), np.uint8), iterations=2)
+            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((7, 7), np.uint8), iterations=2)
+            dirty_edges_mask = cv2.dilate(dilated_edges, np.ones((7, 7), np.uint8), iterations=2)
             
             dirty_donor_mask = (
                 (dirty_text_mask > 0) | 
-                (dilated_edges > 0) | 
+                (dirty_edges_mask > 0) | 
                 (gray_orig > 230) | 
                 (gray_orig < 25)
             ).astype(np.float32)
