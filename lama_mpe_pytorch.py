@@ -708,17 +708,14 @@ class LamaMPEPyTorchInpainter:
         ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
         ans = np.clip(ans, 0, 255).astype(np.uint8)
 
-        # 4. Защита тонов: если оригинал чисто белый (>250) — остаётся 255, если чёрный контур (<15) — остаётся 0
+        # 4. Защита тонов: если оригинал чисто белый (>250) — оставляем белым (255)
         ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
         orig_gray = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
         inpaint_zone = (mask_refined > 0)
         pure_white = (orig_gray >= 250) & inpaint_zone
-        pure_black = (orig_gray <= 15) & inpaint_zone
         
         ans_gray[pure_white] = 255
-        ans_gray[pure_black] = 0
-
         ans = cv2.cvtColor(ans_gray, cv2.COLOR_GRAY2BGR)
         return ans
 
