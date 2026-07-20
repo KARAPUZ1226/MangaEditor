@@ -627,54 +627,42 @@ class LamaMPEPyTorchInpainter:
         user_mask_bool = mask >= 127
 
         mask_refined = np.zeros((height, width), dtype=np.uint8)
+        kernel_3 = np.ones((3, 3), np.uint8)
 
         # 1. Точные прямоугольные границы выделения пользователя
         y_indices, x_indices = np.where(user_mask_bool)
         if len(y_indices) > 0 and len(x_indices) > 0:
             y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
             x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
-            
-            box_h = y_max - y_min
-            box_w = x_max - x_min
-            
-            crop_user = image[y_min:y_max, x_min:x_max]
-            crop_gray = cv2.cvtColor(crop_user, cv2.COLOR_BGR2GRAY)
-
-            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
-            
-            # Прогоняем через U-Net сегментатор с сохранением пропорций
+            box_h, box_w = y_max - y_min, x_max - x_min
+            crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
+            seg_mask_box = None
             if self.segmenter is not None and box_h >= 8 and box_w >= 8:
                 try:
-                    max_side = max(box_h, box_w)
-                    square = np.full((max_side, max_side), 255, dtype=np.uint8)
-                    y_off = (max_side - box_h) // 2
-                    x_off = (max_side - box_w) // 2
-                    square[y_off:y_off+box_h, x_off:x_off+box_w] = crop_gray
-                    
-                    square_256 = cv2.resize(square, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (square_256.astype(np.float32) / 255.0)[None, None, :, :]
-                    
+                    # Сегментатор обучен на кропах текста 256x256
+                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
+                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
                     outputs = self.segmenter.run(None, {"input": inp})
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    
-                    # Прямой вывод нейросети так, как она обучена (без доп. дилатаций и вмешательств)
-                    seg_256 = (probs > 0.5).astype(np.uint8) * 255
-                    seg_square = cv2.resize(seg_256, (max_side, max_side), interpolation=cv2.INTER_NEAREST)
-                    seg_mask_box = seg_square[y_off:y_off+box_h, x_off:x_off+box_w]
+                    # Прогноз нейросети: маска букв + обводки
+                    seg_256 = (probs > 0.20).astype(np.uint8) * 255
+                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
                 except Exception as e:
-                    print(f"[LaMa] U-Net segmenter error: {e}")
+                    print(f"[LaMa] Segmenter error: {e}")
 
-            # Страховка (если рамка пустая)
-            if np.sum(seg_mask_box > 0) < 5:
-                seg_mask_box = (crop_gray < 110).astype(np.uint8) * 255
+            # Безопасная страховка: если нейросеть ничего не нашла, берем только самые темные штрихи
+            if seg_mask_box is None or np.sum(seg_mask_box > 0) < 5:
+                seg_mask_box = (crop_gray < 80).astype(np.uint8) * 255
 
-            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_box
+            # Дилатация 2px для гарантированного накрытия краёв обводок букв (fuchidori)
+            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=2)
+            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
         # Страховка
         if np.sum(mask_refined > 0) < 5:
-            mask_refined = mask.copy()
+            mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
 
@@ -703,20 +691,14 @@ class LamaMPEPyTorchInpainter:
             result = result[:height, :width]
         result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
 
-        # 3. Мягкое смешивание по чистой маске U-Net
+        # 3. Мягкое вклеивание результата LaMa строго по маске букв
         m = (mask_refined > 0).astype(np.float32)[:, :, None]
+        m = cv2.GaussianBlur(m, (3, 3), 0)
+        if m.ndim == 2:
+            m = m[:, :, None]
+
         ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
         ans = np.clip(ans, 0, 255).astype(np.uint8)
-
-        # 4. Защита тонов: если оригинал чисто белый (>250) — оставляем белым (255)
-        ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
-        orig_gray = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        
-        inpaint_zone = (mask_refined > 0)
-        pure_white = (orig_gray >= 250) & inpaint_zone
-        
-        ans_gray[pure_white] = 255
-        ans = cv2.cvtColor(ans_gray, cv2.COLOR_GRAY2BGR)
         return ans
 
 
