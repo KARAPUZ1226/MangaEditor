@@ -985,7 +985,11 @@ class LamaMPEPyTorchInpainter:
             f_white = np.clip((225.0 - orig_gray_smooth) / 20.0, 0, 1)  # гаснет 205->225
             f_black = np.clip((lama_gray_smooth - 20.0) / 20.0, 0, 1)   # гаснет 40->20
             
-            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis]
+            # Текстура растра НЕ должна накладываться на тёмные линии рисунка (чтобы не перекрывать их)
+            lama_gray_raw = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
+            f_not_line = np.clip((lama_gray_raw.astype(np.float32) - 40.0) / 70.0, 0, 1)
+            
+            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis] * f_not_line[:, :, np.newaxis]
             
             # Заменяем подложку в зоне скринтона на 100% гладкий градиент без мусора текста
             base_bg = img_inpainted.astype(np.float32) * (1.0 - f_texture) + img_inpainted_smooth * f_texture
@@ -1005,11 +1009,11 @@ class LamaMPEPyTorchInpainter:
                 
             ans = np.clip(ans, 0, 255).astype(np.uint8)
             
-            # Возвращаем чёткость линий: снэп только внутри зоны найденного текста
-            # (text_mask_raw), а не всего выделения пользователя
+            # Возвращаем чёткость и непрерывность линий:
+            # Все восстановленные LaMa линии (яркость < 115) доводим до чистого контрастного чёрного (0)
             ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
             text_zone = (text_mask_dilated > 0)[:, :, None]
-            very_dark  = (ans_gray < 85)[:, :, None] & text_zone
+            very_dark  = (ans_gray < 115)[:, :, None] & text_zone
             very_light = (ans_gray > 215)[:, :, None] & text_zone
             ans[np.repeat(very_dark,  3, axis=2)] = 0
             ans[np.repeat(very_light, 3, axis=2)] = 255
