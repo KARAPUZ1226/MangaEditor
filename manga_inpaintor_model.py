@@ -5,6 +5,9 @@ import torch
 
 class MangaInpaintorInpainter:
     def __init__(self, model_path="models/manga_inpaintor.jit"):
+        if not model_path or not model_path.endswith(".jit") or not os.path.exists(model_path):
+            model_path = os.path.join(os.path.dirname(__file__), "models", "manga_inpaintor.jit")
+
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"[MangaInpainting] Loading SIGGRAPH 2021 TorchScript checkpoint {model_path} to {self.device}...")
         

@@ -860,34 +860,34 @@ class MangaEditorApp(QMainWindow):
             self.pristine_qimage = None
             
     def check_and_load_lama(self, prompt=True):
-        """Проверяет наличие ИИ-модели LaMa MPE, скачивает её при необходимости и загружает сессию."""
+        """Проверяет наличие ИИ-модели MangaInpainting, скачивает её при необходимости и загружает сессию."""
         model_dir = "models"
-        model_path = os.path.join(model_dir, "inpainting_lama_mpe.ckpt")
+        model_path = os.path.join(model_dir, "manga_inpaintor.jit")
         
         if not os.path.exists(model_path):
             if prompt:
                 reply = QMessageBox.question(
                     self, 
                     "Загрузка ИИ-модели", 
-                    "Для качественной очистки необходимо скачать ИИ-модель LaMa MPE (около 100 МБ), дообученную на манге.\nСкачать её сейчас?",
+                    "Для качественной очистки необходимо скачать ИИ-модель MangaInpainting (около 70 МБ), дообученную на манге.\nСкачать её сейчас?",
                     QMessageBox.Yes | QMessageBox.No
                 )
                 if reply != QMessageBox.Yes:
                     return False
             
-            # Скачиваем с GitHub Releases
-            ok = self.download_model_gui("https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/inpainting_lama_mpe.ckpt", model_path)
+            # Скачиваем с Hugging Face
+            ok = self.download_model_gui("https://huggingface.co/chaodu001/ComfyUI_LayerStyle_All_models_download/resolve/main/lama/manga_inpaintor.jit", model_path)
             if not ok:
                 QMessageBox.warning(self, "Загрузка отменена", "Будет использован стандартный алгоритм (Navier-Stokes).")
                 return False
         if self.lama_inpainter is None:
             try:
-                self.statusBar().showMessage("Загрузка ИИ-модели LaМа MPE в память (PyTorch)...")
+                self.statusBar().showMessage("Загрузка ИИ-модели MangaInpainting в память (PyTorch)...")
                 QApplication.processEvents()
                 self.lama_inpainter = LaMaInpainter(model_path)
-                self.statusBar().showMessage("ИИ-модель LaМа MPE готова к работе!", 3000)
+                self.statusBar().showMessage("ИИ-модель MangaInpainting готова к работе!", 3000)
             except Exception as e:
-                QMessageBox.warning(self, "Ошибка инициализации", f"Не удалось запустить LaMa: {e}\nБудет использован стандартный алгоритм.")
+                QMessageBox.warning(self, "Ошибка инициализации", f"Не удалось запустить ИИ-модель: {e}\nБудет использован стандартный алгоритм.")
                 self.lama_inpainter = None
                 return False
         return True
