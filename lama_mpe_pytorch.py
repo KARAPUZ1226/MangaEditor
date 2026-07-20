@@ -672,24 +672,31 @@ class LamaMPEPyTorchInpainter:
         # 3. Объединяем результаты U-Net и связных компонентов
         combined_text = (unet_mask > 0) | (cc_text_mask > 0)
         
-        # 4. Умное расширение маски текста (включая белые ореолы и тени)
-        kernel5 = np.ones((5, 5), np.uint8)
+        # 4. Точная маска текста с умным расширением белых обводок
+        kernel3 = np.ones((3, 3), np.uint8)
         if np.sum(combined_text) > 0:
-            text_mask_dilated = cv2.dilate(combined_text.astype(np.uint8) * 255, kernel5, iterations=2)
-            white_outline = (gray_orig > 170) & (cv2.dilate(text_mask_dilated, kernel5, iterations=2) > 0)
-            text_mask_dilated[white_outline] = 255
-            text_mask_dilated = cv2.dilate(text_mask_dilated, kernel5, iterations=2)
+            # Расширяем сам текст на 6px
+            near_text = cv2.dilate(combined_text.astype(np.uint8) * 255, kernel3, iterations=6)
+            
+            # Находим белые обводки (ореолы букв) около текста
+            white_outline = (gray_orig > 175) & (near_text > 0)
+            
+            text_mask_raw = np.zeros_like(gray_orig)
+            text_mask_raw[combined_text] = 255
+            text_mask_raw[white_outline] = 255
+            
+            # Расширяем маску еще на 6px, чтобы 100% полностью закрыть края обводки
+            text_mask_dilated = cv2.dilate(text_mask_raw, kernel3, iterations=6)
         else:
             text_mask_dilated = np.copy(mask)
 
-        # 5. Маска очистки использует выделение пользователя с лёгким запасом
+        # 5. Ограничиваем маску выделением пользователя (строго по контуру текста!)
         mask_refined = np.copy(mask)
-        mask_refined[mask_refined >= 127] = 255
-        mask_refined[mask_refined < 127] = 0
-        mask_refined = cv2.dilate(mask_refined, np.ones((3, 3), np.uint8), iterations=2)
-        
+        if np.sum(text_mask_dilated > 0) > 0:
+            mask_refined[text_mask_dilated == 0] = 0
+            
         if np.sum(mask_refined >= 127) < 10:
-            mask_refined = np.copy(text_mask_dilated)
+            mask_refined = np.copy(mask)
 
         mask_original = (mask_refined >= 127).astype(np.uint8)
         mask_original_3d = mask_original[:, :, None]
