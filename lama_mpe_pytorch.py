@@ -929,12 +929,18 @@ class LamaMPEPyTorchInpainter:
             
             # Запрещаем брать доноры из букв, чёрных линий, белых облаков и тёмных теней
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((9, 9), np.uint8), iterations=3)
+            
             dirty_donor_mask = (
-                (text_mask_dilated > 0) | 
+                (dirty_text_mask > 0) | 
                 (dilated_edges > 0) | 
-                (gray_orig > 230) | 
-                (gray_orig < 25)
+                (gray_orig > 225) | 
+                (gray_orig < 30)
             ).astype(np.float32)
+            
+            # Принудительно обнуляем высокочастотную текстуру на всех грязных участках, 
+            # чтобы штрихи букв физически не могли попасть в доноры!
+            hp_orig[dirty_donor_mask[:, :, None] > 0] = 0.0
             
             # 2D базис решётки скринтона (основной вектор + перпендикулярный)
             v1 = (best_dx, best_dy)
