@@ -647,7 +647,7 @@ class LamaMPEPyTorchInpainter:
                     outputs = self.segmenter.run(None, {"input": input_blob})
                     logits = outputs[0][0][0]
                     probs = 1.0 / (1.0 + np.exp(-logits))
-                    mask_256 = (probs > 0.5).astype(np.uint8) * 255
+                    mask_256 = (probs > 0.65).astype(np.uint8) * 255
                     bbox_mask = cv2.resize(mask_256, (x1_box - x0_box, y1_box - y0_box), interpolation=cv2.INTER_NEAREST)
                     unet_mask[y0_box:y1_box, x0_box:x1_box] = bbox_mask
             except Exception as e:
@@ -1012,6 +1012,16 @@ class LamaMPEPyTorchInpainter:
             ans[restore_mask] = img_original[restore_mask]
                 
             ans = np.clip(ans, 0, 255).astype(np.uint8)
+            
+            # Возвращаем чёткость линий: очень тёмные пиксели → чистый чёрный,
+            # очень светлые → чистый белый (только внутри зоны текста)
+            ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
+            text_zone = mask_original_3d > 0
+            very_dark  = (ans_gray < 55)[:, :, None] & text_zone
+            very_light = (ans_gray > 220)[:, :, None] & text_zone
+            ans[np.repeat(very_dark,  3, axis=2)] = 0
+            ans[np.repeat(very_light, 3, axis=2)] = 255
+            
             return ans
         else:
             ans = img_blended
