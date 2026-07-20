@@ -52,8 +52,10 @@ class MangaInpaintorInpainter:
         gray_clean = np.copy(gray_padded)
         gray_clean[mask_padded > 0] = 255
         
-        # Extract structural line art (Canny edges inverted) on clean image
-        edges = cv2.Canny(gray_clean, 50, 150)
+        # Extract ONLY structural line art (character outlines, bubble borders).
+        # Apply medianBlur to remove screentone dots so Canny doesn't treat dots as line art!
+        gray_smooth_for_lines = cv2.medianBlur(gray_clean, 5)
+        edges = cv2.Canny(gray_smooth_for_lines, 50, 150)
         line_art = 255 - edges
         
         # 3. Prepare Tensors
@@ -78,9 +80,9 @@ class MangaInpaintorInpainter:
         # Convert to BGR
         out_bgr = cv2.cvtColor(out_gray, cv2.COLOR_GRAY2BGR)
 
-        # Seamless blend with feathered mask
+        # Seamless blend with feathered mask (smooth 21x21 transition)
         mask_float = (mask_refined.astype(np.float32) / 255.0)[:, :, None]
-        feathered = cv2.GaussianBlur(mask_float, (7, 7), 0)
+        feathered = cv2.GaussianBlur(mask_float, (21, 21), 0)
         if len(feathered.shape) == 2:
             feathered = feathered[:, :, None]
 
