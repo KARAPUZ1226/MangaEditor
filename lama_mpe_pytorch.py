@@ -655,37 +655,22 @@ class LamaMPEPyTorchInpainter:
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                     
-                    # Порог 0.15 забирает все края символов и тонкие штрихи
-                    seg_256 = (probs > 0.15).astype(np.uint8) * 255
+                    # Порог 0.05 забирает абсолютно все символы и мелкие знаки (!?), не затрагивая рисованные детали
+                    seg_256 = (probs > 0.05).astype(np.uint8) * 255
                     seg_square = cv2.resize(seg_256, (max_side, max_side), interpolation=cv2.INTER_NEAREST)
                     seg_mask_box = seg_square[y_off:y_off+box_h, x_off:x_off+box_w]
                 except Exception as e:
                     print(f"[LaMa] Segmenter box error: {e}")
 
-            # Защита пуговиц и деталей одежды: не маскируем отдельно стоящие круглой формы темные объекты
-            # если они не находятся внутри белой обводки текста
-            # Фильтруем маску сегментатора по связным компонентам
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(seg_mask_box, connectivity=8)
+            # Исключаем изолированный шумок меньше 5px
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seg_mask_box, connectivity=8)
             cleaned_seg_box = np.zeros_like(seg_mask_box)
-            
             for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                w_c = stats[i, cv2.CC_STAT_WIDTH]
-                h_c = stats[i, cv2.CC_STAT_HEIGHT]
-                
-                # Если деталь отдельная, круглая (пуговица) и находится без буквенного контекста
-                aspect = max(w_c / max(1, h_c), h_c / max(1, w_c))
-                # Обычные символы или фрагменты слов
-                if area >= 8:
+                if stats[i, cv2.CC_STAT_AREA] >= 5:
                     cleaned_seg_box[labels == i] = 255
-                    
             seg_mask_box = cleaned_seg_box
 
-            # Если сегментатор ничего не вернул — фолбэк на тёмные штрихи (< 120)
-            if np.sum(seg_mask_box > 0) < 10:
-                seg_mask_box = (crop_gray < 120).astype(np.uint8) * 255
-
-            # Дилатация 2px накрывает белые обводки (fuchidori) и края букв
+            # Дилатация 2px точно покрывает белые обводки (fuchidori) вокруг букв, не трогая пуговицы
             seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=2)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
