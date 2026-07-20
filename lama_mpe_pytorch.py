@@ -974,6 +974,9 @@ class LamaMPEPyTorchInpainter:
         img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
 
         if hp_texture is not None:
+            # 1. Гладкий фон от LaMa без мусора и следов текста
+            img_inpainted_smooth = cv2.GaussianBlur(img_inpainted, (31, 31), 0).astype(np.float32)
+
             # Определяем, где в ОРИГИНАЛЕ есть текстура (скринтон)
             orig_gray_f = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY).astype(np.float32)
             mean_gray = cv2.GaussianBlur(orig_gray_f, (11, 11), 0)
@@ -988,8 +991,6 @@ class LamaMPEPyTorchInpainter:
             scale = 0.25
             small_h, small_w = max(1, int(height * scale)), max(1, int(width * scale))
             small_texture = cv2.resize(texture_presence_u8, (small_w, small_h), interpolation=cv2.INTER_AREA)
-            
-            # Маска инпейнта должна покрывать весь текст, иначе inpaint оставит края букв
             small_mask = cv2.resize(text_mask_dilated, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
             
             small_inpainted = cv2.inpaint(small_texture, small_mask, 5, cv2.INPAINT_TELEA)
@@ -1005,12 +1006,31 @@ class LamaMPEPyTorchInpainter:
             
             f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis]
             
-            clean_texture_mask = feathered_mask * f_texture
-            clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
+            # Заменяем подложку в зоне скринтона на 100% гладкий градиент без мусора текста
+            base_bg = img_inpainted.astype(np.float32) * (1.0 - f_texture) + img_inpainted_smooth * f_texture
             
-            ans = img_blended + hp_texture * clean_texture_mask
+            # Восстанавливаем узор растра с ПОЛНОЙ 100% амплитудой до самой границы
+            reconstructed_hole = base_bg + hp_texture * f_texture
+            
+            # Смешиваем с оригиналом по маске
+            hole_mask_feathered = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (3, 3), 0)
+            if len(hole_mask_feathered.shape) == 2:
+                hole_mask_feathered = hole_mask_feathered[:, :, None]
+                
+            ans = reconstructed_hole * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
+            
+            # Восстанавливаем оригинальные линии рисунка
+            restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
+            ans[restore_mask] = img_original[restore_mask]
+                
+            ans = np.clip(ans, 0, 255).astype(np.uint8)
+            return ans
         else:
             ans = img_blended
+            restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
+            ans[restore_mask] = img_original[restore_mask]
+            ans = np.clip(ans, 0, 255).astype(np.uint8)
+            return ans
             
         # Восстанавливаем оригинальные линии рисунка строго вне сырой маски букв (text_mask_raw == 0),
         # чтобы вернуть резкие линии и границы кадра, но не восстановить стертый текст.
