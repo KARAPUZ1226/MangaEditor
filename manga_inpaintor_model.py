@@ -29,32 +29,10 @@ class MangaInpaintorInpainter:
         img_original = np.copy(image)
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Refine mask with U-Net text segmenter & connected components if mask covers broader area
+        # Use user selection mask dilated slightly to ensure smooth coverage without fragmented horizontal line gaps
         mask_refined = np.copy(mask)
-        y_indices, x_indices = np.where(mask >= 127)
-        if len(y_indices) > 0 and self.segmenter is not None:
-            try:
-                y0_box, y1_box = y_indices.min(), y_indices.max() + 1
-                x0_box, x1_box = x_indices.min(), x_indices.max() + 1
-                bbox_gray = gray_orig[y0_box:y1_box, x0_box:x1_box]
-                bbox_resized = cv2.resize(bbox_gray, (256, 256))
-                input_blob = (bbox_resized.astype(np.float32) / 255.0)[None, None, :, :]
-                outputs = self.segmenter.run(None, {"input": input_blob})
-                probs = 1.0 / (1.0 + np.exp(-outputs[0][0][0]))
-                mask_256 = (probs > 0.5).astype(np.uint8) * 255
-                bbox_mask = cv2.resize(mask_256, (x1_box - x0_box, y1_box - y0_box), interpolation=cv2.INTER_NEAREST)
-                
-                unet_mask = np.zeros_like(gray_orig)
-                unet_mask[y0_box:y1_box, x0_box:x1_box] = bbox_mask
-                
-                # Dilate slightly to catch text outlines
-                kernel = np.ones((3, 3), np.uint8)
-                text_mask_dilated = cv2.dilate(unet_mask, kernel, iterations=4)
-                
-                # Intersect with user selection
-                mask_refined[text_mask_dilated == 0] = 0
-            except Exception as e:
-                print(f"[MangaInpainting] Segmenter refinement skipped: {e}")
+        kernel = np.ones((5, 5), np.uint8)
+        mask_refined = cv2.dilate(mask_refined, kernel, iterations=2)
 
         # Ensure height and width are divisible by 8 using reflection padding
         pad_size = 8
@@ -70,18 +48,22 @@ class MangaInpaintorInpainter:
             
         ph, pw = gray_padded.shape[:2]
 
-        # 2. Extract structural line art (Canny edges inverted)
-        edges = cv2.Canny(gray_padded, 50, 150)
+        # 2. Clear text letters inside the mask so the network sees a clean white hole
+        gray_clean = np.copy(gray_padded)
+        gray_clean[mask_padded > 0] = 255
+        
+        # Extract structural line art (Canny edges inverted) on clean image
+        edges = cv2.Canny(gray_clean, 50, 150)
         line_art = 255 - edges
         
         # 3. Prepare Tensors
-        img_t = torch.from_numpy((gray_padded.astype(np.float32) / 127.5) - 1.0).unsqueeze(0).unsqueeze(0).to(self.device)
+        img_t = torch.from_numpy((gray_clean.astype(np.float32) / 127.5) - 1.0).unsqueeze(0).unsqueeze(0).to(self.device)
         lines_t = torch.from_numpy((line_art.astype(np.float32) / 127.5) - 1.0).unsqueeze(0).unsqueeze(0).to(self.device)
         mask_t = torch.from_numpy((mask_padded.astype(np.float32) / 255.0)).unsqueeze(0).unsqueeze(0).to(self.device)
         mask_t[mask_t < 0.5] = 0
         mask_t[mask_t >= 0.5] = 1
 
-        noise_t = torch.randn(1, 1, ph, pw).to(self.device)
+        noise_t = torch.zeros(1, 1, ph, pw).to(self.device)
         ones_t = torch.ones(1, 1, ph, pw).to(self.device)
 
         # 4. Neural Inpainting
