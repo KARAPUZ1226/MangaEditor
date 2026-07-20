@@ -619,35 +619,52 @@ class LamaMPEPyTorchInpainter:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
         text_mask_raw = np.zeros_like(mask)
-          # === 0. Обратный подход: детектим НЕ текст, а ЛИНИИ РИСУНКА для сохранения ===
-        # Текст = мелкие изолированные тёмные формы. Линии рисунка = длинные непрерывные штрихи.
-        # LaMa инпейнтит ВСЁ выделение. Потом мы восстанавливаем линии рисунка из оригинала.
+        # === 0. Точное изолирование ТЕКСТА (не переделываем весь кроп!) ===
+        # Маска для LaMa = ТОЛЬКО символы текста + белая обводка (fuchidori).
+        # Вся остальная область (скринтон, белая одежда, контуры рисунка) остается 100% оригиналом.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         user_mask_bool = mask >= 127
         
-        # 1. Находим все тёмные пиксели (контуры + текст)
-        dark_all = (gray_orig < 100).astype(np.uint8)
+        # 1. Находим тёмные пиксели (буквы + детали) внутри области пользователя
+        dark_pixels = ((gray_orig < 160) & user_mask_bool).astype(np.uint8)
         
-        # 2. Эрозия длинным ядром — выживают только ДЛИННЫЕ непрерывные линии.
-        #    Тонкие штрихи текста уничтожаются, толстые линии рисунка остаются.
-        line_h = cv2.erode(dark_all, np.ones((1, 15), np.uint8))  # горизонтальные линии
-        line_v = cv2.erode(dark_all, np.ones((15, 1), np.uint8))  # вертикальные линии
-        line_d1 = cv2.erode(dark_all, np.eye(12, dtype=np.uint8)) # диагональ 1
-        line_d2 = cv2.erode(dark_all, np.fliplr(np.eye(12, dtype=np.uint8))) # диагональ 2
+        # 2. Компонентный анализ: отделяем буквы от входящих контуров одежды/рисунка
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_pixels, connectivity=8)
+        text_mask_raw = np.zeros_like(gray_orig)
         
-        # 3. Объединяем и расширяем обратно чтобы восстановить толщину
-        lines_thin = (line_h | line_v | line_d1 | line_d2)
-        lines_restored = cv2.dilate(lines_thin, np.ones((5, 5), np.uint8), iterations=2)
+        # Контур границы выделения пользователя
+        user_u8 = user_mask_bool.astype(np.uint8)
+        border_mask = cv2.morphologyEx(user_u8, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
         
-        # 4. Маска "что стирать" = выделение пользователя МИНУС линии рисунка
-        protect_mask = (lines_restored > 0) & user_mask_bool
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            w_c = stats[i, cv2.CC_STAT_WIDTH]
+            h_c = stats[i, cv2.CC_STAT_HEIGHT]
+            
+            comp_mask = (labels == i)
+            touches_border = np.any(comp_mask & border_mask)
+            
+            # Если компонент касается границы выходящими длинными штрихами — это контур одежды/рисунка
+            if touches_border and (w_c > 30 or h_c > 30 or area > 250):
+                continue
+            
+            # Оставляем только символы/иероглифы
+            if 10 < area < 12000:
+                text_mask_raw[comp_mask] = 255
         
-        # Всё выделение — маска для LaMa (стираем весь текст)
-        mask_refined = np.copy(mask)
-        # text_mask_dilated используется ниже для скринтона — ставим = вся маска минус линии
-        text_mask_dilated = np.copy(mask)
-        text_mask_dilated[protect_mask] = 0
-        text_mask_raw = text_mask_dilated.copy()
+        # 3. Накрываем белые обводки (fuchidori) букв небольшой дилатацией (4px)
+        kernel_3 = np.ones((3, 3), np.uint8)
+        text_mask_dilated = cv2.dilate(text_mask_raw, kernel_3, iterations=4)
+        text_mask_dilated[~user_mask_bool] = 0
+        
+        # Страховка: если текст без контрастных букв или особый шрифт
+        if np.sum(text_mask_dilated > 0) < 25:
+            text_mask_dilated = cv2.dilate((dark_pixels * 255).astype(np.uint8), kernel_3, iterations=3)
+            text_mask_dilated[~user_mask_bool] = 0
+
+        # Маска ДЛЯ LAMA = ТОЛЬКО маска букв! Не весь кроп!
+        mask_refined = text_mask_dilated.copy()
+        protect_mask = user_mask_bool & (text_mask_dilated == 0)
         
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
@@ -659,7 +676,6 @@ class LamaMPEPyTorchInpainter:
         # Отладочные маски
         cv2.imwrite("mask_debug_0_0.png", (mask_original * 255).astype(np.uint8))
         cv2.imwrite("text_mask_raw_debug.png", text_mask_dilated)
-        cv2.imwrite("lines_protect_debug.png", (protect_mask.astype(np.uint8) * 255))
 
         # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
         pad_size = 8
