@@ -672,31 +672,26 @@ class LamaMPEPyTorchInpainter:
         # 3. Объединяем результаты U-Net и связных компонентов
         combined_text = (unet_mask > 0) | (cc_text_mask > 0)
         
-        # 4. Умный поиск обводки вокруг объединенного текста
-        kernel = np.ones((3, 3), np.uint8)
-        near_text = cv2.dilate(combined_text.astype(np.uint8) * 255, kernel, iterations=2)
-        white_outline = (gray_orig > 185) & (near_text > 0)
-        
-        text_mask_raw = np.zeros_like(gray_orig)
-        text_mask_raw[combined_text] = 255
-        text_mask_raw[white_outline] = 255
-        
-        # 5. Слегка расширяем для сглаживания краев и полного удаления белых ореолов
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=4)
-        
-        # 6. Ограничиваем областью выделения пользователя
+        # 4. Умное расширение маски текста (включая белые ореолы и тени)
+        kernel5 = np.ones((5, 5), np.uint8)
+        if np.sum(combined_text) > 0:
+            text_mask_dilated = cv2.dilate(combined_text.astype(np.uint8) * 255, kernel5, iterations=2)
+            white_outline = (gray_orig > 170) & (cv2.dilate(text_mask_dilated, kernel5, iterations=2) > 0)
+            text_mask_dilated[white_outline] = 255
+            text_mask_dilated = cv2.dilate(text_mask_dilated, kernel5, iterations=2)
+        else:
+            text_mask_dilated = np.copy(mask)
+
+        # 5. Маска очистки использует выделение пользователя с лёгким запасом
         mask_refined = np.copy(mask)
-        mask_refined[text_mask_dilated == 0] = 0
+        mask_refined[mask_refined >= 127] = 255
+        mask_refined[mask_refined < 127] = 0
+        mask_refined = cv2.dilate(mask_refined, np.ones((3, 3), np.uint8), iterations=2)
         
         if np.sum(mask_refined >= 127) < 10:
-            mask_refined = np.zeros_like(mask)
+            mask_refined = np.copy(text_mask_dilated)
 
-        # HoughLinesP и вычитание удалены, защита рамок теперь строится 
-        # исключительно на финальном этапе через overlap-фильтрацию dilated_edges
-
-        mask_original = np.copy(mask_refined)
-        mask_original[mask_original < 127] = 0
-        mask_original[mask_original >= 127] = 1
+        mask_original = (mask_refined >= 127).astype(np.uint8)
         mask_original_3d = mask_original[:, :, None]
 
         height, width, c = image.shape
