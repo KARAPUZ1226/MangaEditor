@@ -617,40 +617,66 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
+        """Инпэйнтинг с точным изолированием текста через U-Net сегментатор кропа."""
         img_original = np.copy(image)
-        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        
-        # 1. Точное изолирование символов текста по отклонению от локального фона (absdiff)
-        # Это выделяет ТОЛЬКО символы, буквенные обводки, плашки ■ и тире —,
-        # сохраняя пространство МЕЖДУ символами открытым как контекст для LaMa!
-        bg_smooth = cv2.GaussianBlur(gray_orig, (21, 21), 0)
-        diff = cv2.absdiff(gray_orig, bg_smooth)
+        height, width = image.shape[:2]
         user_mask_bool = mask >= 127
-        
-        # Все элементы текста (черный текст + белая обводка) отличаются от фона > 18
-        text_pixels = (diff > 18) & user_mask_bool
-        
         kernel_3 = np.ones((3, 3), np.uint8)
-        mask_refined = cv2.dilate(text_pixels.astype(np.uint8) * 255, kernel_3, iterations=4)
-        mask_refined[~user_mask_bool] = 0
-        
+
+        mask_refined = np.zeros((height, width), dtype=np.uint8)
+
+        # Находим точные прямоугольные границы выделения пользователя
+        y_indices, x_indices = np.where(user_mask_bool)
+        if len(y_indices) > 0 and len(x_indices) > 0:
+            y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
+            x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
+            
+            box_h = y_max - y_min
+            box_w = x_max - x_min
+            
+            crop_user = image[y_min:y_max, x_min:x_max]
+            crop_gray = cv2.cvtColor(crop_user, cv2.COLOR_BGR2GRAY)
+
+            seg_mask_box = None
+            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
+                try:
+                    # Сегментатор обучен на кропах текста 256x256
+                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
+                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
+                    
+                    outputs = self.segmenter.run(None, {"input": inp})
+                    logits = outputs[0][0, 0]
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                    
+                    seg_256 = (probs > 0.4).astype(np.uint8) * 255
+                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                except Exception as e:
+                    print(f"[LaMa] Segmenter box error: {e}")
+                    seg_mask_box = None
+
+            # Если сегментатор не вернул текст — используем контрастное выделение букв
+            if seg_mask_box is None or np.sum(seg_mask_box > 0) < 10:
+                dark_pixels = (crop_gray < 150).astype(np.uint8) * 255
+                seg_mask_box = dark_pixels
+
+            # Дилатация 3px для гарантии покрытия белых обводок (fuchidori) и сглаживания
+            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=3)
+            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
+            mask_refined[~user_mask_bool] = 0
+
         # Страховка
-        if np.sum(mask_refined > 0) < 20:
+        if np.sum(mask_refined > 0) < 10:
             mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
-        
-        mask_original = (mask_refined > 0).astype(np.uint8)
-        mask_original_3d = mask_original[:, :, None]
 
-        height, width, c = image.shape
+        text_px = np.sum(mask_refined > 0)
+        sel_px = np.sum(user_mask_bool)
+        print(f"[LaMa] Precise text mask: {text_px} px text / {sel_px} px selection ({text_px / max(1, sel_px):.1%})")
 
-        # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
-        pad_size = 8
-        pad_h = (pad_size - (height % pad_size)) % pad_size
-        pad_w = (pad_size - (width % pad_size)) % pad_size
-
+        # === 2. LaMa инпэйнтинг ===
+        pad_h = (8 - height % 8) % 8
+        pad_w = (8 - width % 8) % 8
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         if pad_h > 0 or pad_w > 0:
@@ -660,94 +686,30 @@ class LamaMPEPyTorchInpainter:
             image_padded = image_rgb
             mask_padded = mask_refined
 
-        img_torch = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze_(0).float() / 255.
-        mask_torch = torch.from_numpy(mask_padded).unsqueeze_(0).unsqueeze_(0).float() / 255.0
-        mask_torch[mask_torch < 0.5] = 0
-        mask_torch[mask_torch >= 0.5] = 1
-
-        img_torch = img_torch.to(self.device)
-        mask_torch = mask_torch.to(self.device)
+        img_t = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze(0).float().div_(255.).to(self.device)
+        mask_t = torch.from_numpy(mask_padded).unsqueeze(0).unsqueeze(0).float().div_(255.).to(self.device)
+        mask_t = (mask_t >= 0.5).float()
 
         with torch.no_grad():
-            img_torch *= (1 - mask_torch)
-            img_inpainted_torch = self.model(img_torch, mask_torch)
-            img_inpainted_torch = img_inpainted_torch.to(torch.float32)
-            img_inpainted = (img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
+            img_t *= (1 - mask_t)
+            out = self.model(img_t, mask_t).to(torch.float32)
+            result = (out.cpu().squeeze(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
 
         if pad_h > 0 or pad_w > 0:
-            img_inpainted = img_inpainted[:height, :width]
+            result = result[:height, :width]
+        result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
 
-        img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
+        # === 3. Мягкое вклеивание стёртого текста в оригинал ===
+        m = (mask_refined > 0).astype(np.float32)[:, :, None]
+        m = cv2.GaussianBlur(m, (5, 5), 0)
+        if m.ndim == 2:
+            m = m[:, :, None]
 
-        # === 2. Экстракция высокочастотной текстуры растра (MPE FFT) ===
-        hp_texture = None
-        dirty_donor_mask = cv2.dilate(mask_refined, np.ones((15, 15), np.uint8), iterations=2)
-        dirty_donor_mask = (dirty_donor_mask > 0).astype(np.float32)
+        ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
 
-        if self.use_mpe:
-            try:
-                hp_texture = self._extract_screentone_texture(image, dirty_donor_mask)
-                if hp_texture is not None:
-                    # Ограничиваем амплитуду растровой текстуры, чтобы исключить тёмные пятна от линий донора
-                    hp_texture = np.clip(hp_texture, -35.0, 35.0)
-            except Exception as e:
-                hp_texture = None
-
-        # === 3. Совмещение и текстурирование ===
-        if hp_texture is not None:
-            img_inpainted_smooth = cv2.GaussianBlur(img_inpainted, (31, 31), 0).astype(np.float32)
-
-            orig_gray_f = gray_orig.astype(np.float32)
-            mean_gray = cv2.GaussianBlur(orig_gray_f, (11, 11), 0)
-            variance = cv2.GaussianBlur((orig_gray_f - mean_gray)**2, (11, 11), 0)
-            stddev = np.sqrt(np.clip(variance, 0, None))
-            texture_presence = np.clip((stddev - 1.5) / 4.0, 0, 1)
-            texture_presence_u8 = (texture_presence * 255).astype(np.uint8)
-            
-            scale = 0.25
-            small_h, small_w = max(1, int(height * scale)), max(1, int(width * scale))
-            small_texture = cv2.resize(texture_presence_u8, (small_w, small_h), interpolation=cv2.INTER_AREA)
-            small_mask = cv2.resize(mask_refined, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
-            small_inpainted = cv2.inpaint(small_texture, small_mask, 5, cv2.INPAINT_TELEA)
-            
-            texture_presence_inpainted = cv2.resize(small_inpainted, (width, height), interpolation=cv2.INTER_LINEAR)
-            f_texture = (texture_presence_inpainted.astype(np.float32) / 255.0)[:, :, np.newaxis]
-            
-            orig_gray_smooth = cv2.GaussianBlur(gray_orig, (7, 7), 0).astype(np.float32)
-            f_white = np.clip((210.0 - orig_gray_smooth) / 20.0, 0, 1)[:, :, np.newaxis]
-            
-            lama_gray_raw = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            f_not_line = np.clip((lama_gray_raw - 40.0) / 70.0, 0, 1)[:, :, np.newaxis]
-            f_has_variance = np.clip((stddev - 1.6) / 3.0, 0, 1)[:, :, np.newaxis]
-            
-            f_texture = f_texture * f_white * f_not_line * f_has_variance
-            
-            base_bg = img_inpainted.astype(np.float32) * (1.0 - f_texture) + img_inpainted_smooth * f_texture
-            reconstructed_hole = base_bg + hp_texture * f_texture
-            
-            hole_mask_feathered = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (5, 5), 0)
-            if len(hole_mask_feathered.shape) == 2:
-                hole_mask_feathered = hole_mask_feathered[:, :, None]
-                
-            ans = reconstructed_hole * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
-        else:
-            hole_mask_feathered = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (5, 5), 0)
-            if len(hole_mask_feathered.shape) == 2:
-                hole_mask_feathered = hole_mask_feathered[:, :, None]
-            ans = img_inpainted.astype(np.float32) * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
-
+        # Строгое ч/б
         ans = np.clip(ans, 0, 255).astype(np.uint8)
-
-        # === 4. Закалка резкости линий и 100% строгое ч/б без цветных артефактов ===
-        ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
-        inpaint_zone = (mask_original_3d > 0)
-        very_dark  = (ans_gray < 100)[:, :, None] & inpaint_zone
-        very_light = (ans_gray > 220)[:, :, None] & inpaint_zone
-        ans[np.repeat(very_dark,  3, axis=2)] = 0
-        ans[np.repeat(very_light, 3, axis=2)] = 255
-
-        # Строго убираем любые цветовые шумы (зелёные/красные точки) для манги
-        ans_bw = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
-        ans = cv2.cvtColor(ans_bw, cv2.COLOR_GRAY2BGR)
-
+        ans = cv2.cvtColor(cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
         return ans
+
+
