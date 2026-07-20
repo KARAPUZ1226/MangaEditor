@@ -618,67 +618,18 @@ class LamaMPEPyTorchInpainter:
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
-        text_mask_raw = np.zeros_like(mask)
-        # === 0. Точное изолирование ТЕКСТА (без захвата растровых точек скринтона!) ===
-        # Маска для LaMa = ТОЛЬКО символы текста + белая обводка (fuchidori).
-        # Вся остальная область (скринтон, белая одежда, контуры рисунка) остается 100% оригиналом.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        user_mask_bool = mask >= 127
         
-        # 1. Медианный фильтр 5x5 полностью стирает мелкие растровые точки скринтона,
-        #    оставляя ТОЛЬКО плотные штрихи текста, иероглифы, плашки ■ и линии рисунка!
-        gray_smooth = cv2.medianBlur(gray_orig, 5)
-        
-        # 2. Находим тёмные пиксели (буквы, плашки, линии) внутри области пользователя
-        dark_pixels = ((gray_smooth < 140) & user_mask_bool).astype(np.uint8)
-        
-        # 3. Компонентный анализ: отделяем символы текста от тонких контуров одежды/панелей
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_pixels, connectivity=8)
-        text_mask_raw = np.zeros_like(gray_orig)
-        
-        # Контур границы выделения пользователя
-        user_u8 = user_mask_bool.astype(np.uint8)
-        border_mask = cv2.morphologyEx(user_u8, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
-        
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            w_c = stats[i, cv2.CC_STAT_WIDTH]
-            h_c = stats[i, cv2.CC_STAT_HEIGHT]
-            comp_mask = (labels == i)
-            
-            touches_border = np.any(comp_mask & border_mask)
-            aspect_ratio = max(w_c / (h_c + 1e-5), h_c / (w_c + 1e-5))
-            min_dim = min(w_c, h_c)
-            
-            # Тонкая линия рисунка: узкая толщина (<= 6px) AND вытянутая (ratio > 3.0) AND касается границы
-            is_thin_drawing_line = touches_border and (min_dim <= 6) and (aspect_ratio > 3.0)
-            
-            if is_thin_drawing_line:
-                continue
-            
-            # Всё остальное (включая плашки ■, тире —, иероглифы, буквы) — это ТЕКСТ (отсекаем мелкий шум < 30px)
-            if area >= 30:
-                text_mask_raw[comp_mask] = 255
-        
-        # 4. Накрываем белые обводки (fuchidori) букв небольшой дилатацией (4px)
+        # 1. Маска для LaMa = выделение пользователя + 2px дилататор для полной защиты от белых обводок
         kernel_3 = np.ones((3, 3), np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel_3, iterations=4)
-        text_mask_dilated[~user_mask_bool] = 0
-
-        # Маска ДЛЯ LAMA = ТОЛЬКО маска букв! Не весь кроп!
-        mask_refined = text_mask_dilated.copy()
-        protect_mask = user_mask_bool & (text_mask_dilated == 0)
+        mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
+        mask_refined[mask_refined < 127] = 0
+        mask_refined[mask_refined >= 127] = 255
         
-        mask_original = np.copy(mask_refined)
-        mask_original[mask_original < 127] = 0
-        mask_original[mask_original >= 127] = 1
+        mask_original = (mask_refined > 0).astype(np.uint8)
         mask_original_3d = mask_original[:, :, None]
 
         height, width, c = image.shape
-
-        # Отладочные маски
-        cv2.imwrite("mask_debug_0_0.png", (mask_original * 255).astype(np.uint8))
-        cv2.imwrite("text_mask_raw_debug.png", text_mask_dilated)
 
         # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
         pad_size = 8
@@ -686,21 +637,12 @@ class LamaMPEPyTorchInpainter:
         pad_w = (pad_size - (width % pad_size)) % pad_size
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Предобработка: ОЧЕНЬ слабый bilateral filter или его отсутствие.
-        # Скринтоны должны остаться видимыми для LaMa, иначе модель не сможет их восстановить.
-        # Если скринтоны сильно мелкие — можно включить, но с d=5 и малыми сигмами.
-        use_bilateral = False  # Поставь True, если LaMa слишком шумит на скринтонах
-        if use_bilateral:
-            image_smooth = cv2.bilateralFilter(image_rgb, d=5, sigmaColor=25, sigmaSpace=25)
-        else:
-            image_smooth = image_rgb.copy()
 
         if pad_h > 0 or pad_w > 0:
-            image_padded = cv2.copyMakeBorder(image_smooth, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
             mask_padded = cv2.copyMakeBorder(mask_refined, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
-            image_padded = image_smooth
+            image_padded = image_rgb
             mask_padded = mask_refined
 
         img_torch = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze_(0).float() / 255.
@@ -717,329 +659,73 @@ class LamaMPEPyTorchInpainter:
             img_inpainted_torch = img_inpainted_torch.to(torch.float32)
             img_inpainted = (img_inpainted_torch.cpu().squeeze_(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
 
-        img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
-        # Принудительно конвертируем в grayscale и обратно, чтобы убить цветной тон на ч/б манге
-        gray_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
-        img_inpainted = cv2.cvtColor(gray_inpainted, cv2.COLOR_GRAY2BGR)
-
-        # Обрезаем паддинг обратно
         if pad_h > 0 or pad_w > 0:
-            img_inpainted = img_inpainted[0:height, 0:width]
+            img_inpainted = img_inpainted[:height, :width]
 
-        # === 2. FFT-based поиск периода скринтона на ОРИГИНАЛЕ ===
-        # Сканируем 9 областей кропа, чтобы найти область с самой чистой текстурой без текста
-        sub_size = min(256, height, width)
-        half_sub = sub_size // 2
-        
-        # Находим центр выделения для локального анализа
-        y_indices, x_indices = np.where(mask_original == 1)
-        if len(y_indices) > 0:
-            cy_box = int(y_indices.mean())
-            cx_box = int(x_indices.mean())
-        else:
-            cy_box, cx_box = height // 2, width // 2
-            
-        best_peak_ratio = 0.0
-        best_dy = 0
-        best_dx = 0
-        
-        # Регулярная сетка по всему кропу (не привязана к координатам текста)
-        grid_points = [
-            (height // 4, width // 4),
-            (height // 4, width // 2),
-            (height // 4, 3 * width // 4),
-            (height // 2, width // 4),
-            (height // 2, width // 2),
-            (height // 2, 3 * width // 4),
-            (3 * height // 4, width // 4),
-            (3 * height // 4, width // 2),
-            (3 * height // 4, 3 * width // 4)
-        ]
-        
-        for cy, cx in grid_points:
-            y0_sub = max(0, cy - half_sub)
-            y1_sub = min(height, cy + half_sub)
-            x0_sub = max(0, cx - half_sub)
-            x1_sub = min(width, cx + half_sub)
-            
-            # Корректируем размеры до ровного квадрата sub_size x sub_size
-            if (y1_sub - y0_sub) < sub_size:
-                if y0_sub == 0:
-                    y1_sub = min(height, sub_size)
-                else:
-                    y0_sub = max(0, y1_sub - sub_size)
-            if (x1_sub - x0_sub) < sub_size:
-                if x0_sub == 0:
-                    x1_sub = min(width, sub_size)
-                else:
-                    x0_sub = max(0, x1_sub - sub_size)
-                    
-            h_s, w_s = y1_sub - y0_sub, x1_sub - x0_sub
-            if h_s < 64 or w_s < 64:
-                continue
-                
-            # Считаем процент текста в окне
-            mask_area = np.sum(mask_original[y0_sub:y1_sub, x0_sub:x1_sub] > 0)
-            if mask_area > h_s * w_s * 0.15:
-                continue
-                
-            gray_sub = gray_orig[y0_sub:y1_sub, x0_sub:x1_sub].astype(np.float32)
-            mask_sub = (mask_original[y0_sub:y1_sub, x0_sub:x1_sub] == 0).astype(np.float32)
-            
-            # Маскируем и центрируем
-            gray_sub -= gray_sub.mean()
-            gray_sub *= mask_sub
-            
-            # FFT
-            f_gray = np.fft.fft2(gray_sub)
-            f_conj = np.conj(f_gray)
-            power = np.fft.ifft2(f_gray * f_conj).real
-            power_shifted = np.fft.fftshift(power)
-            
-            cy_s, cx_s = h_s // 2, w_s // 2
-            search_half = 16
-            y_start = max(0, cy_s - search_half)
-            y_end = min(h_s, cy_s + search_half + 1)
-            x_start = max(0, cx_s - search_half)
-            x_end = min(w_s, cx_s + search_half + 1)
-            power_shifted[y_start:y_end, x_start:x_end] = 0
-            # Подавляем горизонтальные и вертикальные гармоники (линии рисунка)
-            power_shifted[max(0, cy_s - 2):min(h_s, cy_s + 3), :] = 0
-            power_shifted[:, max(0, cx_s - 2):min(w_s, cx_s + 3)] = 0
-            
-            max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
-            dy = max_idx[0] - cy_s
-            dx = max_idx[1] - cx_s
-            
-            peak_val = power_shifted[max_idx]
-            power_mean = np.mean(np.abs(power_shifted))
-            ratio = peak_val / (power_mean + 1e-5)
-            
-            if ratio > best_peak_ratio:
-                best_peak_ratio = ratio
-                best_dy = dy
-                best_dx = dx
-                
-        # Если ни одно окно не подошло, берем центр без ограничений на маску
-        if best_peak_ratio == 0.0:
-            y0_sub = max(0, height // 2 - half_sub)
-            y1_sub = min(height, height // 2 + half_sub)
-            x0_sub = max(0, width // 2 - half_sub)
-            x1_sub = min(width, width // 2 + half_sub)
-            h_s, w_s = y1_sub - y0_sub, x1_sub - x0_sub
-            gray_sub = gray_orig[y0_sub:y1_sub, x0_sub:x1_sub].astype(np.float32)
-            gray_sub -= gray_sub.mean()
-            gray_sub *= (mask_original[y0_sub:y1_sub, x0_sub:x1_sub] == 0)
-            f_gray = np.fft.fft2(gray_sub)
-            f_conj = np.conj(f_gray)
-            power = np.fft.ifft2(f_gray * f_conj).real
-            power_shifted = np.fft.fftshift(power)
-            cy_s, cx_s = h_s // 2, w_s // 2
-            search_half = 16
-            power_shifted[max(0, cy_s - search_half):min(h_s, cy_s + search_half + 1),
-                          max(0, cx_s - search_half):min(w_s, cx_s + search_half + 1)] = 0
-            # Подавляем горизонтальные и вертикальные гармоники (линии рисунка)
-            power_shifted[max(0, cy_s - 2):min(h_s, cy_s + 3), :] = 0
-            power_shifted[:, max(0, cx_s - 2):min(w_s, cx_s + 3)] = 0
-            
-            max_idx = np.unravel_index(np.argmax(power_shifted), power_shifted.shape)
-            best_dy = max_idx[0] - cy_s
-            best_dx = max_idx[1] - cx_s
-            best_peak_ratio = power_shifted[max_idx] / (np.mean(np.abs(power_shifted)) + 1e-5)
-            
-        has_screentone = best_peak_ratio > 3.0
-        print(f"[LaMa PyTorch DEBUG] FFT peak: dy={best_dy}, dx={best_dx}, strength={best_peak_ratio:.2f}")
-        
-        # === 3. Улучшенное выделение структурных линий (без поглощения растра) ===
-        # Используем ОРИГИНАЛЬНОЕ изображение для детекции линий, чтобы не потерять стертые LaMa куски рамок
-        gray_lines = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        
-        # Бинаризируем темные участки
-        _, binary_dark = cv2.threshold(gray_lines, 150, 255, cv2.THRESH_BINARY_INV)
-        
-        # Разрываем случайные мостики между точками растра
-        kernel_cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        binary_separated = cv2.erode(binary_dark, kernel_cross, iterations=1)
-        
-        # Ищем связные компоненты строго по 4 соседям (чтобы диагонали не слипались)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_separated, connectivity=4)
-        dilated_edges = np.zeros_like(gray_lines)
-        for i in range(1, num_labels):
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            area = stats[i, cv2.CC_STAT_AREA]
-            
-            # Исключаем мелкий шум и буковки
-            if area > 40 or w > 20 or h > 20:
-                comp_mask = (labels == i)
-                # Если компонент касается задилейченной маски букв хотя бы на 5% — это буква/ореол текста!
-                overlap = np.sum(comp_mask & (text_mask_dilated > 0)) / (area + 1e-5)
-                
-                if overlap > 0.05:
-                    # Это буква текста или её ореол, исключаем её 100%
-                    continue
-                else:
-                    # Это настоящая рамка кадра или контур персонажа вне букв
-                    dilated_edges[comp_mask] = 255
-                
-        # Возвращаем линиям исходную толщину + небольшой запас
-        kernel_rect = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated_edges = cv2.dilate(dilated_edges, kernel_rect, iterations=3)
-        cv2.imwrite("edges_debug.png", dilated_edges)
+        img_inpainted = cv2.cvtColor(img_inpainted, cv2.COLOR_RGB2BGR)
 
-        # Оставляем mask_original полной, чтобы не пропускать буквы около линий
-        mask_original_3d = mask_original[:, :, None]
-
-        # === 4. Мгновенный локальный синтез растра (FFT Period Shift) ===
-        text_mask_u8 = (mask_original * 255).astype(np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask_u8, np.ones((7, 7), np.uint8), iterations=2)
-        
+        # === 2. Экстракция высокочастотной текстуры растра (MPE FFT) ===
         hp_texture = None
-        if has_screentone and (best_dx != 0 or best_dy != 0):
-            # Извлекаем точки высокой частоты НАПРЯМУЮ из оригинала вокруг бабла
-            orig_smooth = cv2.GaussianBlur(img_original, (5, 5), 0).astype(np.float32)
-            hp_orig = img_original.astype(np.float32) - orig_smooth
-            
-            hp_texture = np.zeros_like(hp_orig)
-            mask_to_fill = (text_mask_dilated > 0)
-            
-            # Расширяем маски грязных зон (буквы и контуры) ровно настолько, чтобы захватить их невидимые ореолы сглаживания
-            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((7, 7), np.uint8), iterations=2)
-            dirty_edges_mask = cv2.dilate(dilated_edges, np.ones((7, 7), np.uint8), iterations=2)
-            
-            dirty_donor_mask = (
-                (dirty_text_mask > 0) | 
-                (dirty_edges_mask > 0) | 
-                (gray_orig > 230) | 
-                (gray_orig < 25)
-            ).astype(np.float32)
-            
-            # 2D базис решётки скринтона (основной вектор + перпендикулярный)
-            v1 = (best_dx, best_dy)
-            v2 = (-best_dy, best_dx)
-            
-            # Поиск спиралью от ближнего к дальнему окружению бабла
-            period_shifts = []
-            for r in range(1, 35):
-                for k1 in range(-r, r + 1):
-                    for k2 in range(-r, r + 1):
-                        if abs(k1) == r or abs(k2) == r:
-                            sx = k1 * v1[0] + k2 * v2[0]
-                            sy = k1 * v1[1] + k2 * v2[1]
-                            period_shifts.append((sx, sy))
-            
-            for sx, sy in period_shifts:
-                if not np.any(mask_to_fill):
-                    break
-                M = np.float32([[1, 0, sx], [0, 1, sy]])
-                shifted_hp = cv2.warpAffine(hp_orig, M, (width, height), borderMode=cv2.BORDER_REFLECT)
-                shifted_dirty = cv2.warpAffine(dirty_donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
-                
-                # Копируем ТОЛЬКО из 100% чистых участков
-                copy_map = mask_to_fill & (shifted_dirty < 0.5)
-                if np.any(copy_map):
-                    copy_map_3d = np.repeat(copy_map[:, :, None], 3, axis=2)
-                    hp_texture[copy_map_3d] = shifted_hp[copy_map_3d]
-                    mask_to_fill[copy_map] = False
-            
-            print(f"[LaMa PyTorch DEBUG] Local FFT-Period shift complete! Unfilled pixels={np.sum(mask_to_fill)}")
-            print(f"[LaMa PyTorch DEBUG] hp_texture stats: min={np.min(hp_texture):.2f}, max={np.max(hp_texture):.2f}, mean_abs={np.mean(np.abs(hp_texture)):.2f}")
+        dirty_donor_mask = cv2.dilate(mask_refined, np.ones((15, 15), np.uint8), iterations=2)
+        dirty_donor_mask = (dirty_donor_mask > 0).astype(np.float32)
 
-        # === 5. Финальное совмещение: LaMa = структура, Донор = текстура ===
-        feathered_mask = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (15, 15), 0)
-        if len(feathered_mask.shape) == 2:
-            feathered_mask = feathered_mask[:, :, None]
+        if self.use_mpe:
+            try:
+                hp_texture = self._extract_screentone_texture(image, dirty_donor_mask)
+            except Exception as e:
+                hp_texture = None
 
-        img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
-
+        # === 3. Совмещение и текстурирование ===
         if hp_texture is not None:
-            # 1. Гладкий фон от LaMa без мусора и следов текста
             img_inpainted_smooth = cv2.GaussianBlur(img_inpainted, (31, 31), 0).astype(np.float32)
 
-            # Определяем, где в ОРИГИНАЛЕ есть текстура (скринтон)
-            orig_gray_f = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            orig_gray_f = gray_orig.astype(np.float32)
             mean_gray = cv2.GaussianBlur(orig_gray_f, (11, 11), 0)
             variance = cv2.GaussianBlur((orig_gray_f - mean_gray)**2, (11, 11), 0)
             stddev = np.sqrt(np.clip(variance, 0, None))
-            
-            # stddev < 1.5 -> сплошной цвет (белый/черный), stddev > 5.5 -> скринтон
             texture_presence = np.clip((stddev - 1.5) / 4.0, 0, 1)
             texture_presence_u8 = (texture_presence * 255).astype(np.uint8)
             
-            # Inpaint маски присутствия текстуры, чтобы предсказать, где она должна быть под текстом
             scale = 0.25
             small_h, small_w = max(1, int(height * scale)), max(1, int(width * scale))
             small_texture = cv2.resize(texture_presence_u8, (small_w, small_h), interpolation=cv2.INTER_AREA)
-            small_mask = cv2.resize(text_mask_dilated, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
-            
+            small_mask = cv2.resize(mask_refined, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
             small_inpainted = cv2.inpaint(small_texture, small_mask, 5, cv2.INPAINT_TELEA)
             
             texture_presence_inpainted = cv2.resize(small_inpainted, (width, height), interpolation=cv2.INTER_LINEAR)
             f_texture = (texture_presence_inpainted.astype(np.float32) / 255.0)[:, :, np.newaxis]
             
-            # Дополнительно подстрахуемся яркостью от LaMa
-            lama_gray_smooth = cv2.GaussianBlur(
-                cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
-            # Используем ОРИГИНАЛЬНУЮ яркость для гейтинга текстуры:
-            # если в оригинале белый (одежда, рамка) — текстура не накладывается
-            orig_gray_smooth = cv2.GaussianBlur(
-                gray_orig, (7, 7), 0).astype(np.float32)
-            f_white = np.clip((210.0 - orig_gray_smooth) / 20.0, 0, 1)  # 190->210
-            f_black = np.clip((lama_gray_smooth - 20.0) / 20.0, 0, 1)   # гаснет 40->20
+            orig_gray_smooth = cv2.GaussianBlur(gray_orig, (7, 7), 0).astype(np.float32)
+            f_white = np.clip((210.0 - orig_gray_smooth) / 20.0, 0, 1)[:, :, np.newaxis]
             
-            # Текстура растра НЕ должна накладываться на тёмные линии рисунка (чтобы не перекрывать их)
-            lama_gray_raw = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY)
-            f_not_line = np.clip((lama_gray_raw.astype(np.float32) - 50.0) / 70.0, 0, 1)
+            lama_gray_raw = cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            f_not_line = np.clip((lama_gray_raw - 40.0) / 70.0, 0, 1)[:, :, np.newaxis]
+            f_has_variance = np.clip((stddev - 1.6) / 3.0, 0, 1)[:, :, np.newaxis]
             
-            # Проверяем оригинальное присутствие текстуры (stddev):
-            # Если в оригинале белая одежда или плоский цвет (stddev < 1.8) -> гасим текстуру!
-            orig_gray_f = gray_orig.astype(np.float32)
-            mean_gray = cv2.GaussianBlur(orig_gray_f, (11, 11), 0)
-            variance = cv2.GaussianBlur((orig_gray_f - mean_gray)**2, (11, 11), 0)
-            stddev = np.sqrt(np.clip(variance, 0, None))
-            f_has_variance = np.clip((stddev - 1.6) / 3.0, 0, 1)
+            f_texture = f_texture * f_white * f_not_line * f_has_variance
             
-            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis] * f_not_line[:, :, np.newaxis] * f_has_variance[:, :, np.newaxis]
-            
-            # Заменяем подложку в зоне скринтона на 100% гладкий градиент без мусора текста
             base_bg = img_inpainted.astype(np.float32) * (1.0 - f_texture) + img_inpainted_smooth * f_texture
-            
-            # Восстанавливаем узор растра с ПОЛНОЙ 100% амплитудой до самой границы
             reconstructed_hole = base_bg + hp_texture * f_texture
             
-            # Смешиваем с оригиналом по маске
-            hole_mask_feathered = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (3, 3), 0)
+            hole_mask_feathered = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (5, 5), 0)
             if len(hole_mask_feathered.shape) == 2:
                 hole_mask_feathered = hole_mask_feathered[:, :, None]
                 
             ans = reconstructed_hole * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
-            
-            # Восстанавливаем линии рисунка из оригинала (protect_mask)
-            ans[protect_mask] = img_original[protect_mask]
-                
-            ans = np.clip(ans, 0, 255).astype(np.uint8)
-            
-            # Возвращаем чёткость и непрерывность линий:
-            # Все восстановленные LaMa линии (яркость < 115) доводим до чистого контрастного чёрного (0)
-            ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
-            text_zone = (text_mask_dilated > 0)[:, :, None]
-            very_dark  = (ans_gray < 115)[:, :, None] & text_zone
-            very_light = (ans_gray > 215)[:, :, None] & text_zone
-            ans[np.repeat(very_dark,  3, axis=2)] = 0
-            ans[np.repeat(very_light, 3, axis=2)] = 255
-            
-            return ans
         else:
-            ans = img_blended
-            ans[protect_mask] = img_original[protect_mask]
-            ans = np.clip(ans, 0, 255).astype(np.uint8)
-            return ans
-            
-        # Восстанавливаем оригинальные линии рисунка строго вне сырой маски букв (text_mask_raw == 0),
-        # чтобы вернуть резкие линии и границы кадра, но не восстановить стертый текст.
-        restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
-        ans[restore_mask] = img_original[restore_mask]
-            
+            hole_mask_feathered = cv2.GaussianBlur(mask_original_3d.astype(np.float32), (5, 5), 0)
+            if len(hole_mask_feathered.shape) == 2:
+                hole_mask_feathered = hole_mask_feathered[:, :, None]
+            ans = img_inpainted.astype(np.float32) * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
+
         ans = np.clip(ans, 0, 255).astype(np.uint8)
+
+        # === 4. Закалка резкости линий и чистый белый цвет ===
+        ans_gray = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
+        inpaint_zone = (mask_original_3d > 0)
+        very_dark  = (ans_gray < 100)[:, :, None] & inpaint_zone
+        very_light = (ans_gray > 220)[:, :, None] & inpaint_zone
+        ans[np.repeat(very_dark,  3, axis=2)] = 0
+        ans[np.repeat(very_light, 3, axis=2)] = 255
+
         return ans
