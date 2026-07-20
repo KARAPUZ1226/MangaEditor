@@ -932,8 +932,8 @@ class LamaMPEPyTorchInpainter:
             dirty_donor_mask = (
                 (text_mask_dilated > 0) | 
                 (dilated_edges > 0) | 
-                (gray_orig > 195) | 
-                (gray_orig < 45)
+                (gray_orig > 230) | 
+                (gray_orig < 25)
             ).astype(np.float32)
             
             # 2D базис решётки скринтона (основной вектор + перпендикулярный)
@@ -957,7 +957,7 @@ class LamaMPEPyTorchInpainter:
                 shifted_hp = cv2.warpAffine(hp_orig, M, (width, height), borderMode=cv2.BORDER_REFLECT)
                 shifted_dirty = cv2.warpAffine(dirty_donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
-                # Копируем ТОЛЬКО из 100% чистых участков серого растрового неба
+                # Копируем ТОЛЬКО из 100% чистых участков
                 copy_map = mask_to_fill & (shifted_dirty < 0.5)
                 if np.any(copy_map):
                     hp_texture[copy_map] = shifted_hp[copy_map]
@@ -974,15 +974,36 @@ class LamaMPEPyTorchInpainter:
         img_blended = img_inpainted.astype(np.float32) * feathered_mask + img_original.astype(np.float32) * (1.0 - feathered_mask)
 
         if hp_texture is not None:
-            # Карта яркости берётся строго из LaMa (img_inpainted).
+            # Определяем, где в ОРИГИНАЛЕ есть текстура (скринтон)
+            orig_gray_f = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            mean_gray = cv2.GaussianBlur(orig_gray_f, (11, 11), 0)
+            variance = cv2.GaussianBlur((orig_gray_f - mean_gray)**2, (11, 11), 0)
+            stddev = np.sqrt(np.clip(variance, 0, None))
+            
+            # stddev < 1.5 -> сплошной цвет (белый/черный), stddev > 5.5 -> скринтон
+            texture_presence = np.clip((stddev - 1.5) / 4.0, 0, 1)
+            texture_presence_u8 = (texture_presence * 255).astype(np.uint8)
+            
+            # Inpaint маски присутствия текстуры, чтобы предсказать, где она должна быть под текстом
+            scale = 0.25
+            small_h, small_w = max(1, int(height * scale)), max(1, int(width * scale))
+            small_texture = cv2.resize(texture_presence_u8, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            
+            # Маска инпейнта должна покрывать весь текст, иначе inpaint оставит края букв
+            small_mask = cv2.resize(text_mask_dilated, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+            
+            small_inpainted = cv2.inpaint(small_texture, small_mask, 5, cv2.INPAINT_TELEA)
+            
+            texture_presence_inpainted = cv2.resize(small_inpainted, (width, height), interpolation=cv2.INTER_LINEAR)
+            f_texture = (texture_presence_inpainted.astype(np.float32) / 255.0)[:, :, np.newaxis]
+            
+            # Дополнительно подстрахуемся яркостью от LaMa
             lama_gray_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
+            f_white = np.clip((240.0 - lama_gray_smooth) / 20.0, 0, 1)  # гаснет 220->240
+            f_black = np.clip((lama_gray_smooth - 20.0) / 20.0, 0, 1)   # гаснет 40->20
             
-            # Точки скринтона накладываются СТРОГО на серый растр неба (75..165)
-            # Белые облака (>190) и чёрные ветки/тени (<50) остаются 100% чистыми от точек!
-            f_white = np.clip((190.0 - lama_gray_smooth) / 25.0, 0, 1)  # гаснет 165→190 к белому облаку
-            f_black = np.clip((lama_gray_smooth - 50.0) / 25.0, 0, 1)   # гаснет 75→50 к тёмным теням
-            f_texture = (f_white * f_black)[:, :, np.newaxis]
+            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
