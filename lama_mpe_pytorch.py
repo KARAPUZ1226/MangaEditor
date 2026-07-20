@@ -896,14 +896,14 @@ class LamaMPEPyTorchInpainter:
             # Точки растра маленькие, линии - протяженные
             if area > 20 or w > 15 or h > 15:
                 comp_mask = (labels == i)
-                # Вычисляем процент пересечения компонента с маской букв
-                overlap = np.sum(comp_mask & (text_mask_raw > 0)) / (area + 1e-5)
+                # Вычисляем процент пересечения компонента с расширенной маской букв
+                overlap = np.sum(comp_mask & (text_mask_dilated > 0)) / (area + 1e-5)
                 
-                if overlap > 0.3:
-                    # Это буква текста (высокое перекрытие), исключаем ее полностью
+                if overlap > 0.05:
+                    # Это буква текста или её ореол, исключаем её полностью
                     continue
                 else:
-                    # Это рамка кадра или контур рисунка (низкое перекрытие), защищаем его без вырезания букв
+                    # Это рамка кадра или контур рисунка, защищаем его без вырезания букв
                     dilated_edges[comp_mask] = 255
                 
         # Возвращаем линиям исходную толщину + небольшой запас
@@ -1020,21 +1020,21 @@ class LamaMPEPyTorchInpainter:
             ans = reconstructed_hole * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
             
             # Восстанавливаем оригинальные линии рисунка
-            restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
+            restore_mask = (dilated_edges > 0) & (text_mask_dilated == 0)
             ans[restore_mask] = img_original[restore_mask]
                 
             ans = np.clip(ans, 0, 255).astype(np.uint8)
             return ans
         else:
             ans = img_blended
-            restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
+            restore_mask = (dilated_edges > 0) & (text_mask_dilated == 0)
             ans[restore_mask] = img_original[restore_mask]
             ans = np.clip(ans, 0, 255).astype(np.uint8)
             return ans
             
         # Восстанавливаем оригинальные линии рисунка строго вне сырой маски букв (text_mask_raw == 0),
         # чтобы вернуть резкие линии и границы кадра, но не восстановить стертый текст.
-        restore_mask = (dilated_edges > 0) & (text_mask_raw == 0)
+        restore_mask = (dilated_edges > 0) & (text_mask_dilated == 0)
         ans[restore_mask] = img_original[restore_mask]
             
         ans = np.clip(ans, 0, 255).astype(np.uint8)
