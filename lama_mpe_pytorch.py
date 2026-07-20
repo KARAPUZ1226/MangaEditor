@@ -927,15 +927,22 @@ class LamaMPEPyTorchInpainter:
             hp_texture = np.zeros_like(hp_orig)
             mask_to_fill = (text_mask_dilated > 0)
             
-            # Запрещаем брать доноры из букв, чёрных линий, белых облаков и тёмных теней
+            # Запрещаем брать доноры из букв, чёрных линий, белых облаков, тёмных теней и резких перепадов краев
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((5, 5), np.uint8), iterations=1)
+            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((5, 5), np.uint8), iterations=2)
+            dilated_edges_expanded = cv2.dilate(dilated_edges, np.ones((7, 7), np.uint8), iterations=2)
+            
+            # Всплески высокой частоты от резких контуров рисунка (> 52.0) — блокируем их, 
+            # оставляя как доноры ТОЛЬКО мягкие точечные скринтоны!
+            hp_max = np.max(np.abs(hp_orig), axis=2)
+            sharp_edge_spikes = (hp_max > 52.0)
             
             dirty_donor_mask = (
                 (dirty_text_mask > 0) | 
-                (dilated_edges > 0) | 
-                (gray_orig > 235) | 
-                (gray_orig < 25)
+                (dilated_edges_expanded > 0) | 
+                (gray_orig > 230) | 
+                (gray_orig < 25) |
+                sharp_edge_spikes
             ).astype(np.float32)
             
             # 2D базис решётки скринтона (основной вектор + перпендикулярный)
