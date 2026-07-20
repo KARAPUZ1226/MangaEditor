@@ -993,7 +993,6 @@ class LamaMPEPyTorchInpainter:
             variance = cv2.GaussianBlur((orig_gray_f - mean_gray)**2, (11, 11), 0)
             stddev = np.sqrt(np.clip(variance, 0, None))
             
-            # stddev < 1.5 -> сплошной цвет (белый/черный), stddev > 5.5 -> скринтон
             texture_presence = np.clip((stddev - 1.5) / 4.0, 0, 1)
             texture_presence_u8 = (texture_presence * 255).astype(np.uint8)
             
@@ -1004,17 +1003,21 @@ class LamaMPEPyTorchInpainter:
             small_mask = cv2.resize(text_mask_dilated, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
             
             small_inpainted = cv2.inpaint(small_texture, small_mask, 5, cv2.INPAINT_TELEA)
-            
             texture_presence_inpainted = cv2.resize(small_inpainted, (width, height), interpolation=cv2.INTER_LINEAR)
-            f_texture = (texture_presence_inpainted.astype(np.float32) / 255.0)[:, :, np.newaxis]
             
-            # Дополнительно подстрахуемся яркостью от LaMa
+            # Делаем резкую маску присутствия растра (чтобы не было полупрозрачной пыли у белых ног!)
+            f_texture_raw = (texture_presence_inpainted.astype(np.float32) / 255.0)
+            
             lama_gray_smooth = cv2.GaussianBlur(
                 cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2GRAY), (15, 15), 0).astype(np.float32)
-            f_white = np.clip((240.0 - lama_gray_smooth) / 20.0, 0, 1)  # гаснет 220->240
-            f_black = np.clip((lama_gray_smooth - 20.0) / 20.0, 0, 1)   # гаснет 40->20
+            f_white = (lama_gray_smooth < 235.0).astype(np.float32)
+            f_black = (lama_gray_smooth > 25.0).astype(np.float32)
             
-            f_texture = f_texture * f_white[:, :, np.newaxis] * f_black[:, :, np.newaxis]
+            # Точки остаются на 100% контрасте на скринтоне и срезаются на 0% на белой ноге/облаках
+            f_combined = (f_texture_raw > 0.35).astype(np.float32) * f_white * f_black
+            
+            # Легкое 3х3 сглаживание границы
+            f_texture = cv2.GaussianBlur(f_combined, (3, 3), 0)[:, :, np.newaxis]
             
             # Заменяем подложку в зоне скринтона на 100% гладкий градиент без мусора текста
             base_bg = img_inpainted.astype(np.float32) * (1.0 - f_texture) + img_inpainted_smooth * f_texture
