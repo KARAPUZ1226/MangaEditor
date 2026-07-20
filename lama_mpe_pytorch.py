@@ -604,6 +604,7 @@ class LamaMPEPyTorchInpainter:
         print(f"[LaMa PyTorch] Loading checkpoint {model_path} to {self.device}...")
         self.model = load_lama_mpe(model_path, self.device)
         self.model.eval()
+        self.use_mpe = True
         
         # Загружаем text segmenter (U-Net) для точного удаления только текста
         segmenter_path = os.path.join(os.path.dirname(model_path), "segmenter.onnx")
@@ -620,11 +621,25 @@ class LamaMPEPyTorchInpainter:
         img_original = np.copy(image)
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         
-        # 1. Маска для LaMa = выделение пользователя + 2px дилататор для полной защиты от белых обводок
+        # 1. Точное изолирование символов текста по отклонению от локального фона (absdiff)
+        # Это выделяет ТОЛЬКО символы, буквенные обводки, плашки ■ и тире —,
+        # сохраняя пространство МЕЖДУ символами открытым как контекст для LaMa!
+        bg_smooth = cv2.GaussianBlur(gray_orig, (21, 21), 0)
+        diff = cv2.absdiff(gray_orig, bg_smooth)
+        user_mask_bool = mask >= 127
+        
+        # Все элементы текста (черный текст + белая обводка) отличаются от фона > 18
+        text_pixels = (diff > 18) & user_mask_bool
+        
         kernel_3 = np.ones((3, 3), np.uint8)
-        mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
-        mask_refined[mask_refined < 127] = 0
-        mask_refined[mask_refined >= 127] = 255
+        mask_refined = cv2.dilate(text_pixels.astype(np.uint8) * 255, kernel_3, iterations=4)
+        mask_refined[~user_mask_bool] = 0
+        
+        # Страховка
+        if np.sum(mask_refined > 0) < 20:
+            mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
+            mask_refined[mask_refined < 127] = 0
+            mask_refined[mask_refined >= 127] = 255
         
         mask_original = (mask_refined > 0).astype(np.uint8)
         mask_original_3d = mask_original[:, :, None]
