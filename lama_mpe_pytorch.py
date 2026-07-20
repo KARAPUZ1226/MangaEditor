@@ -927,13 +927,16 @@ class LamaMPEPyTorchInpainter:
             hp_texture = np.zeros_like(hp_orig)
             mask_to_fill = (text_mask_dilated > 0)
             
+            # Запрещаем брать доноры из букв И из чёрных линий/веток!
+            dirty_donor_mask = ((text_mask_dilated > 0) | (dilated_edges > 0)).astype(np.float32)
+            
             # 2D базис решётки скринтона (основной вектор + перпендикулярный)
             v1 = (best_dx, best_dy)
             v2 = (-best_dy, best_dx)
             
             # Поиск спиралью от ближнего к дальнему окружению бабла
             period_shifts = []
-            for r in range(1, 30):
+            for r in range(1, 35):
                 for k1 in range(-r, r + 1):
                     for k2 in range(-r, r + 1):
                         if abs(k1) == r or abs(k2) == r:
@@ -946,10 +949,10 @@ class LamaMPEPyTorchInpainter:
                     break
                 M = np.float32([[1, 0, sx], [0, 1, sy]])
                 shifted_hp = cv2.warpAffine(hp_orig, M, (width, height), borderMode=cv2.BORDER_REFLECT)
-                shifted_mask = cv2.warpAffine(text_mask_dilated.astype(np.float32), M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
+                shifted_dirty = cv2.warpAffine(dirty_donor_mask, M, (width, height), borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
                 
-                # Копируем только из здоровых зон вне текста
-                copy_map = mask_to_fill & (shifted_mask < 0.5)
+                # Копируем ТОЛЬКО из чистых зон небес (без текста и без чёрных веток)
+                copy_map = mask_to_fill & (shifted_dirty < 0.5)
                 if np.any(copy_map):
                     hp_texture[copy_map] = shifted_hp[copy_map]
                     mask_to_fill[copy_map] = False
@@ -972,7 +975,9 @@ class LamaMPEPyTorchInpainter:
             # Точки скринтона накладываются на весь диапазон растра (15..242), гаснут только у чистой белой бумаги (>242)
             f_white = np.clip((242.0 - lama_gray_smooth) / 20.0, 0, 1)  # гаснет 222→242 перед белым
             f_black = np.clip((lama_gray_smooth - 15.0) / 20.0, 0, 1)   # гаснет 35→15 перед тушью
-            f_texture = (f_white * f_black)[:, :, np.newaxis]
+            f_texture_raw = (f_white * f_black)[:, :, np.newaxis]
+            # Плавное сглаживание карты амплитуды растра, убирающее резкие стыки
+            f_texture = cv2.GaussianBlur(f_texture_raw, (9, 9), 0)[:, :, np.newaxis]
             
             clean_texture_mask = feathered_mask * f_texture
             clean_texture_mask[dilated_edges[:, :, None] > 0] = 0
