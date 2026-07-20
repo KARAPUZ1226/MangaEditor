@@ -619,59 +619,35 @@ class LamaMPEPyTorchInpainter:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
         text_mask_raw = np.zeros_like(mask)
-          # === 0. Детектирование текста: для каждого тёмного компонента проверяем, ===
-        # === есть ли у него белый ореол (кольцо). Текст = да, линии рисунка = нет ===
+          # === 0. Обратный подход: детектим НЕ текст, а ЛИНИИ РИСУНКА для сохранения ===
+        # Текст = мелкие изолированные тёмные формы. Линии рисунка = длинные непрерывные штрихи.
+        # LaMa инпейнтит ВСЁ выделение. Потом мы восстанавливаем линии рисунка из оригинала.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         user_mask_bool = mask >= 127
         
-        # 1. Медиан-фильтр убивает растровые точки, оставляет буквы и линии
-        gray_smooth = cv2.medianBlur(gray_orig, 5)
-        dark_mask = ((gray_smooth < 130) & user_mask_bool).astype(np.uint8)
+        # 1. Находим все тёмные пиксели (контуры + текст)
+        dark_all = (gray_orig < 100).astype(np.uint8)
         
-        # 2. CC-анализ тёмных компонентов
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
-        text_mask_raw = np.zeros_like(gray_orig)
-        kernel_ring = np.ones((7, 7), np.uint8)
+        # 2. Эрозия длинным ядром — выживают только ДЛИННЫЕ непрерывные линии.
+        #    Тонкие штрихи текста уничтожаются, толстые линии рисунка остаются.
+        line_h = cv2.erode(dark_all, np.ones((1, 15), np.uint8))  # горизонтальные линии
+        line_v = cv2.erode(dark_all, np.ones((15, 1), np.uint8))  # вертикальные линии
+        line_d1 = cv2.erode(dark_all, np.eye(12, dtype=np.uint8)) # диагональ 1
+        line_d2 = cv2.erode(dark_all, np.fliplr(np.eye(12, dtype=np.uint8))) # диагональ 2
         
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            w_c  = stats[i, cv2.CC_STAT_WIDTH]
-            h_c  = stats[i, cv2.CC_STAT_HEIGHT]
-            ar   = max(w_c / (h_c + 1e-5), h_c / (w_c + 1e-5))
-            density = area / (w_c * h_c + 1e-5)
-            
-            # Размерные фильтры: текстовые символы 10-50px, не слишком вытянуты
-            if not (40 < area < 4000 and w_c < 55 and h_c < 55 and ar < 2.8 and density > 0.12):
-                continue
-            
-            # 3. Проверка "белого кольца": расширяем компонент, вычисляем кольцо,
-            #    смотрим долю белых пикселей в кольце
-            comp_mask = (labels == i).astype(np.uint8)
-            dilated_comp = cv2.dilate(comp_mask, kernel_ring, iterations=1)
-            ring = (dilated_comp > 0) & (comp_mask == 0)
-            ring_pixels = gray_orig[ring]
-            
-            if len(ring_pixels) > 5:
-                white_fraction = np.mean(ring_pixels > 185)
-                if white_fraction > 0.25:
-                    # ≥25% кольца — белое → это буква с обводкой
-                    text_mask_raw[labels == i] = 255
+        # 3. Объединяем и расширяем обратно чтобы восстановить толщину
+        lines_thin = (line_h | line_v | line_d1 | line_d2)
+        lines_restored = cv2.dilate(lines_thin, np.ones((5, 5), np.uint8), iterations=2)
         
-        # 4. Расширяем маску чтобы покрыть саму белую обводку
-        kernel = np.ones((3, 3), np.uint8)
-        text_mask_dilated = cv2.dilate(text_mask_raw, kernel, iterations=4)
+        # 4. Маска "что стирать" = выделение пользователя МИНУС линии рисунка
+        protect_mask = (lines_restored > 0) & user_mask_bool
         
-        # 5. Ограничиваем выделением пользователя
+        # Всё выделение — маска для LaMa (стираем весь текст)
         mask_refined = np.copy(mask)
-        mask_refined[text_mask_dilated == 0] = 0
-        
-        detected_px = np.sum(mask_refined >= 127)
-        print(f"[LaMa] Детектор нашёл {detected_px} px текста")
-        
-        # Если не нашли текст — возвращаем оригинал без изменений (безопасно!)
-        if detected_px < 100:
-            print("[LaMa] Текст не найден — возвращаю оригинал без изменений")
-            return img_original
+        # text_mask_dilated используется ниже для скринтона — ставим = вся маска минус линии
+        text_mask_dilated = np.copy(mask)
+        text_mask_dilated[protect_mask] = 0
+        text_mask_raw = text_mask_dilated.copy()
         
         mask_original = np.copy(mask_refined)
         mask_original[mask_original < 127] = 0
@@ -680,9 +656,10 @@ class LamaMPEPyTorchInpainter:
 
         height, width, c = image.shape
 
-        # Сохраняем отладочную маску на диск для визуальной проверки
+        # Отладочные маски
         cv2.imwrite("mask_debug_0_0.png", (mask_original * 255).astype(np.uint8))
-        cv2.imwrite("text_mask_raw_debug.png", text_mask_raw)
+        cv2.imwrite("text_mask_raw_debug.png", text_mask_dilated)
+        cv2.imwrite("lines_protect_debug.png", (protect_mask.astype(np.uint8) * 255))
 
         # === 1. Паддинг до кратного 8 БЕЗ ресайза (используем отражение) ===
         pad_size = 8
@@ -1007,9 +984,8 @@ class LamaMPEPyTorchInpainter:
                 
             ans = reconstructed_hole * hole_mask_feathered + img_original.astype(np.float32) * (1.0 - hole_mask_feathered)
             
-            # Восстанавливаем оригинальные линии рисунка строго ВНЕ расправленной маски букв
-            restore_mask = (dilated_edges > 0) & (text_mask_dilated == 0)
-            ans[restore_mask] = img_original[restore_mask]
+            # Восстанавливаем линии рисунка из оригинала (protect_mask)
+            ans[protect_mask] = img_original[protect_mask]
                 
             ans = np.clip(ans, 0, 255).astype(np.uint8)
             
@@ -1025,8 +1001,7 @@ class LamaMPEPyTorchInpainter:
             return ans
         else:
             ans = img_blended
-            restore_mask = (dilated_edges > 0) & (text_mask_dilated == 0)
-            ans[restore_mask] = img_original[restore_mask]
+            ans[protect_mask] = img_original[protect_mask]
             ans = np.clip(ans, 0, 255).astype(np.uint8)
             return ans
             
