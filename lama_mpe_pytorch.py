@@ -655,8 +655,8 @@ class LamaMPEPyTorchInpainter:
             if seg_mask_box is None or np.sum(seg_mask_box > 0) < 5:
                 seg_mask_box = (crop_gray < 80).astype(np.uint8) * 255
 
-            # Дилатация 4px для гарантированного накрытия краёв обводок букв (fuchidori)
-            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=4)
+            # Дилатация 3px для гарантированного накрытия краёв обводок букв (fuchidori)
+            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=3)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
