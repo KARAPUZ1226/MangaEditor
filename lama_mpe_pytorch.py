@@ -647,17 +647,17 @@ class LamaMPEPyTorchInpainter:
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                     
-                    seg_256 = (probs > 0.2).astype(np.uint8) * 255
+                    seg_256 = (probs > 0.3).astype(np.uint8) * 255
                     seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
                 except Exception as e:
                     print(f"[LaMa] Segmenter box error: {e}")
 
-            # Объединяем прогноз нейросети с темными штрихами букв (crop_gray < 170)
-            dark_pixels = (crop_gray < 170).astype(np.uint8) * 255
-            combined_box = seg_mask_box | dark_pixels
+            # Фолбэк на случай если сегментатор ничего не вернул: только тёмные штрихи (< 100)
+            if np.sum(seg_mask_box > 0) < 10:
+                seg_mask_box = (crop_gray < 100).astype(np.uint8) * 255
 
-            # Дилатация 4px полностью накрывает белые обводки (fuchidori) и полутона
-            seg_mask_dilated = cv2.dilate(combined_box, kernel_3, iterations=4)
+            # Дилатация 2px для покрытия белых обводок без слипания растровых точек
+            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=2)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
