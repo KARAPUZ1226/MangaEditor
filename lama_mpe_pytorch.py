@@ -929,18 +929,14 @@ class LamaMPEPyTorchInpainter:
             
             # Запрещаем брать доноры из букв, чёрных линий, белых облаков и тёмных теней
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((9, 9), np.uint8), iterations=3)
+            dirty_text_mask = cv2.dilate(text_mask_dilated, np.ones((5, 5), np.uint8), iterations=1)
             
             dirty_donor_mask = (
                 (dirty_text_mask > 0) | 
                 (dilated_edges > 0) | 
-                (gray_orig > 225) | 
-                (gray_orig < 30)
+                (gray_orig > 235) | 
+                (gray_orig < 25)
             ).astype(np.float32)
-            
-            # Принудительно обнуляем высокочастотную текстуру на всех грязных участках, 
-            # чтобы штрихи букв физически не могли попасть в доноры!
-            hp_orig[dirty_donor_mask[:, :, None] > 0] = 0.0
             
             # 2D базис решётки скринтона (основной вектор + перпендикулярный)
             v1 = (best_dx, best_dy)
@@ -966,7 +962,8 @@ class LamaMPEPyTorchInpainter:
                 # Копируем ТОЛЬКО из 100% чистых участков
                 copy_map = mask_to_fill & (shifted_dirty < 0.5)
                 if np.any(copy_map):
-                    hp_texture[copy_map] = shifted_hp[copy_map]
+                    copy_map_3d = np.repeat(copy_map[:, :, None], 3, axis=2)
+                    hp_texture[copy_map_3d] = shifted_hp[copy_map_3d]
                     mask_to_fill[copy_map] = False
             
             print(f"[LaMa PyTorch DEBUG] Local FFT-Period shift complete! Unfilled pixels={np.sum(mask_to_fill)}")
