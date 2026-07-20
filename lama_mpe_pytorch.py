@@ -617,7 +617,7 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Чистый пайплайн: обученный U-Net сегментатор -> LaMa -> вклеивание."""
+        """Структурный чистый пайплайн: выделение букв -> защита деталей -> точное FMM восстановление скринтона."""
         img_original = np.copy(image)
         height, width = image.shape[:2]
         user_mask_bool = mask >= 127
@@ -625,7 +625,7 @@ class LamaMPEPyTorchInpainter:
 
         mask_refined = np.zeros((height, width), dtype=np.uint8)
 
-        # 1. Вырезаем точные границы выделения пользователя
+        # 1. Точные прямоугольные границы выделения пользователя
         y_indices, x_indices = np.where(user_mask_bool)
         if len(y_indices) > 0 and len(x_indices) > 0:
             y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
@@ -637,81 +637,57 @@ class LamaMPEPyTorchInpainter:
             crop_user = image[y_min:y_max, x_min:x_max]
             crop_gray = cv2.cvtColor(crop_user, cv2.COLOR_BGR2GRAY)
 
-            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
+            # 2. Выделяем тёмные штрихи символов (crop_gray < 135)
+            dark_ink = (crop_gray < 135).astype(np.uint8) * 255
             
-            # Прогоняем кроп через обученный U-Net сегментатор с сохранением пропорций (square padding)
-            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
-                try:
-                    max_side = max(box_h, box_w)
-                    square = np.full((max_side, max_side), 255, dtype=np.uint8)
-                    y_off = (max_side - box_h) // 2
-                    x_off = (max_side - box_w) // 2
-                    square[y_off:y_off+box_h, x_off:x_off+box_w] = crop_gray
+            # 3. Фильтруем пуговицы и изолированные детали одежды вне текста
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            text_ink_box = np.zeros_like(dark_ink)
+            
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                w_c = stats[i, cv2.CC_STAT_WIDTH]
+                h_c = stats[i, cv2.CC_STAT_HEIGHT]
+                
+                # Мелкий шумок < 6px игнорируем
+                if area < 6:
+                    continue
                     
-                    square_256 = cv2.resize(square, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (square_256.astype(np.float32) / 255.0)[None, None, :, :]
-                    
-                    outputs = self.segmenter.run(None, {"input": inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    
-                    # Прогноз нейросети: маска букв
-                    seg_256 = (probs > 0.1).astype(np.uint8) * 255
-                    seg_square = cv2.resize(seg_256, (max_side, max_side), interpolation=cv2.INTER_NEAREST)
-                    seg_mask_box = seg_square[y_off:y_off+box_h, x_off:x_off+box_w]
-                except Exception as e:
-                    print(f"[LaMa] Segmenter error: {e}")
+                aspect = max(w_c / max(1, h_c), h_c / max(1, w_c))
+                is_round_button = (aspect < 1.35) and (12 <= area <= 300) and (abs(w_c - h_c) <= 4)
+                
+                # Проверяем окружение: если вокруг нет букв — это пуговица/деталь одежды!
+                if is_round_button:
+                    cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
+                    margin = 25
+                    y1_m = max(0, cy_i - margin)
+                    y2_m = min(box_h, cy_i + margin)
+                    x1_m = max(0, cx_i - margin)
+                    x2_m = min(box_w, cx_i + margin)
+                    nearby_dark = np.sum(dark_ink[y1_m:y2_m, x1_m:x2_m] > 0) - area
+                    if nearby_dark < 35:
+                        # Защищаем пуговицу (не стираем)
+                        print(f"[Cleaner] Protected button at ({cx_i}, {cy_i}), area={area}")
+                        continue
+                
+                text_ink_box[labels == i] = 255
 
-            # Если нейросеть ничего не нашла в рамке (редкий случай), берём выделение с минимальной дилатацией
-            if np.sum(seg_mask_box > 0) < 5:
-                seg_mask_box = (crop_gray < 100).astype(np.uint8) * 255
-
-            # Дилатация 2px для накрытия белых обводок букв (fuchidori)
-            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=2)
+            # 4. Дилатация 3px покрывает белые обводки (fuchidori)
+            seg_mask_dilated = cv2.dilate(text_ink_box, kernel_3, iterations=3)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
-        # Страховка
+        # Страховка: если выделить не удалось — берём выделение с минимальной дилатацией
         if np.sum(mask_refined > 0) < 5:
             mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
 
-        # 2. LaMa дорисовывает фон под маской
-        pad_h = (8 - height % 8) % 8
-        pad_w = (8 - width % 8) % 8
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # 5. Восстановление растра скринтона и линий через Fast Marching Telea
+        # FMM идеально сохраняет растровые точки скринтона и соединяет линии без серого мыла LaMa
+        ans = cv2.inpaint(img_original, mask_refined, 3, cv2.INPAINT_TELEA)
 
-        if pad_h > 0 or pad_w > 0:
-            image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-            mask_padded = cv2.copyMakeBorder(mask_refined, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-        else:
-            image_padded = image_rgb
-            mask_padded = mask_refined
-
-        img_t = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze(0).float().div_(255.).to(self.device)
-        mask_t = torch.from_numpy(mask_padded).unsqueeze(0).unsqueeze(0).float().div_(255.).to(self.device)
-        mask_t = (mask_t >= 0.5).float()
-
-        with torch.no_grad():
-            img_t *= (1 - mask_t)
-            out = self.model(img_t, mask_t).to(torch.float32)
-            result = (out.cpu().squeeze(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
-
-        if pad_h > 0 or pad_w > 0:
-            result = result[:height, :width]
-        result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-
-        # 3. Мягкое вклеивание результата LaMa строго по маске букв
-        m = (mask_refined > 0).astype(np.float32)[:, :, None]
-        m = cv2.GaussianBlur(m, (3, 3), 0)
-        if m.ndim == 2:
-            m = m[:, :, None]
-
-        ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
-        ans = np.clip(ans, 0, 255).astype(np.uint8)
-
-        # 4. Гарантированное строгое ч/б
+        # 6. Строгое ч/б без цветного шума
         ans = cv2.cvtColor(cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
         return ans
 
