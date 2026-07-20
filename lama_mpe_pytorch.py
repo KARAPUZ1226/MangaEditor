@@ -619,16 +619,20 @@ class LamaMPEPyTorchInpainter:
         # BGR (H, W, 3) and mask (H, W) [255 = inpaint]
         img_original = np.copy(image)
         text_mask_raw = np.zeros_like(mask)
-        # === 0. Точное изолирование ТЕКСТА (не переделываем весь кроп!) ===
+        # === 0. Точное изолирование ТЕКСТА (без захвата растровых точек скринтона!) ===
         # Маска для LaMa = ТОЛЬКО символы текста + белая обводка (fuchidori).
         # Вся остальная область (скринтон, белая одежда, контуры рисунка) остается 100% оригиналом.
         gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
         user_mask_bool = mask >= 127
         
-        # 1. Находим тёмные пиксели (буквы + детали) внутри области пользователя
-        dark_pixels = ((gray_orig < 160) & user_mask_bool).astype(np.uint8)
+        # 1. Медианный фильтр 5x5 полностью стирает мелкие растровые точки скринтона,
+        #    оставляя ТОЛЬКО плотные штрихи текста, иероглифы, плашки ■ и линии рисунка!
+        gray_smooth = cv2.medianBlur(gray_orig, 5)
         
-        # 2. Компонентный анализ: отделяем буквы от входящих контуров одежды/рисунка
+        # 2. Находим тёмные пиксели (буквы, плашки, линии) внутри области пользователя
+        dark_pixels = ((gray_smooth < 140) & user_mask_bool).astype(np.uint8)
+        
+        # 3. Компонентный анализ: отделяем символы текста от тонких контуров одежды/панелей
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_pixels, connectivity=8)
         text_mask_raw = np.zeros_like(gray_orig)
         
@@ -643,9 +647,6 @@ class LamaMPEPyTorchInpainter:
             comp_mask = (labels == i)
             
             touches_border = np.any(comp_mask & border_mask)
-            
-            # Проверяем, является ли компонент тонкой непрерывной линией рисунка (например, контур одежды),
-            # которая идет сквозь границу выделения
             aspect_ratio = max(w_c / (h_c + 1e-5), h_c / (w_c + 1e-5))
             min_dim = min(w_c, h_c)
             
@@ -655,19 +656,14 @@ class LamaMPEPyTorchInpainter:
             if is_thin_drawing_line:
                 continue
             
-            # Всё остальное (включая плашки ■, тире —, иероглифы, буквы) — это ТЕКСТ
-            if area > 4:
+            # Всё остальное (включая плашки ■, тире —, иероглифы, буквы) — это ТЕКСТ (отсекаем мелкий шум < 30px)
+            if area >= 30:
                 text_mask_raw[comp_mask] = 255
         
-        # 3. Накрываем белые обводки (fuchidori) букв небольшой дилатацией (4px)
+        # 4. Накрываем белые обводки (fuchidori) букв небольшой дилатацией (4px)
         kernel_3 = np.ones((3, 3), np.uint8)
         text_mask_dilated = cv2.dilate(text_mask_raw, kernel_3, iterations=4)
         text_mask_dilated[~user_mask_bool] = 0
-        
-        # Страховка: если текст без контрастных букв или особый шрифт
-        if np.sum(text_mask_dilated > 0) < 25:
-            text_mask_dilated = cv2.dilate((dark_pixels * 255).astype(np.uint8), kernel_3, iterations=3)
-            text_mask_dilated[~user_mask_bool] = 0
 
         # Маска ДЛЯ LAMA = ТОЛЬКО маска букв! Не весь кроп!
         mask_refined = text_mask_dilated.copy()
