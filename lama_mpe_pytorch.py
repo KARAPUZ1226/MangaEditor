@@ -624,13 +624,37 @@ class LamaMPEPyTorchInpainter:
         img_original = np.copy(image)
         height, width = image.shape[:2]
         
-        # --- ПРОХОД 1: Полный инпейнт всей маски ---
-        # Используем маску пользователя напрямую — всё что выделено, стираем
-        user_mask = np.zeros((height, width), dtype=np.uint8)
-        user_mask[mask >= 127] = 255
-        
-        if np.sum(user_mask > 0) < 5:
+        # --- ПРОХОД 1: Точечный инпейнт маски текста ---
+        # Выделяем только чернила букв (<130) + 9px дилатация для поглощения белой обводки.
+        # Это сохраняет белый фон рубашки, воротники, волос и рисунок во всей остальной области!
+        user_mask_bool = (mask >= 127)
+        if not np.any(user_mask_bool):
             return image
+            
+        y_indices, x_indices = np.where(user_mask_bool)
+        y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
+        x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
+        
+        crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
+        
+        # Находим только темные пиксели букв (<130)
+        dark_text = (crop_gray < 130).astype(np.uint8) * 255
+        
+        # Дилатация на 9px полностью перекрывает белую обводку Fuchidori вокруг букв
+        kernel_3 = np.ones((3, 3), np.uint8)
+        text_mask_crop = cv2.dilate(dark_text, kernel_3, iterations=9)
+        
+        text_mask_full = np.zeros((height, width), dtype=np.uint8)
+        text_mask_full[y_min:y_max, x_min:x_max] = text_mask_crop
+        text_mask_full[~user_mask_bool] = 0
+        
+        # Если не нашлось букв, берем обычную дилатацию выделения пользователя
+        if np.sum(text_mask_full > 0) < 5:
+            text_mask_full = cv2.dilate(mask, kernel_3, iterations=3)
+            text_mask_full[text_mask_full < 127] = 0
+            text_mask_full[text_mask_full >= 127] = 255
+            
+        user_mask = text_mask_full
         
         # Паддинг до кратности 8
         pad_h = (8 - height % 8) % 8
