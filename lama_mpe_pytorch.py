@@ -677,45 +677,30 @@ class LamaMPEPyTorchInpainter:
                 comp_mask = (labels == i)
                 
                 # 2.1. Игнорируем линии панели и другие границы, касающиеся краев выделения
-                touches_border = (x_c <= 3) or (y_c <= 3) or (x_c + w_c >= box_w - 3) or (y_c + h_c >= box_h - 3)
-                if touches_border and (w_c > 35 or h_c > 35 or area > 100):
-                    continue
-                
-                # Считаем яркость локального фона вокруг компонента в ПОЛНОМ изображении (с учетом +128px контекста)!
-                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
-                gray_full = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-                cy_orig = y_min + cy_i
-                cx_orig = x_min + cx_i
-                
-                margin = 40
-                y1_m = max(0, cy_orig - margin)
-                y2_m = min(height, cy_orig + margin)
-                x1_m = max(0, cx_orig - margin)
-                x2_m = min(width, cx_orig + margin)
-                
-                nb_gray = gray_full[y1_m:y2_m, x1_m:x2_m]
-                p35 = np.percentile(nb_gray, 35)
-                bg_mean = np.mean(nb_gray)
-                
-                is_char_sized = (w_c <= 45) and (h_c <= 45)
+                is_char_sized = (w_c <= 45 or h_c <= 45) and max(w_c, h_c) <= 65 and area <= 350
                 survived_erosion = np.any(eroded_ink[comp_mask] > 0)
                 solidity = area / (w_c * h_c)
                 aspect_ratio = max(w_c, h_c) / (min(w_c, h_c) + 1e-3)
+                
+                # Восстанавливаем только НАСТОЯЩИЕ длинные рамки кадров манги, касающиеся края
+                is_panel_line = touches_border and (w_c >= box_w - 6 or h_c >= box_h - 6 or aspect_ratio > 7.0) and (solidity > 0.40) and (area > 150)
+                if is_panel_line:
+                    edges_box[comp_mask] = 255
+                    continue
                 
                 is_unet = np.any(seg_mask_box[comp_mask] > 0)
                 
                 is_text = False
                 if is_unet:
                     # Игнорируем складки одежды, штриховку и мех, даже если U-Net задел их
-                    if (solidity < 0.22 and min(w_c, h_c) > 5) or (aspect_ratio > 4.5 and area > 120):
+                    if (solidity < 0.18 and min(w_c, h_c) > 5 and aspect_ratio > 6.0):
                         pass
                     else:
                         is_text = True
                 elif is_char_sized:
-                    # Надежный фолбэк для компонентов размером с символ (ловит の, ト, даже если U-Net их пропустил)
-                    if aspect_ratio <= 3.5 and solidity >= 0.20 and area >= 10:
-                        if not (solidity < 0.22 and min(w_c, h_c) > 5):
-                            is_text = True
+                    # Надежный фолбэк для всех штрихов японских иероглифов (ловит の, ト, ッ, フ)
+                    if aspect_ratio <= 6.5 and solidity >= 0.10 and area >= 8:
+                        is_text = True
                         
                 if is_text:
                     final_mask[comp_mask] = 255
