@@ -719,8 +719,10 @@ class LamaMPEPyTorchInpainter:
                         
                 if is_text:
                     final_mask[comp_mask] = 255
-                    # Если средняя яркость локального фона серая (<205), это точно скринтон!
-                    if bg_mean < 205:
+                    # Детекция скринтона по 25-му перцентилю: на скринтоне есть растровые точки (gray < 195),
+                    # даже если у текста широкая белая обводка (fuchidori), поднимающая среднее bg_mean!
+                    has_screentone = np.percentile(nb_gray, 25) < 195
+                    if has_screentone:
                         screentone_mask[comp_mask] = 255
                     
             # 3. Точечная дилатация 3px для LaMa и ультра-точечная 1px для донора скринтонов
