@@ -177,14 +177,14 @@ def fast_exemplar_inpaint(image, mask, edges_mask=None, screentone_threshold=3.0
 
     # 3. Если есть скринтон — заполняем периодическими сдвигами
     if has_screentone:
-        result, remaining = periodic_fill(image, mask, (dy, dx), edges_mask=edges_mask, max_r=20)
+        result, remaining = periodic_fill(image, mask, (dy, dx), edges_mask=edges_mask, max_r=25)
+        # Если не все пиксели заполнились периодическим сдвигом, оставляем оригинальный вход (LaMa)
+        # НЕ вызываем nearest_neighbor_fill, так как он создает градиентные лучи при больших масках
     else:
         result = image.copy().astype(np.float32)
         remaining = fill_mask.copy()
-
-    # 4. Оставшиеся пиксели — ближайший сосед
-    if np.any(remaining):
-        result = nearest_neighbor_fill(result, remaining)
+        if np.any(remaining):
+            result = nearest_neighbor_fill(result, remaining)
 
     # 5. Feather blend по краям маски (уменьшено до 5 для четкости границ и предотвращения призраков)
     result = feather_blend(result, image, mask, kernel_size=5)
