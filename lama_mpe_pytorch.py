@@ -647,7 +647,13 @@ class LamaMPEPyTorchInpainter:
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                     # Прогноз нейросети: маска букв + обводки
                     seg_256 = (probs > 0.20).astype(np.uint8) * 255
-                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                    raw_seg = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                    num_l, labels_u, stats_u, _ = cv2.connectedComponentsWithStats(raw_seg, connectivity=8)
+                    seg_mask_box = np.zeros_like(raw_seg)
+                    for i in range(1, num_l):
+                        if stats_u[i, cv2.CC_STAT_WIDTH] > 120 or stats_u[i, cv2.CC_STAT_HEIGHT] > 120:
+                            continue
+                        seg_mask_box[labels_u == i] = 255
                 except Exception as e:
                     print(f"[LaMa] Segmenter error: {e}")
 
@@ -655,10 +661,45 @@ class LamaMPEPyTorchInpainter:
             if seg_mask_box is None or np.sum(seg_mask_box > 0) < 5:
                 seg_mask_box = (crop_gray < 80).astype(np.uint8) * 255
 
+            # Recover characters on white backgrounds where UNet is blind
+            dark_ink = (crop_gray < 110).astype(np.uint8) * 255
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            final_mask = seg_mask_box.copy()
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                w_c = stats[i, cv2.CC_STAT_WIDTH]
+                h_c = stats[i, cv2.CC_STAT_HEIGHT]
+                if area < 4:
+                    continue
+                comp_mask = (labels == i)
+                if np.any(final_mask[comp_mask] > 0):
+                    continue
+                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
+                margin = 35
+                y1_m = max(0, cy_i - margin)
+                y2_m = min(box_h, cy_i + margin)
+                x1_m = max(0, cx_i - margin)
+                x2_m = min(box_w, cx_i + margin)
+                nb_gray = crop_gray[y1_m:y2_m, x1_m:x2_m]
+                nb_dark = dark_ink[y1_m:y2_m, x1_m:x2_m]
+                bg_pixels = nb_gray[nb_dark == 0]
+                bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
+                nearby_dark_area = np.sum(nb_dark > 0) - area
+                is_isolated = (nearby_dark_area < 25)
+                is_char_sized = (w_c <= 45) and (h_c <= 45)
+                if bg_val >= 210 and is_char_sized and not is_isolated:
+                    final_mask[comp_mask] = 255
+            seg_mask_box = final_mask
+
             # Дилатация 3px для гарантированного накрытия краёв обводок букв (fuchidori)
             seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=3)
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
+            
+            # Временный дебаг
+            cv2.imwrite("debug_crop_gray.png", crop_gray)
+            cv2.imwrite("debug_seg_mask_box.png", seg_mask_box)
+            cv2.imwrite("debug_mask_refined.png", mask_refined)
 
         # Страховка
         if np.sum(mask_refined > 0) < 5:
