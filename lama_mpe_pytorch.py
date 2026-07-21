@@ -799,7 +799,7 @@ class LamaMPEPyTorchInpainter:
                 
                 donor_edges = np.zeros_like(dark_orig)
                 for i in range(1, num_labels_or):
-                    if stats_or[i, cv2.CC_STAT_AREA] >= 10:
+                    if stats_or[i, cv2.CC_STAT_AREA] >= 150:
                         donor_edges[labels_or == i] = 255
                 
                 # Запускаем донорную заливку локально в расширенной области для идеального поиска периода скринтона
