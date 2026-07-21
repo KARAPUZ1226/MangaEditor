@@ -38,6 +38,26 @@ def feather_blend_patch(target: np.ndarray, donor: np.ndarray, mask: np.ndarray,
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
+def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 15) -> bool:
+    """
+    Проверяет: если окружение дырки однородное (низкая дисперсия <= 8.0) —
+    донор не нужен, оставить чистый результат LaMa.
+    Если окружение текстурное (высокая дисперсия > 8.0) — донор нужен.
+    """
+    k_ring = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1))
+    ring = (cv2.dilate((mask > 0).astype(np.uint8), k_ring) > 0) & (mask == 0)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    ring_pixels = gray[ring]
+    ring_std = float(ring_pixels.std()) if ring_pixels.size > 0 else 0.0
+    return ring_std > 8.0
+
+
+def patch_density(patch: np.ndarray, thresh: int = 128) -> float:
+    """Возвращает долю темных пикселей (<thresh) в патче."""
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
+    return float((gray < thresh).mean())
+
+
 def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_fail: np.ndarray, M_text_raw: np.ndarray) -> np.ndarray:
     """
     Заполняет области M_fail с помощью ориентированного поиска доноров и сохранения структуры.
@@ -52,7 +72,6 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         
     result = image_lama.copy()
     gray_orig = cv2.cvtColor(image_orig, cv2.COLOR_BGR2GRAY)
-    gray_lama = cv2.cvtColor(image_lama, cv2.COLOR_BGR2GRAY)
     h, w = gray_orig.shape
     
     # 1. Запрещенная зона для выбора доноров — исходные недилатированные чернила текста
@@ -69,22 +88,28 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             
         comp_mask = (labels == i)
         
+        # --- ФИКС 2: Проверка "нужен ли вообще донор здесь" ---
+        if not region_needs_texture(image_orig, comp_mask, ring_width=15):
+            continue  # Гладкий фон / белая рубашка — донор НЕ нужен, оставляем чистый LaMa!
+        
         # Контур компонента M_fail
         kernel_3 = np.ones((3, 3), np.uint8)
         dil = cv2.dilate(comp_mask.astype(np.uint8), kernel_3)
         boundary_mask = (dil > 0) & (~comp_mask) & donor_valid_mask
         
-        # Средняя яркость и доминирующий угол на границе провала
+        # Средняя яркость и плотность паттерна вокруг дырки
         if np.any(boundary_mask):
             target_mean_gray = float(np.mean(gray_orig[boundary_mask]))
+            target_density_val = patch_density(image_orig[boundary_mask], thresh=128)
             dom_angle = compute_structure_tensor_orientation(gray_orig, boundary_mask)
         else:
             target_mean_gray = float(np.mean(gray_orig[comp_mask]))
+            target_density_val = patch_density(image_orig[comp_mask], thresh=128)
             dom_angle = 0.0
             
-        # Локальное окно поиска донора ±80px
+        # --- ФИКС 1: Жестко ограниченное локальное окно поиска (search_radius=60) ---
         cx, cy = int(centroids[i][0]), int(centroids[i][1])
-        search_radius = 80
+        search_radius = 60
         
         y0_s = max(0, cy - search_radius)
         y1_s = min(h, cy + search_radius)
@@ -94,16 +119,15 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         best_donor_shift = None
         best_score = float('inf')
         
-        # Ищем идеальный вектор сдвига донора (dy, dx)
+        # Ищем донора ТОЛЬКО в локальном радиусе search_radius от target-патча
         shifts_to_test = []
-        for dy in range(-40, 41, 4):
-            for dx in range(-40, 41, 4):
+        for dy in range(-search_radius, search_radius + 1, 4):
+            for dx in range(-search_radius, search_radius + 1, 4):
                 if abs(dy) < 4 and abs(dx) < 4:
                     continue
                 shifts_to_test.append((dy, dx))
                 
         for dy, dx in shifts_to_test:
-            # Проверяем валидность сдвинутых пикселей
             y_shifted = np.clip(y_c + dy, 0, h - h_c)
             x_shifted = np.clip(x_c + dx, 0, w - w_c)
             
@@ -111,7 +135,6 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             if not np.any(donor_region_valid):
                 continue
                 
-            # Проверяем сдвинутый патч на попадание в валидного донора
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             
@@ -121,14 +144,17 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
             
-            # Считаем расхождение яркости и направления градиента
+            # --- ФИКС 3: Фильтр кандидатов по плотности растровых точек ---
+            candidate_density_val = patch_density(shifted_gray[comp_mask], thresh=128)
+            if abs(target_density_val - candidate_density_val) > 0.15:
+                continue  # Пропускаем кандидата — слишком разная плотность точек растра!
+                
             donor_mean_gray = float(np.mean(shifted_gray[comp_mask]))
             bright_diff = abs(donor_mean_gray - target_mean_gray)
             
-            if bright_diff > 25.0:
+            if bright_diff > 20.0:
                 continue
                 
-            # Score на совпадение градиентов
             donor_angle = compute_structure_tensor_orientation(shifted_gray, boundary_mask)
             angle_diff = abs(np.arctan2(np.sin(dom_angle - donor_angle), np.cos(dom_angle - donor_angle)))
             
@@ -137,13 +163,11 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
                 best_score = score
                 best_donor_shift = (dy, dx)
                 
-        # Если нашли хороший донорный патч (score < 40), вклеиваем с плавным блендингом
-        if best_donor_shift is not None and best_score < 40.0:
+        if best_donor_shift is not None and best_score < 35.0:
             dy, dx = best_donor_shift
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             donor_patch = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             
-            # Применяем блендинг
             blended_comp = feather_blend_patch(result, donor_patch, comp_mask, feather_px=4)
             result[comp_mask] = blended_comp[comp_mask]
             
