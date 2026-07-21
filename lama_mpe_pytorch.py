@@ -694,6 +694,8 @@ class LamaMPEPyTorchInpainter:
                 bg_pixels = nb_gray[nb_dark == 0]
                 
                 bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
+                bg_mean = np.mean(nb_gray)
+                
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
                 survived_erosion = np.any(eroded_ink[comp_mask] > 0)
                 solidity = area / (w_c * h_c)
@@ -712,8 +714,8 @@ class LamaMPEPyTorchInpainter:
                         
                 if is_text:
                     final_mask[comp_mask] = 255
-                    # Если фон темнее 200 (серый скринтон), добавляем в маску для восстановления текстур
-                    if bg_val < 200:
+                    # Если средняя яркость локального фона серая (<205), это точно скринтон!
+                    if bg_mean < 205:
                         screentone_mask[comp_mask] = 255
                     
             # 3. Дилатация на 5px для гарантированного удаления белой обводки (fuchidori)
