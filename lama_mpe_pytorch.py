@@ -653,7 +653,7 @@ class LamaMPEPyTorchInpainter:
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                     
-                    seg_256 = (probs > 0.20).astype(np.uint8) * 255
+                    seg_256 = (probs > 0.08).astype(np.uint8) * 255
                     seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
                 except Exception as e:
                     print(f"[LaMa] Segmenter error: {e}")
@@ -669,13 +669,13 @@ class LamaMPEPyTorchInpainter:
             
             final_mask = np.zeros_like(dark_ink)
             screentone_mask = np.zeros_like(dark_ink)
+            edges_box = np.zeros_like(dark_ink)
             for i in range(1, num_labels):
                 x_c, y_c, w_c, h_c, area = stats[i]
                 if area < 6:
                     continue
                     
                 comp_mask = (labels == i)
-                
                 touches_border = (x_c <= 3) or (y_c <= 3) or (x_c + w_c >= box_w - 3) or (y_c + h_c >= box_h - 3)
                 
                 # Считаем яркость локального фона вокруг компонента в ПОЛНОМ изображении (с учетом +128px контекста)!
@@ -684,7 +684,7 @@ class LamaMPEPyTorchInpainter:
                 cy_orig = y_min + cy_i
                 cx_orig = x_min + cx_i
                 
-                margin = 40
+                margin = 30
                 y1_m = max(0, cy_orig - margin)
                 y2_m = min(height, cy_orig + margin)
                 x1_m = max(0, cx_orig - margin)
@@ -692,13 +692,16 @@ class LamaMPEPyTorchInpainter:
                 
                 nb_gray = gray_full[y1_m:y2_m, x1_m:x2_m]
                 p35 = np.percentile(nb_gray, 35)
-                bg_mean = np.mean(nb_gray)
+                bg_mean_comp = np.mean(nb_gray)
                 
-                is_char_sized = (w_c <= 45 or h_c <= 45) and max(w_c, h_c) <= 65 and area <= 350
-                survived_erosion = np.any(eroded_ink[comp_mask] > 0)
+                # Защита пуговиц и элементов одежды на чистой белой рубашке/бумаге (bg_mean >= 238)
+                if bg_mean_comp >= 238.0 and not np.any(seg_mask_box[comp_mask] > 0):
+                    edges_box[comp_mask] = 255
+                    continue
+
                 solidity = area / (w_c * h_c)
                 aspect_ratio = max(w_c, h_c) / (min(w_c, h_c) + 1e-3)
-                
+
                 # Восстанавливаем только НАСТОЯЩИЕ длинные рамки кадров манги, касающиеся края
                 is_panel_line = touches_border and (w_c >= box_w - 6 or h_c >= box_h - 6 or aspect_ratio > 7.0) and (solidity > 0.40) and (area > 150)
                 if is_panel_line:
@@ -706,6 +709,7 @@ class LamaMPEPyTorchInpainter:
                     continue
                 
                 is_unet = np.any(seg_mask_box[comp_mask] > 0)
+                is_char_or_word_sized = (min(w_c, h_c) <= 55) and (area <= 3500)
                 
                 is_text = False
                 if is_unet:
@@ -714,16 +718,15 @@ class LamaMPEPyTorchInpainter:
                         pass
                     else:
                         is_text = True
-                elif is_char_sized:
-                    # Надежный фолбэк для всех штрихов японских иероглифов (ловит の, ト, ッ, フ)
-                    if aspect_ratio <= 6.5 and solidity >= 0.10 and area >= 8:
+                elif is_char_or_word_sized:
+                    # Надежный фолбэк для всех японских слов и символов (ловит の, ト, ッ, フ)
+                    if aspect_ratio <= 8.0 and solidity >= 0.08 and area >= 8:
                         is_text = True
                         
                 if is_text:
                     final_mask[comp_mask] = 255
                     # Детекция скринтона по расширенному контексту: если p35 < 210 или bg_mean < 225, вокруг есть скринтон!
-                    has_screentone = (p35 < 210) or (bg_mean < 225)
-                    if has_screentone:
+                    if p35 < 210 or bg_mean_comp < 225:
                         screentone_mask[comp_mask] = 255
                     
             # 3. Дилатация на 4px для полного стирания туши букв И широкой белой обводки (fuchidori)
