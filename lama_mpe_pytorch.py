@@ -633,14 +633,62 @@ class LamaMPEPyTorchInpainter:
             
             crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
             
-            # Детекция чернил букв (<120)
+            # 1. Запуск ИИ-сегментатора U-Net для семантического поиска областей с текстом
+            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
+            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
+                try:
+                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
+                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
+                    outputs = self.segmenter.run(None, {"input": inp})
+                    logits = outputs[0][0, 0]
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                    
+                    seg_256 = (probs > 0.20).astype(np.uint8) * 255
+                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                except Exception as e:
+                    print(f"[LaMa] Segmenter error: {e}")
+                    
+            # 2. Выделение связных компонентов темных чернил (<120)
             dark_ink = (crop_gray < 120).astype(np.uint8) * 255
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
             
-            # Дилатация на 4px для полного накрытия белой обводки (fuchidori)
+            final_mask = np.zeros_like(dark_ink)
+            for i in range(1, num_labels):
+                x_c, y_c, w_c, h_c, area = stats[i]
+                if area < 6:
+                    continue
+                    
+                comp_mask = (labels == i)
+                
+                # Если компонент пересекается с маской U-Net -> это точно текст на скринтоне
+                if np.any(seg_mask_box[comp_mask] > 0):
+                    final_mask[comp_mask] = 255
+                    continue
+                    
+                # Если U-Net "ослеп" на белом фоне (рубашка/бабл), проверяем локальный фон компонента
+                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
+                margin = 35
+                y1_m = max(0, cy_i - margin)
+                y2_m = min(box_h, cy_i + margin)
+                x1_m = max(0, cx_i - margin)
+                x2_m = min(box_w, cx_i + margin)
+                
+                nb_gray = crop_gray[y1_m:y2_m, x1_m:x2_m]
+                nb_dark = dark_ink[y1_m:y2_m, x1_m:x2_m]
+                bg_pixels = nb_gray[nb_dark == 0]
+                
+                bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
+                is_char_sized = (w_c <= 45) and (h_c <= 45)
+                
+                # Если фон чистый белый (>=200) и размер компонента соответствует символу, то закрашиваем
+                if bg_val >= 200 and is_char_sized:
+                    final_mask[comp_mask] = 255
+                    
+            # 3. Дилатация 4px для полного покрытия белой обводки текста (fuchidori)
             kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_box = cv2.dilate(dark_ink, kernel_3, iterations=4)
+            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=4)
             
-            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_box
+            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
             
         if np.sum(mask_refined > 0) < 5:
