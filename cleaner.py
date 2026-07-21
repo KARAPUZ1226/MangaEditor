@@ -113,9 +113,16 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
     crop = cv_image[y:y_end, x:x_end].copy()
     
     text_mask = np.zeros((h, w), dtype=np.uint8)
-    mask_x = x0 - x
-    mask_y = y0 - y
-    text_mask[mask_y:mask_y+h0, mask_x:mask_x+w0] = 255
+    mx0 = max(0, x0 - x)
+    my0 = max(0, y0 - y)
+    mx1 = min(w, x0 + w0 - x)
+    my1 = min(h, y0 + h0 - y)
+    if mx1 > mx0 and my1 > my0:
+        text_mask[my0:my1, mx0:mx1] = 255
+
+    if dilation_pixels > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        text_mask = cv2.dilate(text_mask, kernel, iterations=dilation_pixels)
 
     if lama_inpainter is not None:
         try:

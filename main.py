@@ -1114,9 +1114,8 @@ class MangaEditorApp(QMainWindow):
                             bg_before_cv = self.original_cv_image.copy()
                             self.original_cv_image = inpainted.copy()
                             
-                            # Конвертируем обратно в QImage
-                            inpainted_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
-                            q_img = QImage(inpainted_rgb.data, w_bg, h_bg, w_bg * 3, QImage.Format_RGB888).copy()
+                            # Конвертируем обратно в QImage (гарантируем единообразный Format_BGR888)
+                            q_img = QImage(inpainted.data, w_bg, h_bg, w_bg * 3, QImage.Format_BGR888).copy()
                             
                             bg_before = self.layers[0].image.copy()
                             self.layers[0].image = q_img
@@ -1146,15 +1145,19 @@ class MangaEditorApp(QMainWindow):
                 return
             
             # Стандартная обработка для остальных инструментов (кисть, ластик, восстановление)
+            before_cv = None
             if active_layer == self.layers[0]:
                 h, w = active_layer.image.height(), active_layer.image.width()
                 temp_qimg = active_layer.image.convertToFormat(QImage.Format_BGR888)
                 ptr = temp_qimg.bits()
                 arr = np.array(ptr).reshape(h, w, 3)
+                before_cv = self.original_cv_image.copy() if self.original_cv_image is not None else None
                 self.original_cv_image = arr.copy()
                 
             desc = "Восстановление" if self.view.tool == "restore" else ("Кисть клина" if self.view.tool == "brush" else ("Ластик" if self.view.tool == "eraser" else "ИИ-Маска"))
             cmd = UndoPaintCommand(active_layer, self.draw_start_image, active_layer.image, desc, self)
+            if active_layer == self.layers[0]:
+                cmd.set_cv_images(before_cv, self.original_cv_image)
             self.undo_stack.push(cmd)
             self.draw_start_image = None
             self.sync_history_list()
