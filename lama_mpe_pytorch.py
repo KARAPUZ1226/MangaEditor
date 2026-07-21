@@ -625,6 +625,7 @@ class LamaMPEPyTorchInpainter:
         y_indices, x_indices = np.where(user_mask_bool)
         
         mask_refined = np.zeros((height, width), dtype=np.uint8)
+        edges_mask = np.zeros((height, width), dtype=np.uint8)
         
         if len(y_indices) > 0 and len(x_indices) > 0:
             y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
@@ -707,6 +708,11 @@ class LamaMPEPyTorchInpainter:
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
+
+            # Маска линий для восстановления (темные пиксели исходника, не являющиеся текстом)
+            edges_box = ((crop_gray < 120) & (final_mask == 0)).astype(np.uint8) * 255
+            edges_mask[y_min:y_max, x_min:x_max] = edges_box
+            edges_mask[~user_mask_bool] = 0
             
             # Сохраняем отладочные файлы для анализа
             cv2.imwrite("debug_crop_gray.png", crop_gray)
@@ -717,6 +723,7 @@ class LamaMPEPyTorchInpainter:
             mask_refined = cv2.dilate(mask, kernel_3, iterations=3)
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
+            edges_mask = np.zeros_like(mask_refined)
             
         # 2. LaMa дорисовывает
         pad_h = (8 - height % 8) % 8
@@ -755,10 +762,8 @@ class LamaMPEPyTorchInpainter:
         # 4. Донорная заливка (fast_exemplar_inpaint) для идеального восстановления тонов и текстур скринтонов
         try:
             from fast_exemplar_inpaint import fast_exemplar_inpaint
-            gray_lama = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
-            # Защищаем тонкие линии, нарисованные LaMa
-            lama_edges = (gray_lama < 50).astype(np.uint8) * 255
-            ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=lama_edges)
+            # Передаем edges_mask=None, так как восстановим линии сами на следующем шаге с максимальной точностью
+            ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=None)
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")
             
