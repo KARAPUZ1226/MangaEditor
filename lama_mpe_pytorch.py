@@ -762,10 +762,18 @@ class LamaMPEPyTorchInpainter:
         # 4. Донорная заливка (fast_exemplar_inpaint) для идеального восстановления тонов и текстур скринтонов
         try:
             from fast_exemplar_inpaint import fast_exemplar_inpaint
-            # Передаем edges_mask=None, так как восстановим линии сами на следующем шаге с максимальной точностью
-            ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=None)
+            # Выделяем все оригинальные темные контуры рисунка, чтобы донор не копировал их как текстуру
+            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+            donor_edges = (gray_orig < 120).astype(np.uint8) * 255
+            ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=donor_edges)
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")
+            
+        # 5. Прецизионное восстановление оригинального лайн-арта (рамки кадра, складки, швы)
+        # Накладываем обратно оригинальные черные контуры, которые были стерты только из-за расширения маски
+        restore_mask = (edges_mask > 0)
+        if np.any(restore_mask):
+            ans[restore_mask] = img_original[restore_mask]
             
         return ans
 
