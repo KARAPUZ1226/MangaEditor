@@ -733,11 +733,19 @@ class LamaMPEPyTorchInpainter:
         if np.any(M_fail_crop > 0):
             crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, M_fail_crop, crop_mask_raw)
             
-        # --- ШАГ 7: QC Проверка качественного результата ---
+        # --- ШАГ 7: QC Проверка качественного результата & Строгая изоляция вне маски ---
         M_fail_qc = detect_lama_failures(crop_ans, crop_mask_dilated, patch_size=16, ring_width=20)
         qc_fail_count = np.count_nonzero(M_fail_qc)
         if qc_fail_count > 0:
             print(f"[LaMa Pipeline v2 QC] {qc_fail_count} px отмечены для внимания QC.")
+            
+        # Строгое ограничение: замена ТОЛЬКО пикселей внутри dilated U-Net mask
+        outside_mask_crop = (crop_mask_dilated == 0)
+        crop_ans[outside_mask_crop] = crop_image[outside_mask_crop]
+        
+        # Assert гарантия: разница до/после вне маски должна быть СТРОГО == 0
+        diff_outside = np.abs(crop_ans[outside_mask_crop].astype(np.int32) - crop_image[outside_mask_crop].astype(np.int32))
+        assert np.max(diff_outside) == 0, f"Ошибка! Изменены {np.count_nonzero(diff_outside)} пикселей за пределами маски U-Net!"
             
         ans = image.copy()
         ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_ans
