@@ -808,6 +808,7 @@ class LamaMPEPyTorchInpainter:
                 # Запускаем донорную заливку локально в расширенной области.
                 # ВАЖНО: передаем crop_orig (оригинальное изображение с настоящими точками скринтона!),
                 # а НЕ crop_ans (где LaMa уже размыла фон в мыльный серый цвет).
+                crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 crop_orig = img_original[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 crop_mask = screentone_mask_dilated[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
