@@ -617,11 +617,10 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Чистый пайплайн: 1. U-Net (без фильтров) 2. LaMa 3. Защита тонов"""
+        """Чистый пайплайн: 1. Детекция букв + обводки (4px дилатация) 2. LaMa inpainting"""
         img_original = np.copy(image)
         height, width = image.shape[:2]
         
-        # 1. Точные прямоугольные границы выделения пользователя
         user_mask_bool = mask >= 127
         y_indices, x_indices = np.where(user_mask_bool)
         
@@ -633,22 +632,20 @@ class LamaMPEPyTorchInpainter:
             box_h, box_w = y_max - y_min, x_max - x_min
             
             crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-            # Высокоточный детектор букв и их обводки (fuchidori)
-            dark_ink = (crop_gray < 110).astype(np.uint8) * 255
-            white_bg = (crop_gray > 180).astype(np.uint8) * 255
             
+            # Детекция чернил букв (<120)
+            dark_ink = (crop_gray < 120).astype(np.uint8) * 255
+            
+            # Дилатация на 4px для полного накрытия белой обводки (fuchidori)
             kernel_3 = np.ones((3, 3), np.uint8)
-            dilated_ink = cv2.dilate(dark_ink, kernel_3, iterations=2)
-            
-            # Маска = буквы + их обводка (без вылезания на скринтоны и соседние линии)
-            seg_mask_box = cv2.bitwise_and(dilated_ink, cv2.bitwise_or(dark_ink, white_bg))
+            seg_mask_box = cv2.dilate(dark_ink, kernel_3, iterations=4)
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_box
             mask_refined[~user_mask_bool] = 0
             
         if np.sum(mask_refined > 0) < 5:
             kernel_3 = np.ones((3, 3), np.uint8)
-            mask_refined = cv2.dilate(mask, kernel_3, iterations=1)
+            mask_refined = cv2.dilate(mask, kernel_3, iterations=3)
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
             
@@ -677,7 +674,7 @@ class LamaMPEPyTorchInpainter:
             result = result[:height, :width]
         result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
-        # 3. Мягкое вклеивание
+        # 3. Мягкое вклеивание результата LaMa
         m = (mask_refined > 0).astype(np.float32)[:, :, None]
         m = cv2.GaussianBlur(m, (3, 3), 0)
         if m.ndim == 2:
@@ -685,51 +682,6 @@ class LamaMPEPyTorchInpainter:
             
         ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
         ans = np.clip(ans, 0, 255).astype(np.uint8)
-        
-        # 4. Постобработка: защита чистых белых и черных фонов ("донорная заливка смотрит на тон")
-        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_refined, connectivity=8)
-        
-        for i in range(1, num_labels):
-            x, y, w_c, h_c, area = stats[i]
-            # Находим фон вокруг компоненты текста
-            margin = 8
-            x1 = max(0, x - margin)
-            y1 = max(0, y - margin)
-            x2 = min(width, x + w_c + margin)
-            y2 = min(height, y + h_c + margin)
-            
-            comp_mask = (labels[y1:y2, x1:x2] == i)
-            # Кольцо фона шириной 5 пикселей вокруг текста
-            dilated_comp = cv2.dilate(comp_mask.astype(np.uint8), np.ones((5, 5), np.uint8))
-            bg_ring = (dilated_comp > 0) & (~comp_mask)
-            
-            bg_pixels = gray_orig[y1:y2, x1:x2][bg_ring]
-            if len(bg_pixels) > 0:
-                bg_median = np.median(bg_pixels)
-                # Если фон чистый белый (245+), то LaMa и донорная заливка там не нужны - просто заливаем белым
-                if bg_median >= 245:
-                    ans[y1:y2, x1:x2][comp_mask] = [255, 255, 255]
-                # Если фон чистый черный (<15), заливаем черным
-                elif bg_median <= 15:
-                    ans[y1:y2, x1:x2][comp_mask] = [0, 0, 0]
-                else:
-                    # Это серый тон. Применяем донорную заливку (fast_exemplar_inpaint), если она есть
-                    try:
-                        from fast_exemplar_inpaint import fast_exemplar_inpaint
-                        # Берем только область текущей компоненты для ускорения
-                        crop_ans = ans[y1:y2, x1:x2].copy()
-                        crop_mask = comp_mask.astype(np.uint8) * 255
-                        
-                        gray_lama = cv2.cvtColor(crop_ans, cv2.COLOR_BGR2GRAY)
-                        lama_edges = (gray_lama < 50).astype(np.uint8) * 255
-                        
-                        crop_fixed = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=lama_edges)
-                        # Вклеиваем обратно
-                        ans[y1:y2, x1:x2][comp_mask] = crop_fixed[comp_mask]
-                    except Exception:
-                        pass
-                        
         return ans
 
 
