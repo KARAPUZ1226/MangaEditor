@@ -691,6 +691,10 @@ class LamaMPEPyTorchInpainter:
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
             
+            # Сохраняем отладочные файлы для анализа
+            cv2.imwrite("debug_crop_gray.png", crop_gray)
+            cv2.imwrite("debug_mask_refined.png", mask_refined)
+            
         if np.sum(mask_refined > 0) < 5:
             kernel_3 = np.ones((3, 3), np.uint8)
             mask_refined = cv2.dilate(mask, kernel_3, iterations=3)
