@@ -812,10 +812,16 @@ class LamaMPEPyTorchInpainter:
                 
                 crop_filled = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=crop_donor)
                 
-                # Прямая точечная замена пикселей туши на скринтон (без feather-размытия),
-                # чтобы не было серых мыльных ореолов на границах букв
-                screentone_bool = (crop_mask > 0)
-                crop_ans[screentone_bool] = crop_filled[screentone_bool]
+                # Применяем донорную заливку ТОЛЬКО на областях серого скринтона (<220),
+                # полностью защищая белый цвет одежды/меха (LaMa) и черные линии лайн-арта!
+                gray_crop_ans = cv2.cvtColor(crop_ans, cv2.COLOR_BGR2GRAY)
+                gray_crop_orig = cv2.cvtColor(img_original[y_min_pad:y_max_pad, x_min_pad:x_max_pad], cv2.COLOR_BGR2GRAY)
+                
+                is_grey_screentone = (gray_crop_ans < 220) | (gray_crop_orig < 220)
+                is_not_black_line = (gray_crop_orig > 60)
+                
+                donor_apply_mask = (crop_mask > 0) & is_grey_screentone & is_not_black_line
+                crop_ans[donor_apply_mask] = crop_filled[donor_apply_mask]
                 ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_ans
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")

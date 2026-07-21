@@ -168,7 +168,8 @@ def fast_exemplar_inpaint(image, mask, edges_mask=None, screentone_threshold=3.0
 
     # 1. Ищем период скринтона
     dy, dx, strength = detect_period_fft(gray, mask)
-    has_screentone = strength > screentone_threshold
+    period_len = np.sqrt(dy**2 + dx**2)
+    has_screentone = (strength > screentone_threshold) and (2.5 <= period_len <= 10.0)
 
     # 2. Подготовка маски
     fill_mask = (mask > 0)
