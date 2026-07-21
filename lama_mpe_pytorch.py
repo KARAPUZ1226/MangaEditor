@@ -814,13 +814,19 @@ class LamaMPEPyTorchInpainter:
                 
                 crop_filled = fast_exemplar_inpaint(crop_orig, crop_mask, edges_mask=crop_donor)
                 
-                # Применяем донорную заливку ТОЛЬКО на областях серого скринтона (<220),
-                # полностью защищая белый цвет одежды/меха (LaMa) и черные линии лайн-арта!
+                # Математический детектор микро-структуры скринтона (дисперсия + яркость)
                 gray_crop_orig = cv2.cvtColor(crop_orig, cv2.COLOR_BGR2GRAY)
-                is_grey_screentone = (gray_crop_orig < 220)
-                is_not_black_line = (gray_crop_orig > 60)
+                k_size = 15
+                mean_bg = cv2.boxFilter(gray_crop_orig.astype(np.float32), -1, (k_size, k_size))
+                sqr_mean_bg = cv2.boxFilter((gray_crop_orig.astype(np.float32))**2, -1, (k_size, k_size))
+                std_dev_bg = np.sqrt(np.maximum(0, sqr_mean_bg - mean_bg**2))
                 
-                donor_apply_mask = (crop_mask > 0) & is_grey_screentone & is_not_black_line
+                # Карта растровой текстуры скринтона: высокая микро-дисперсия (std_dev > 10) AND серый тон (100..230)
+                is_screentone_pixel_map = (std_dev_bg > 10.0) & (mean_bg >= 100.0) & (mean_bg <= 230.0)
+                k_15 = np.ones((15, 15), np.uint8)
+                screentone_region_map = cv2.dilate(is_screentone_pixel_map.astype(np.uint8), k_15) > 0
+                
+                donor_apply_mask = (crop_mask > 0) & screentone_region_map
                 crop_ans[donor_apply_mask] = crop_filled[donor_apply_mask]
                 ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_ans
         except Exception as e:
