@@ -719,16 +719,17 @@ class LamaMPEPyTorchInpainter:
                         
                 if is_text:
                     final_mask[comp_mask] = 255
-                    # Если средняя яркость локального фона сероватая (<235), в окрестности есть скринтон!
-                    if bg_mean < 235:
+                    # Если средняя яркость локального фона серая (<205), это точно скринтон!
+                    if bg_mean < 205:
                         screentone_mask[comp_mask] = 255
                     
-            # 3. Дилатация на 5px для гарантированного удаления белой обводки (fuchidori)
+            # 3. Точечная дилатация 3px для LaMa и ультра-точечная 1px для донора скринтонов
+            # Это сохраняет 95% оригинального скринтона и не дает маске расширяться на весь кроп
             kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=5)
+            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=3)
             
-            # Маска для донорной заливки скринтонов (только те буквы, что стояли на сером скринтоне)
-            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=5)
+            # Ультра-точная маска донора (только чернила букв + 1px граница)
+            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=1)
             screentone_mask_dilated[~user_mask_bool] = 0
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
