@@ -688,7 +688,7 @@ class LamaMPEPyTorchInpainter:
             edges_box = np.zeros_like(dark_ink)
             for i in range(1, num_labels):
                 x_c, y_c, w_c, h_c, area = stats[i]
-                if area < 6:
+                if area < 4:
                     continue
                     
                 comp_mask = (labels == i)
@@ -710,7 +710,7 @@ class LamaMPEPyTorchInpainter:
                 p35 = np.percentile(nb_gray, 35)
                 bg_mean_comp = np.mean(nb_gray)
                 
-                # 1. Защита пуговиц и элементов одежды на чистой белой рубашке/бумаге (bg_mean >= 238)
+                # 1. Защита элементов одежды на чистой белой рубашке/бумаге (bg_mean >= 238)
                 if bg_mean_comp >= 238.0 and not np.any(seg_mask_box[comp_mask] > 0):
                     edges_box[comp_mask] = 255
                     continue
@@ -726,12 +726,10 @@ class LamaMPEPyTorchInpainter:
                 if p35 < 210 or bg_mean_comp < 225:
                     screentone_mask[comp_mask] = 255
                     
-            # 3. Дилатация на 4px для полного стирания туши букв И широкой белой обводки (fuchidori)
+            # 4. Дилатация туши букв на 6px для ПОЛНОГО поглощения белой обводки (fuchidori) вокруг каждого символа!
             kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=4)
-            
-            # Маска донора скринтонов (тушь букв + белая обводка fuchidori, 4px дилатация)
-            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=4)
+            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=6)
+            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=6)
             screentone_mask_dilated[~user_mask_bool] = 0
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
