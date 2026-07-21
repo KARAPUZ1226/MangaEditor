@@ -750,6 +750,16 @@ class LamaMPEPyTorchInpainter:
         if qc_fail_count > 0:
             print(f"[LaMa Pipeline v2 QC] {qc_fail_count} px отмечены для внимания QC.")
             
+        # --- DEBUG CHECKLIST ---
+        print("[DEBUG MASK] mask dtype:", crop_mask_dilated.dtype, "unique values:", np.unique(crop_mask_dilated))
+        print("[DEBUG MASK] mask sum (pixels marked):", np.count_nonzero(crop_mask_dilated > 0), "/ total:", crop_mask_dilated.size)
+        print("[DEBUG MASK] crop shape:", crop_image.shape, "mask shape:", crop_mask_dilated.shape)
+
+        diff_outside_dbg = np.abs(crop_ans.astype(int) - crop_image.astype(int))
+        diff_outside_dbg[crop_mask_dilated > 0] = 0
+        print("[DEBUG MASK] MAX diff OUTSIDE mask (должно быть 0!):", diff_outside_dbg.max())
+        print("[DEBUG MASK] Pixels changed outside mask:", (diff_outside_dbg > 0).sum())
+
         # Строгое ограничение: замена ТОЛЬКО пикселей внутри dilated U-Net mask
         outside_mask_crop = (crop_mask_dilated == 0)
         crop_ans[outside_mask_crop] = crop_image[outside_mask_crop]

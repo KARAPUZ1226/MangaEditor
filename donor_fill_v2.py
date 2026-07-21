@@ -40,16 +40,31 @@ def feather_blend_patch(target: np.ndarray, donor: np.ndarray, mask: np.ndarray,
 
 def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 15) -> bool:
     """
-    Проверяет: если окружение дырки однородное (низкая дисперсия <= 8.0) —
-    донор не нужен, оставить чистый результат LaMa.
-    Если окружение текстурное (высокая дисперсия > 8.0) — донор нужен.
+    Классифицирует тип региона:
+    1. Однородный / белая одежда (ring_std <= 8.0) -> donor НЕ нужен (оставить LaMa).
+    2. Градиентные складки платья / тени (fold shading, p95 - p5 > 45.0) -> donor НЕ нужен (доверяем LaMa с контекстом!).
+    3. Повторяющийся растровый скринтон (flat halftone dots) -> donor нужен.
     """
     k_ring = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1))
     ring = (cv2.dilate((mask > 0).astype(np.uint8), k_ring) > 0) & (mask == 0)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     ring_pixels = gray[ring]
-    ring_std = float(ring_pixels.std()) if ring_pixels.size > 0 else 0.0
-    return ring_std > 8.0
+    
+    if ring_pixels.size == 0:
+        return False
+        
+    ring_std = float(ring_pixels.std())
+    if ring_std <= 8.0:
+        return False
+        
+    # Проверка на градиентные складки платья (gradient fold shading)
+    p5 = float(np.percentile(ring_pixels, 5))
+    p95 = float(np.percentile(ring_pixels, 95))
+    if (p95 - p5) > 45.0:
+        print("[Donor Classifier] Обнаружена градиентная складка платья/тени (fold shading). Передаем 100% контроля LaMa!")
+        return False
+        
+    return True
 
 
 def patch_density(patch: np.ndarray, thresh: int = 128) -> float:
