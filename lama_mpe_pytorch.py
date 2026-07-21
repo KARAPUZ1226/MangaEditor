@@ -647,14 +647,30 @@ class LamaMPEPyTorchInpainter:
             seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
             if self.segmenter is not None and box_h >= 8 and box_w >= 8:
                 try:
-                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
-                    outputs = self.segmenter.run(None, {"input": inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    
-                    seg_256 = (probs > 0.08).astype(np.uint8) * 255
-                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                    inp_info = self.segmenter.get_inputs()[0]
+                    inp_name = inp_info.name
+                    if inp_name == "input":
+                        crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
+                        inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
+                        outputs = self.segmenter.run(None, {inp_name: inp})
+                        logits = outputs[0][0, 0]
+                        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                        seg_256 = (probs > 0.08).astype(np.uint8) * 255
+                        seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+                    elif inp_name == "images":
+                        crop_640 = cv2.resize(cv2.cvtColor(crop_gray, cv2.COLOR_GRAY2BGR), (640, 640), interpolation=cv2.INTER_AREA)
+                        inp = (crop_640.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
+                        outputs = self.segmenter.run(None, {inp_name: inp})
+                        out0 = outputs[0][0]
+                        boxes = out0[:4, :]
+                        scores = out0[4, :]
+                        for idx in np.where(scores > 0.15)[0]:
+                            xc, yc, bw, bh = boxes[:, idx]
+                            x1 = int((xc - bw/2) * box_w / 640.0)
+                            y1 = int((yc - bh/2) * box_h / 640.0)
+                            x2 = int((xc + bw/2) * box_w / 640.0)
+                            y2 = int((yc + bh/2) * box_h / 640.0)
+                            cv2.rectangle(seg_mask_box, (max(0, x1), max(0, y1)), (min(box_w, x2), min(box_h, y2)), 255, -1)
                 except Exception as e:
                     print(f"[LaMa] Segmenter error: {e}")
                     
@@ -758,19 +774,14 @@ class LamaMPEPyTorchInpainter:
             img_t *= (1 - mask_t)
             out = self.model(img_t, mask_t).to(torch.float32)
             result = (out.cpu().squeeze(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
-            
         if pad_h > 0 or pad_w > 0:
             result = result[:height, :width]
         result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
-        # 3. Мягкое вклеивание результата LaMa
-        m = (mask_refined > 0).astype(np.float32)[:, :, None]
-        m = cv2.GaussianBlur(m, (3, 3), 0)
-        if m.ndim == 2:
-            m = m[:, :, None]
-            
-        ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
-        ans = np.clip(ans, 0, 255).astype(np.uint8)
+        # 4. Прямое затирание и наложение результатов LaMa (без размытия оригинала!)
+        ans = image.copy()
+        erase_indices = (mask_refined > 0)
+        ans[erase_indices] = result[erase_indices]
         
         # 4. Донорная заливка (fast_exemplar_inpaint) - запускается ТОЛЬКО для областей серого скринтона!
         # Это защищает белые и черные области от случайного наложения текстур и артефактов.
