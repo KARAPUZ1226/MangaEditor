@@ -792,8 +792,9 @@ class LamaMPEPyTorchInpainter:
             if np.sum(screentone_mask_dilated > 0) > 5:
                 from fast_exemplar_inpaint import fast_exemplar_inpaint
                 
-                # Выделяем только крупные оригинальные темные контуры рисунка (линии кадра, волос, одежды),
-                # чтобы донор не копировал их как текстуру, но при этом игнорируем мелкие точки скринтона (area < 10)
+                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                dark_orig = (gray_orig < 120).astype(np.uint8) * 255
+                
                 # Эрозия темных чернил для отсечения тонких линий эффектов и штриховки, с сохранением толстых линий (воротник, рамы)
                 eroded_dark = cv2.erode(dark_orig, kernel_3, iterations=1)
                 num_labels_e, labels_e, stats_e, _ = cv2.connectedComponentsWithStats(eroded_dark, connectivity=8)
