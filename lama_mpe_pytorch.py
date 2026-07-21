@@ -805,19 +805,19 @@ class LamaMPEPyTorchInpainter:
                         donor_edges[labels_e == i] = 255
                 donor_edges = cv2.dilate(donor_edges, kernel_3, iterations=1)
                 
-                # Запускаем донорную заливку локально в расширенной области для идеального поиска периода скринтона
-                crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+                # Запускаем донорную заливку локально в расширенной области.
+                # ВАЖНО: передаем crop_orig (оригинальное изображение с настоящими точками скринтона!),
+                # а НЕ crop_ans (где LaMa уже размыла фон в мыльный серый цвет).
+                crop_orig = img_original[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 crop_mask = screentone_mask_dilated[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 
-                crop_filled = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=crop_donor)
+                crop_filled = fast_exemplar_inpaint(crop_orig, crop_mask, edges_mask=crop_donor)
                 
                 # Применяем донорную заливку ТОЛЬКО на областях серого скринтона (<220),
                 # полностью защищая белый цвет одежды/меха (LaMa) и черные линии лайн-арта!
-                gray_crop_ans = cv2.cvtColor(crop_ans, cv2.COLOR_BGR2GRAY)
-                gray_crop_orig = cv2.cvtColor(img_original[y_min_pad:y_max_pad, x_min_pad:x_max_pad], cv2.COLOR_BGR2GRAY)
-                
-                is_grey_screentone = (gray_crop_ans < 220) | (gray_crop_orig < 220)
+                gray_crop_orig = cv2.cvtColor(crop_orig, cv2.COLOR_BGR2GRAY)
+                is_grey_screentone = (gray_crop_orig < 220)
                 is_not_black_line = (gray_crop_orig > 60)
                 
                 donor_apply_mask = (crop_mask > 0) & is_grey_screentone & is_not_black_line
