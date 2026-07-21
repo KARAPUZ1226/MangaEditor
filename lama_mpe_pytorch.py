@@ -626,6 +626,7 @@ class LamaMPEPyTorchInpainter:
         
         mask_refined = np.zeros((height, width), dtype=np.uint8)
         edges_mask = np.zeros((height, width), dtype=np.uint8)
+        screentone_mask_dilated = np.zeros((height, width), dtype=np.uint8)
         
         y_min_pad, y_max_pad, x_min_pad, x_max_pad = 0, height, 0, width
         
