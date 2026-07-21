@@ -793,14 +793,15 @@ class LamaMPEPyTorchInpainter:
                 
                 # Выделяем только крупные оригинальные темные контуры рисунка (линии кадра, волос, одежды),
                 # чтобы донор не копировал их как текстуру, но при этом игнорируем мелкие точки скринтона (area < 10)
-                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-                dark_orig = (gray_orig < 120).astype(np.uint8) * 255
-                num_labels_or, labels_or, stats_or, _ = cv2.connectedComponentsWithStats(dark_orig, connectivity=8)
+                # Эрозия темных чернил для отсечения тонких линий эффектов и штриховки, с сохранением толстых линий (воротник, рамы)
+                eroded_dark = cv2.erode(dark_orig, kernel_3, iterations=1)
+                num_labels_e, labels_e, stats_e, _ = cv2.connectedComponentsWithStats(eroded_dark, connectivity=8)
                 
                 donor_edges = np.zeros_like(dark_orig)
-                for i in range(1, num_labels_or):
-                    if stats_or[i, cv2.CC_STAT_AREA] >= 150:
-                        donor_edges[labels_or == i] = 255
+                for i in range(1, num_labels_e):
+                    if stats_e[i, cv2.CC_STAT_AREA] >= 15:
+                        donor_edges[labels_e == i] = 255
+                donor_edges = cv2.dilate(donor_edges, kernel_3, iterations=1)
                 
                 # Запускаем донорную заливку локально в расширенной области для идеального поиска периода скринтона
                 crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
