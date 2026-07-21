@@ -660,22 +660,21 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] U-Net error: {e}")
                 
-        # Темные чернила букв
-        dark_ink = (crop_gray < 130).astype(np.uint8) * 255
+        # Темные чернила букв + полутоновые антиалиасинговые края (<185)
+        dark_ink = (crop_gray < 185).astype(np.uint8) * 255
         
         # Объединяем U-Net детекцию с компонентами чернил
         if np.count_nonzero(seg_mask_box) > 10:
-            combined_text_ink = cv2.bitwise_or(dark_text_mask := (dark_ink & seg_mask_box), dark_ink)
+            combined_text_ink = cv2.bitwise_or(dark_ink & seg_mask_box, dark_ink)
         else:
             combined_text_ink = dark_ink
             
-        # Дилатация на 9px полностью перекрывает белую обводку Fuchidori
+        # Дилатация на 12px полностью поглощает всю белую обводку Fuchidori
         kernel_3 = np.ones((3, 3), np.uint8)
-        text_mask_crop = cv2.dilate(combined_text_ink, kernel_3, iterations=9)
+        text_mask_crop = cv2.dilate(combined_text_ink, kernel_3, iterations=12)
         
         text_mask_full = np.zeros((height, width), dtype=np.uint8)
         text_mask_full[y_min:y_max, x_min:x_max] = text_mask_crop
-        text_mask_full[~user_mask_bool] = 0
         
         if np.sum(text_mask_full > 0) < 5:
             text_mask_full = cv2.dilate(mask, kernel_3, iterations=3)
