@@ -673,6 +673,7 @@ class LamaMPEPyTorchInpainter:
                     continue
                 comp_mask = (labels == i)
                 if np.any(final_mask[comp_mask] > 0):
+                    final_mask[comp_mask] = 255
                     continue
                 cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
                 margin = 35
