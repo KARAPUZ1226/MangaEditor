@@ -682,6 +682,7 @@ class LamaMPEPyTorchInpainter:
                     continue
                 
                 # Считаем яркость локального фона вокруг компонента в ПОЛНОМ изображении (с учетом +128px контекста)!
+                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
                 gray_full = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
                 cy_orig = y_min + cy_i
                 cx_orig = x_min + cx_i
