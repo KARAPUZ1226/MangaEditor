@@ -699,12 +699,17 @@ class LamaMPEPyTorchInpainter:
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
                 survived_erosion = np.any(eroded_ink[comp_mask] > 0)
                 solidity = area / (w_c * h_c)
+                aspect_ratio = max(w_c, h_c) / (min(w_c, h_c) + 1e-3)
                 
                 is_unet = np.any(seg_mask_box[comp_mask] > 0)
                 
                 is_text = False
                 if is_unet:
-                    is_text = True
+                    # Игнорируем складки одежды, штриховку и мех, даже если U-Net задел их
+                    if (solidity < 0.22 and min(w_c, h_c) > 5) or (aspect_ratio > 4.5 and area > 120):
+                        pass
+                    else:
+                        is_text = True
                 elif bg_val >= 200 and is_char_sized:
                     # Динамическая проверка плотности: убираем только крупные некомпактные объекты (линии)
                     if area > 80 and solidity < 0.28:
