@@ -617,12 +617,19 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Точный пайплайн очистки манги:
-        1. U-Net сегментирует японские символы + дилатация 9px для белой обводки
-        2. LaMa inpainting с контекстом +128px за кадром восстанавливает структуру и фон
-        3. Донорная заливка (fast_exemplar_inpaint) применяется ИСКЛЮЧИТЕЛЬНО на пикселях растрового скринтона
-           (белая одежда, черный лайн-арт и гладкий фон на 100% защищены и берутся чистыми из LaMa/оригинала)
         """
+        Manga Text Removal Pipeline v2 (7 шагов спецификации):
+        1. U-Net / Ink segmentation (M_text_raw) + Dilation (M_text_dilated)
+        2. Bbox crop + padding (1.5x, max_size 512px)
+        3. LaMa Inpaint (per-crop)
+        4. Детектор провала LaMa (M_fail по variance и Sobel углу градиентов)
+        5. Orientation-Aware Donor-Fill (на M_fail с запретом M_text_raw)
+        6. Blending (feather alpha)
+        7. QC-контроль результатов
+        """
+        from failure_detector import detect_lama_failures
+        from donor_fill_v2 import orientation_aware_donor_fill
+        
         img_original = np.copy(image)
         height, width = image.shape[:2]
         
@@ -635,22 +642,15 @@ class LamaMPEPyTorchInpainter:
         x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
         box_h, box_w = y_max - y_min, x_max - x_min
         
-        # Расширяем область за кадром на +128px во все стороны для контекста LaMa и донора
-        y_min_pad = max(0, y_min - 128)
-        y_max_pad = min(height, y_max + 128)
-        x_min_pad = max(0, x_min - 128)
-        x_max_pad = min(width, x_max + 128)
-        
-        crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-        
-        # --- 1. U-Net Сегментатор японского текста + Детекция чернил ---
+        # --- ШАГ 1: U-Net маска (M_text_raw и M_text_dilated) ---
         seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
         if self.segmenter is not None and box_h >= 8 and box_w >= 8:
             try:
+                crop_gray_u = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
                 inp_info = self.segmenter.get_inputs()[0]
                 inp_name = inp_info.name
                 if inp_name == "input":
-                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
+                    crop_256 = cv2.resize(crop_gray_u, (256, 256), interpolation=cv2.INTER_AREA)
                     inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
                     outputs = self.segmenter.run(None, {inp_name: inp})
                     logits = outputs[0][0, 0]
@@ -658,46 +658,57 @@ class LamaMPEPyTorchInpainter:
                     seg_256 = (probs > 0.08).astype(np.uint8) * 255
                     seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
             except Exception as e:
-                print(f"[LaMa] U-Net error: {e}")
+                print(f"[LaMa] U-Net segmenter error: {e}")
                 
-        # Темные чернила букв + полутоновые антиалиасинговые края (<185)
+        crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
         dark_ink = (crop_gray < 185).astype(np.uint8) * 255
         
-        # Объединяем U-Net детекцию с компонентами чернил
         if np.count_nonzero(seg_mask_box) > 10:
             combined_text_ink = cv2.bitwise_or(dark_ink & seg_mask_box, dark_ink)
         else:
             combined_text_ink = dark_ink
             
-        # Дилатация на 12px полностью поглощает всю белую обводку Fuchidori
+        # Недилатированная сырая маска текста (M_text_raw) — запретная зона для донора
+        raw_mask_crop = combined_text_ink.copy()
+        raw_mask_full = np.zeros((height, width), dtype=np.uint8)
+        raw_mask_full[y_min:y_max, x_min:x_max] = raw_mask_crop
+        
+        # Дилатированная маска текста (M_text_dilated) на 10px для поглощения Fuchidori
         kernel_3 = np.ones((3, 3), np.uint8)
-        text_mask_crop = cv2.dilate(combined_text_ink, kernel_3, iterations=12)
+        dilated_mask_crop = cv2.dilate(combined_text_ink, kernel_3, iterations=10)
+        dilated_mask_full = np.zeros((height, width), dtype=np.uint8)
+        dilated_mask_full[y_min:y_max, x_min:x_max] = dilated_mask_crop
         
-        text_mask_full = np.zeros((height, width), dtype=np.uint8)
-        text_mask_full[y_min:y_max, x_min:x_max] = text_mask_crop
-        
-        if np.sum(text_mask_full > 0) < 5:
-            text_mask_full = cv2.dilate(mask, kernel_3, iterations=3)
-            text_mask_full[text_mask_full < 127] = 0
-            text_mask_full[text_mask_full >= 127] = 255
+        if np.sum(dilated_mask_full > 0) < 5:
+            dilated_mask_full = cv2.dilate(mask, kernel_3, iterations=3)
+            dilated_mask_full[dilated_mask_full < 127] = 0
+            dilated_mask_full[dilated_mask_full >= 127] = 255
             
-        user_mask = text_mask_full
+        # --- ШАГ 2: Кроп с контекстом padding = 1.5x (до 512px) ---
+        pad_extra = int(max(box_w, box_h) * 0.5)
+        pad_extra = max(64, min(128, pad_extra))
         
-        # --- 2. LaMa Inpainting на расширенном кропе за кадром ---
+        y_min_pad = max(0, y_min - pad_extra)
+        y_max_pad = min(height, y_max + pad_extra)
+        x_min_pad = max(0, x_min - pad_extra)
+        x_max_pad = min(width, x_max + pad_extra)
+        
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-        crop_mask = user_mask[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+        crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+        crop_mask_raw = raw_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         c_h, c_w = crop_image.shape[:2]
         
+        # --- ШАГ 3: LaMa Inpaint проход ---
         pad_h = (8 - c_h % 8) % 8
         pad_w = (8 - c_w % 8) % 8
         image_rgb = cv2.cvtColor(crop_image, cv2.COLOR_BGR2RGB)
         
         if pad_h > 0 or pad_w > 0:
             image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-            mask_padded = cv2.copyMakeBorder(crop_mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            mask_padded = cv2.copyMakeBorder(crop_mask_dilated, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
             image_padded = image_rgb
-            mask_padded = crop_mask
+            mask_padded = crop_mask_dilated
             
         img_t = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze(0).float().div_(255.).to(self.device)
         mask_t = torch.from_numpy(mask_padded).unsqueeze(0).unsqueeze(0).float().div_(255.).to(self.device)
@@ -711,65 +722,27 @@ class LamaMPEPyTorchInpainter:
             result = result[:c_h, :c_w]
         crop_lama_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
-        ans = image.copy()
         crop_ans = crop_image.copy()
-        erase_mask_crop = (crop_mask > 0)
+        erase_mask_crop = (crop_mask_dilated > 0)
         crop_ans[erase_mask_crop] = crop_lama_bgr[erase_mask_crop]
         
-        # --- 3. Точечная донорная заливка скринтона (fast_exemplar_inpaint) ---
-        # Применяется ТОЛЬКО там, где действительно есть серый скринтон (100..220) с микро-дисперсией (std > 8).
-        # Белая одежда (>220), чистый белый фон и черные контуры берутся 100% из чистой LaMa!
-        try:
-            gray_orig_crop = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            
-            k = 15
-            mean_bg = cv2.boxFilter(gray_orig_crop, -1, (k, k))
-            sqr_mean = cv2.boxFilter(gray_orig_crop**2, -1, (k, k))
-            std_dev = np.sqrt(np.maximum(0, sqr_mean - mean_bg**2))
-            
-            # Карта серого растрового скринтона
-            is_screentone = (std_dev > 8.0) & (mean_bg >= 100.0) & (mean_bg <= 220.0)
-            
-            if np.sum(is_screentone & erase_mask_crop) > 10:
-                from fast_exemplar_inpaint import fast_exemplar_inpaint
-                
-                # Донорные линии защищают толстые контуры от копирования
-                dark_orig = (gray_orig_crop < 100).astype(np.uint8) * 255
-                donor_edges = cv2.erode(dark_orig, kernel_3, iterations=1)
-                
-                crop_filled = fast_exemplar_inpaint(crop_image, crop_mask, edges_mask=donor_edges, fallback_image=crop_ans)
-                
-                # Заливаем донорской текстурой ТОЛЬКО маску букв и ТОЛЬКО в области растра
-                k_15 = np.ones((15, 15), np.uint8)
-                screentone_region = cv2.dilate(is_screentone.astype(np.uint8), k_15) > 0
-                
-                donor_apply_mask = erase_mask_crop & screentone_region
-                crop_ans[donor_apply_mask] = crop_filled[donor_apply_mask]
-        except Exception as e:
-            print(f"[LaMa] Screentone donor error: {e}")
-            
-        # --- 4. Восстановление оригинального лайн-арта рисунка (рамки кадра, складки) ---
-        crop_orig_gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
-        dark_ink = (crop_orig_gray < 100).astype(np.uint8) * 255
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+        # --- ШАГ 4: Детектор провала LaMa (M_fail) ---
+        M_fail_crop = detect_lama_failures(crop_ans, crop_mask_dilated, patch_size=16, ring_width=20)
         
-        restore_mask_crop = np.zeros_like(dark_ink)
-        for i in range(1, num_labels):
-            x_c, y_c, w_c, h_c, area = stats[i]
-            if area < 10:
-                continue
-            touches_border = (x_c <= 2) or (y_c <= 2) or (x_c + w_c >= c_w - 2) or (y_c + h_c >= c_h - 2)
-            if not touches_border:
-                continue
-            is_panel_line = (min(w_c, h_c) <= 8) and (w_c >= c_w * 0.8 or h_c >= c_h * 0.8)
-            if is_panel_line:
-                restore_mask_crop[labels == i] = 255
-                
-        if np.any(restore_mask_crop > 0):
-            crop_ans[restore_mask_crop > 0] = crop_image[restore_mask_crop > 0]
+        # --- ШАГИ 5 и 6: Orientation-Aware Donor Fill & Blending ---
+        if np.any(M_fail_crop > 0):
+            crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, M_fail_crop, crop_mask_raw)
             
+        # --- ШАГ 7: QC Проверка качественного результата ---
+        M_fail_qc = detect_lama_failures(crop_ans, crop_mask_dilated, patch_size=16, ring_width=20)
+        qc_fail_count = np.count_nonzero(M_fail_qc)
+        if qc_fail_count > 0:
+            print(f"[LaMa Pipeline v2 QC] {qc_fail_count} px отмечены для внимания QC.")
+            
+        ans = image.copy()
         ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_ans
         return ans
+
 
 
 
