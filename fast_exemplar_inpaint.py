@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 
 
-def detect_period_fft(gray, mask, sub_size=256, search_half=16):
+def detect_period_fft(gray, mask, sub_size=256, search_half=5):
     """
     Находит период скринтона через FFT на окрестностях вне маски.
     Возвращает (dy, dx, strength) или (0, 0, 0).
