@@ -690,10 +690,11 @@ class LamaMPEPyTorchInpainter:
                 bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
                 
-                # Объект должен быть размера символа и пережить эрозию (то есть быть толще тонкой линии)
+                # Объект должен быть размера символа, пережить эрозию и быть достаточно компактным (не тонкой линией)
                 survived_erosion = np.any(eroded_ink[comp_mask] > 0)
+                solidity = area / (w_c * h_c)
                 
-                if bg_val >= 200 and is_char_sized and survived_erosion:
+                if bg_val >= 200 and is_char_sized and survived_erosion and solidity >= 0.28:
                     final_mask[comp_mask] = 255
                     
             # 3. Дилатация 4px для полного покрытия белой обводки текста (fuchidori)
