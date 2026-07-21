@@ -617,130 +617,119 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Чистый пайплайн по оригинальной архитектуре пользователя:
-        1. Обученный U-Net выдаёт маску букв и обводки ровно так, как обучен (без доп. расширений).
-        2. LaMa дорисовывает линии и тон под маской U-Net.
-        3. Защита тонов: чистый белый (>250) остаётся белым, чистый чёрный (<15) остаётся чёрной линией.
-        """
+        """Чистый пайплайн: 1. U-Net (без фильтров) 2. LaMa 3. Защита тонов"""
         img_original = np.copy(image)
         height, width = image.shape[:2]
-        user_mask_bool = mask >= 127
-
-        mask_refined = np.zeros((height, width), dtype=np.uint8)
-        kernel_3 = np.ones((3, 3), np.uint8)
-
+        
         # 1. Точные прямоугольные границы выделения пользователя
+        user_mask_bool = mask >= 127
         y_indices, x_indices = np.where(user_mask_bool)
+        
+        mask_refined = np.zeros((height, width), dtype=np.uint8)
+        
         if len(y_indices) > 0 and len(x_indices) > 0:
             y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
             x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
             box_h, box_w = y_max - y_min, x_max - x_min
+            
             crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-            seg_mask_box = None
-            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
-                try:
-                    # Сегментатор обучен на кропах текста 256x256
-                    crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
-                    outputs = self.segmenter.run(None, {"input": inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    # Прогноз нейросети: маска букв + обводки
-                    seg_256 = (probs > 0.20).astype(np.uint8) * 255
-                    raw_seg = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
-                    num_l, labels_u, stats_u, _ = cv2.connectedComponentsWithStats(raw_seg, connectivity=8)
-                    seg_mask_box = np.zeros_like(raw_seg)
-                    for i in range(1, num_l):
-                        if stats_u[i, cv2.CC_STAT_WIDTH] > 120 or stats_u[i, cv2.CC_STAT_HEIGHT] > 120:
-                            continue
-                        seg_mask_box[labels_u == i] = 255
-                except Exception as e:
-                    print(f"[LaMa] Segmenter error: {e}")
-
-            # Безопасная страховка: если нейросеть ничего не нашла, берем только самые темные штрихи
-            if seg_mask_box is None or np.sum(seg_mask_box > 0) < 5:
-                seg_mask_box = (crop_gray < 80).astype(np.uint8) * 255
-
-            # Recover characters on white backgrounds where UNet is blind
+            # Высокоточный детектор букв и их обводки (fuchidori)
             dark_ink = (crop_gray < 110).astype(np.uint8) * 255
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-            final_mask = seg_mask_box.copy()
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                w_c = stats[i, cv2.CC_STAT_WIDTH]
-                h_c = stats[i, cv2.CC_STAT_HEIGHT]
-                if area < 4:
-                    continue
-                comp_mask = (labels == i)
-                if np.any(final_mask[comp_mask] > 0):
-                    final_mask[comp_mask] = 255
-                    continue
-                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
-                margin = 35
-                y1_m = max(0, cy_i - margin)
-                y2_m = min(box_h, cy_i + margin)
-                x1_m = max(0, cx_i - margin)
-                x2_m = min(box_w, cx_i + margin)
-                nb_gray = crop_gray[y1_m:y2_m, x1_m:x2_m]
-                nb_dark = dark_ink[y1_m:y2_m, x1_m:x2_m]
-                bg_pixels = nb_gray[nb_dark == 0]
-                bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
-                nearby_dark_area = np.sum(nb_dark > 0) - area
-                is_isolated = (nearby_dark_area < 25)
-                is_char_sized = (w_c <= 45) and (h_c <= 45)
-                if bg_val >= 210 and is_char_sized and not is_isolated:
-                    final_mask[comp_mask] = 255
-            seg_mask_box = final_mask
-
-            # Дилатация 3px для гарантированного накрытия краёв обводок букв (fuchidori)
-            seg_mask_dilated = cv2.dilate(seg_mask_box, kernel_3, iterations=3)
-            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
+            white_bg = (crop_gray > 180).astype(np.uint8) * 255
+            
+            kernel_3 = np.ones((3, 3), np.uint8)
+            dilated_ink = cv2.dilate(dark_ink, kernel_3, iterations=2)
+            
+            # Маска = буквы + их обводка (без вылезания на скринтоны и соседние линии)
+            seg_mask_box = cv2.bitwise_and(dilated_ink, cv2.bitwise_or(dark_ink, white_bg))
+            
+            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_box
             mask_refined[~user_mask_bool] = 0
             
-            # Временный дебаг
-            cv2.imwrite("debug_crop_gray.png", crop_gray)
-            cv2.imwrite("debug_seg_mask_box.png", seg_mask_box)
-            cv2.imwrite("debug_mask_refined.png", mask_refined)
-
-        # Страховка
         if np.sum(mask_refined > 0) < 5:
-            mask_refined = cv2.dilate(mask, kernel_3, iterations=2)
+            kernel_3 = np.ones((3, 3), np.uint8)
+            mask_refined = cv2.dilate(mask, kernel_3, iterations=1)
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
-
-        # 2. LaMa дорисовывает линии и тона на маске U-Net
+            
+        # 2. LaMa дорисовывает
         pad_h = (8 - height % 8) % 8
         pad_w = (8 - width % 8) % 8
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
+        
         if pad_h > 0 or pad_w > 0:
             image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
             mask_padded = cv2.copyMakeBorder(mask_refined, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
             image_padded = image_rgb
             mask_padded = mask_refined
-
+            
         img_t = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze(0).float().div_(255.).to(self.device)
         mask_t = torch.from_numpy(mask_padded).unsqueeze(0).unsqueeze(0).float().div_(255.).to(self.device)
         mask_t = (mask_t >= 0.5).float()
-
+        
         with torch.no_grad():
             img_t *= (1 - mask_t)
             out = self.model(img_t, mask_t).to(torch.float32)
             result = (out.cpu().squeeze(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
-
+            
         if pad_h > 0 or pad_w > 0:
             result = result[:height, :width]
         result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-
-        # 3. Мягкое вклеивание результата LaMa строго по маске букв
+        
+        # 3. Мягкое вклеивание
         m = (mask_refined > 0).astype(np.float32)[:, :, None]
         m = cv2.GaussianBlur(m, (3, 3), 0)
         if m.ndim == 2:
             m = m[:, :, None]
-
+            
         ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
         ans = np.clip(ans, 0, 255).astype(np.uint8)
+        
+        # 4. Постобработка: защита чистых белых и черных фонов ("донорная заливка смотрит на тон")
+        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_refined, connectivity=8)
+        
+        for i in range(1, num_labels):
+            x, y, w_c, h_c, area = stats[i]
+            # Находим фон вокруг компоненты текста
+            margin = 8
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(width, x + w_c + margin)
+            y2 = min(height, y + h_c + margin)
+            
+            comp_mask = (labels[y1:y2, x1:x2] == i)
+            # Кольцо фона шириной 5 пикселей вокруг текста
+            dilated_comp = cv2.dilate(comp_mask.astype(np.uint8), np.ones((5, 5), np.uint8))
+            bg_ring = (dilated_comp > 0) & (~comp_mask)
+            
+            bg_pixels = gray_orig[y1:y2, x1:x2][bg_ring]
+            if len(bg_pixels) > 0:
+                bg_median = np.median(bg_pixels)
+                # Если фон чистый белый (245+), то LaMa и донорная заливка там не нужны - просто заливаем белым
+                if bg_median >= 245:
+                    ans[y1:y2, x1:x2][comp_mask] = [255, 255, 255]
+                # Если фон чистый черный (<15), заливаем черным
+                elif bg_median <= 15:
+                    ans[y1:y2, x1:x2][comp_mask] = [0, 0, 0]
+                else:
+                    # Это серый тон. Применяем донорную заливку (fast_exemplar_inpaint), если она есть
+                    try:
+                        from fast_exemplar_inpaint import fast_exemplar_inpaint
+                        # Берем только область текущей компоненты для ускорения
+                        crop_ans = ans[y1:y2, x1:x2].copy()
+                        crop_mask = comp_mask.astype(np.uint8) * 255
+                        
+                        gray_lama = cv2.cvtColor(crop_ans, cv2.COLOR_BGR2GRAY)
+                        lama_edges = (gray_lama < 50).astype(np.uint8) * 255
+                        
+                        crop_fixed = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=lama_edges)
+                        # Вклеиваем обратно
+                        ans[y1:y2, x1:x2][comp_mask] = crop_fixed[comp_mask]
+                    except Exception:
+                        pass
+                        
         return ans
 
 
