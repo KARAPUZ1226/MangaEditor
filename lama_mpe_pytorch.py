@@ -617,147 +617,32 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Чистый пайплайн: 1. Детекция букв + обводки (4px дилатация) 2. LaMa inpainting"""
+        """Двухпроходный инпейнт:
+        Проход 1: LaMa стирает ВСЁ внутри маски (гарантия удаления текста)
+        Проход 2: Восстановление структурных линий рисунка из оригинала
+        """
         img_original = np.copy(image)
         height, width = image.shape[:2]
         
-        user_mask_bool = mask >= 127
-        y_indices, x_indices = np.where(user_mask_bool)
+        # --- ПРОХОД 1: Полный инпейнт всей маски ---
+        # Используем маску пользователя напрямую — всё что выделено, стираем
+        user_mask = np.zeros((height, width), dtype=np.uint8)
+        user_mask[mask >= 127] = 255
         
-        mask_refined = np.zeros((height, width), dtype=np.uint8)
-        edges_mask = np.zeros((height, width), dtype=np.uint8)
-        screentone_mask_dilated = np.zeros((height, width), dtype=np.uint8)
+        if np.sum(user_mask > 0) < 5:
+            return image
         
-        y_min_pad, y_max_pad, x_min_pad, x_max_pad = 0, height, 0, width
-        
-        if len(y_indices) > 0 and len(x_indices) > 0:
-            y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
-            x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
-            box_h, box_w = y_max - y_min, x_max - x_min
-            
-            # Определяем расширенную область поиска текстуры скринтона (выделение + 128px контекста во все стороны)
-            y_min_pad = max(0, y_min - 128)
-            y_max_pad = min(height, y_max + 128)
-            x_min_pad = max(0, x_min - 128)
-            x_max_pad = min(width, x_max + 128)
-            
-            crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-            
-            # 1. Запуск ИИ-сегментатора U-Net для семантического поиска областей с текстом
-            seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
-            if self.segmenter is not None and box_h >= 8 and box_w >= 8:
-                try:
-                    inp_info = self.segmenter.get_inputs()[0]
-                    inp_name = inp_info.name
-                    if inp_name == "input":
-                        crop_256 = cv2.resize(crop_gray, (256, 256), interpolation=cv2.INTER_AREA)
-                        inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
-                        outputs = self.segmenter.run(None, {inp_name: inp})
-                        logits = outputs[0][0, 0]
-                        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                        seg_256 = (probs > 0.08).astype(np.uint8) * 255
-                        seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
-                    elif inp_name == "images":
-                        crop_640 = cv2.resize(cv2.cvtColor(crop_gray, cv2.COLOR_GRAY2BGR), (640, 640), interpolation=cv2.INTER_AREA)
-                        inp = (crop_640.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
-                        outputs = self.segmenter.run(None, {inp_name: inp})
-                        out0 = outputs[0][0]
-                        boxes = out0[:4, :]
-                        scores = out0[4, :]
-                        for idx in np.where(scores > 0.15)[0]:
-                            xc, yc, bw, bh = boxes[:, idx]
-                            x1 = int((xc - bw/2) * box_w / 640.0)
-                            y1 = int((yc - bh/2) * box_h / 640.0)
-                            x2 = int((xc + bw/2) * box_w / 640.0)
-                            y2 = int((yc + bh/2) * box_h / 640.0)
-                            cv2.rectangle(seg_mask_box, (max(0, x1), max(0, y1)), (min(box_w, x2), min(box_h, y2)), 255, -1)
-                except Exception as e:
-                    print(f"[LaMa] Segmenter error: {e}")
-                    
-            # 2. Выделение связных компонентов темных чернил (<120)
-            dark_ink = (crop_gray < 120).astype(np.uint8) * 255
-            
-            # Эрозия для отсечения тонких линий (рисунка одежды, пуговиц и прочих тонких штрихов)
-            kernel_3 = np.ones((3, 3), np.uint8)
-            eroded_ink = cv2.erode(dark_ink, kernel_3, iterations=1)
-            
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-            
-            final_mask = np.zeros_like(dark_ink)
-            screentone_mask = np.zeros_like(dark_ink)
-            edges_box = np.zeros_like(dark_ink)
-            for i in range(1, num_labels):
-                x_c, y_c, w_c, h_c, area = stats[i]
-                if area < 4:
-                    continue
-                    
-                comp_mask = (labels == i)
-                touches_border = (x_c <= 3) or (y_c <= 3) or (x_c + w_c >= box_w - 3) or (y_c + h_c >= box_h - 3)
-                
-                # Считаем яркость локального фона вокруг компонента в ПОЛНОМ изображении (с учетом +128px контекста)!
-                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
-                gray_full = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-                cy_orig = y_min + cy_i
-                cx_orig = x_min + cx_i
-                
-                margin = 30
-                y1_m = max(0, cy_orig - margin)
-                y2_m = min(height, cy_orig + margin)
-                x1_m = max(0, cx_orig - margin)
-                x2_m = min(width, cx_orig + margin)
-                
-                nb_gray = gray_full[y1_m:y2_m, x1_m:x2_m]
-                p35 = np.percentile(nb_gray, 35)
-                bg_mean_comp = np.mean(nb_gray)
-                
-                # 1. Восстанавливаем только НАСТОЯЩИЕ тонкие (1..6px) рамки кадров манги, касающиеся края
-                is_panel_line = touches_border and (min(w_c, h_c) <= 6) and (w_c >= box_w - 10 or h_c >= box_h - 10)
-                if is_panel_line:
-                    edges_box[comp_mask] = 255
-                    continue
-                
-                # 2. Абсолютно все остальные чернильные компоненты внутри выделения пользователя — ЭТО ТЕКСТ!
-                final_mask[comp_mask] = 255
-                if p35 < 210 or bg_mean_comp < 225:
-                    screentone_mask[comp_mask] = 255
-                    
-            # 4. Дилатация туши букв на 12px для ПОЛНОГО поглощения белой обводки (fuchidori) вокруг каждого символа!
-            kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=12)
-            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=12)
-            screentone_mask_dilated[~user_mask_bool] = 0
-            
-            mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
-            mask_refined[~user_mask_bool] = 0
-
-            # Восстановление только истинных рамок кадра (min(w,h) <= 6)
-            edges_mask[y_min:y_max, x_min:x_max] = edges_box
-            edges_mask[~user_mask_bool] = 0
-            edges_mask[~user_mask_bool] = 0
-            
-            # Сохраняем отладочные файлы для анализа
-            cv2.imwrite("debug_crop_gray.png", crop_gray)
-            cv2.imwrite("debug_mask_refined.png", mask_refined)
-            
-        if np.sum(mask_refined > 0) < 5:
-            kernel_3 = np.ones((3, 3), np.uint8)
-            mask_refined = cv2.dilate(mask, kernel_3, iterations=3)
-            mask_refined[mask_refined < 127] = 0
-            mask_refined[mask_refined >= 127] = 255
-            edges_mask = np.zeros_like(mask_refined)
-            screentone_mask_dilated = np.zeros_like(mask_refined)
-            
-        # 2. LaMa дорисовывает
+        # Паддинг до кратности 8
         pad_h = (8 - height % 8) % 8
         pad_w = (8 - width % 8) % 8
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         if pad_h > 0 or pad_w > 0:
             image_padded = cv2.copyMakeBorder(image_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-            mask_padded = cv2.copyMakeBorder(mask_refined, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+            mask_padded = cv2.copyMakeBorder(user_mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
         else:
             image_padded = image_rgb
-            mask_padded = mask_refined
+            mask_padded = user_mask
             
         img_t = torch.from_numpy(image_padded).permute(2, 0, 1).unsqueeze(0).float().div_(255.).to(self.device)
         mask_t = torch.from_numpy(mask_padded).unsqueeze(0).unsqueeze(0).float().div_(255.).to(self.device)
@@ -769,65 +654,111 @@ class LamaMPEPyTorchInpainter:
             result = (out.cpu().squeeze(0).permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
         if pad_h > 0 or pad_w > 0:
             result = result[:height, :width]
-        result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+        result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
-        # 4. Прямое затирание и наложение результатов LaMa (без размытия оригинала!)
+        # Вклеиваем результат LaMa в оригинал
         ans = image.copy()
-        erase_indices = (mask_refined > 0)
-        ans[erase_indices] = result[erase_indices]
+        erase_mask = (user_mask > 0)
+        ans[erase_mask] = result_bgr[erase_mask]
         
-        # 4. Донорная заливка (fast_exemplar_inpaint) - запускается ТОЛЬКО для областей серого скринтона!
-        # Это защищает белые и черные области от случайного наложения текстур и артефактов.
+        # --- ПРОХОД 2: Восстановление структурных линий рисунка ---
+        # Находим толстые линии на оригинале (рамки, контуры одежды, складки)
+        # и восстанавливаем их поверх результата LaMa
+        gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+        gray_result = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
+        
+        # Находим bounding box маски для локальной обработки
+        y_indices, x_indices = np.where(erase_mask)
+        if len(y_indices) == 0:
+            return ans
+        y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
+        x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
+        
+        crop_orig_gray = gray_orig[y_min:y_max, x_min:x_max]
+        crop_mask = user_mask[y_min:y_max, x_min:x_max]
+        box_h, box_w = crop_orig_gray.shape
+        
+        # Структурные линии: толстые чёрные линии (рамки панелей, контуры)
+        # которые КАСАЮТСЯ ГРАНИЦ выделения — это не текст, а рисунок
+        dark_ink = (crop_orig_gray < 100).astype(np.uint8) * 255
+        kernel_3 = np.ones((3, 3), np.uint8)
+        
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+        
+        restore_mask_crop = np.zeros_like(dark_ink)
+        for i in range(1, num_labels):
+            x_c, y_c, w_c, h_c, area = stats[i]
+            if area < 10:
+                continue
+            
+            touches_border = (x_c <= 2) or (y_c <= 2) or (x_c + w_c >= box_w - 2) or (y_c + h_c >= box_h - 2)
+            
+            # Восстанавливаем ТОЛЬКО компоненты, которые:
+            # 1. Касаются границы выделения (т.е. продолжаются за пределы выделения = часть рисунка)
+            # 2. Имеют вытянутую форму (линия, а не буква) ИЛИ очень большую площадь
+            if not touches_border:
+                continue  # Полностью внутри выделения = текст, не восстанавливаем
+            
+            # Линия рамки: тонкая и простирается по всей ширине/высоте
+            is_panel_line = (min(w_c, h_c) <= 8) and (w_c >= box_w * 0.8 or h_c >= box_h * 0.8)
+            
+            # Крупный контурный элемент рисунка: касается 2+ границ
+            borders_touched = sum([
+                x_c <= 2,
+                y_c <= 2,
+                x_c + w_c >= box_w - 2,
+                y_c + h_c >= box_h - 2
+            ])
+            is_drawing_line = borders_touched >= 2 and (min(w_c, h_c) <= 12)
+            
+            if is_panel_line or is_drawing_line:
+                comp_mask = (labels == i)
+                restore_mask_crop[comp_mask] = 255
+        
+        # Восстанавливаем оригинальные пиксели рисунка
+        if np.any(restore_mask_crop > 0):
+            restore_full = np.zeros((height, width), dtype=np.uint8)
+            restore_full[y_min:y_max, x_min:x_max] = restore_mask_crop
+            restore_bool = (restore_full > 0)
+            ans[restore_bool] = img_original[restore_bool]
+        
+        # --- Донорная текстура скринтона (если есть) ---
         try:
-            if np.sum(screentone_mask_dilated > 0) > 5:
+            # Проверяем, есть ли скринтон в окрестности
+            y_pad_min = max(0, y_min - 128)
+            y_pad_max = min(height, y_max + 128)
+            x_pad_min = max(0, x_min - 128)
+            x_pad_max = min(width, x_max + 128)
+            
+            crop_context = img_original[y_pad_min:y_pad_max, x_pad_min:x_pad_max]
+            gray_context = cv2.cvtColor(crop_context, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            
+            k = 15
+            mean_bg = cv2.boxFilter(gray_context, -1, (k, k))
+            sqr_mean = cv2.boxFilter(gray_context**2, -1, (k, k))
+            std_dev = np.sqrt(np.maximum(0, sqr_mean - mean_bg**2))
+            
+            has_screentone = np.mean((std_dev > 10) & (mean_bg >= 100) & (mean_bg <= 230)) > 0.05
+            
+            if has_screentone:
                 from fast_exemplar_inpaint import fast_exemplar_inpaint
                 
-                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-                dark_orig = (gray_orig < 120).astype(np.uint8) * 255
+                crop_area = ans[y_pad_min:y_pad_max, x_pad_min:x_pad_max]
+                crop_orig_area = img_original[y_pad_min:y_pad_max, x_pad_min:x_pad_max]
+                crop_user_mask = user_mask[y_pad_min:y_pad_max, x_pad_min:x_pad_max]
                 
-                # Эрозия темных чернил для отсечения тонких линий эффектов и штриховки, с сохранением толстых линий (воротник, рамы)
-                eroded_dark = cv2.erode(dark_orig, kernel_3, iterations=1)
-                num_labels_e, labels_e, stats_e, _ = cv2.connectedComponentsWithStats(eroded_dark, connectivity=8)
+                crop_filled = fast_exemplar_inpaint(crop_orig_area, crop_user_mask, fallback_image=crop_area)
                 
-                donor_edges = np.zeros_like(dark_orig)
-                for i in range(1, num_labels_e):
-                    if stats_e[i, cv2.CC_STAT_AREA] >= 15:
-                        donor_edges[labels_e == i] = 255
-                donor_edges = cv2.dilate(donor_edges, kernel_3, iterations=1)
-                
-                # Запускаем донорную заливку локально в расширенной области.
-                # ВАЖНО: передаем crop_orig (оригинальное изображение с настоящими точками скринтона!),
-                # а НЕ crop_ans (где LaMa уже размыла фон в мыльный серый цвет).
-                crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-                crop_orig = img_original[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-                crop_mask = screentone_mask_dilated[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-                crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-                
-                crop_filled = fast_exemplar_inpaint(crop_orig, crop_mask, edges_mask=crop_donor, fallback_image=crop_ans)
-                
-                # Математический детектор микро-структуры скринтона (дисперсия + яркость)
-                gray_crop_orig = cv2.cvtColor(crop_orig, cv2.COLOR_BGR2GRAY)
-                k_size = 15
-                mean_bg = cv2.boxFilter(gray_crop_orig.astype(np.float32), -1, (k_size, k_size))
-                sqr_mean_bg = cv2.boxFilter((gray_crop_orig.astype(np.float32))**2, -1, (k_size, k_size))
-                std_dev_bg = np.sqrt(np.maximum(0, sqr_mean_bg - mean_bg**2))
-                
-                # Карта растровой текстуры скринтона: высокая микро-дисперсия (std_dev > 10) AND серый тон (100..230)
-                is_screentone_pixel_map = (std_dev_bg > 10.0) & (mean_bg >= 100.0) & (mean_bg <= 230.0)
+                # Применяем донорную текстуру только в областях скринтона
+                is_screentone = (std_dev > 10) & (mean_bg >= 100) & (mean_bg <= 230)
                 k_15 = np.ones((15, 15), np.uint8)
-                screentone_region_map = cv2.dilate(is_screentone_pixel_map.astype(np.uint8), k_15) > 0
+                screentone_map = cv2.dilate(is_screentone.astype(np.uint8), k_15) > 0
                 
-                donor_apply_mask = (crop_mask > 0) & screentone_region_map
-                crop_ans[donor_apply_mask] = crop_filled[donor_apply_mask]
-                ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_ans
+                donor_mask = (crop_user_mask > 0) & screentone_map
+                crop_area[donor_mask] = crop_filled[donor_mask]
+                ans[y_pad_min:y_pad_max, x_pad_min:x_pad_max] = crop_area
         except Exception as e:
-            print(f"[LaMa] Donor fill error: {e}")
-            
-        # 5. Прецизионное восстановление оригинального лайн-арта (рамки кадра, складки, швы)
-        # Накладываем обратно оригинальные черные контуры, которые были стерты только из-за расширения маски
-        restore_mask = (edges_mask > 0)
-        if np.any(restore_mask):
-            ans[restore_mask] = img_original[restore_mask]
+            print(f"[LaMa] Donor texture error: {e}")
             
         return ans
 
