@@ -681,19 +681,19 @@ class LamaMPEPyTorchInpainter:
                 if touches_border and (w_c > 35 or h_c > 35 or area > 100):
                     continue
                 
-                # Считаем яркость локального фона вокруг компонента
-                cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
-                margin = 35
-                y1_m = max(0, cy_i - margin)
-                y2_m = min(box_h, cy_i + margin)
-                x1_m = max(0, cx_i - margin)
-                x2_m = min(box_w, cx_i + margin)
+                # Считаем яркость локального фона вокруг компонента в ПОЛНОМ изображении (с учетом +128px контекста)!
+                gray_full = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                cy_orig = y_min + cy_i
+                cx_orig = x_min + cx_i
                 
-                nb_gray = crop_gray[y1_m:y2_m, x1_m:x2_m]
-                nb_dark = dark_ink[y1_m:y2_m, x1_m:x2_m]
-                bg_pixels = nb_gray[nb_dark == 0]
+                margin = 40
+                y1_m = max(0, cy_orig - margin)
+                y2_m = min(height, cy_orig + margin)
+                x1_m = max(0, cx_orig - margin)
+                x2_m = min(width, cx_orig + margin)
                 
-                bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
+                nb_gray = gray_full[y1_m:y2_m, x1_m:x2_m]
+                p35 = np.percentile(nb_gray, 35)
                 bg_mean = np.mean(nb_gray)
                 
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
@@ -710,7 +710,7 @@ class LamaMPEPyTorchInpainter:
                         pass
                     else:
                         is_text = True
-                elif bg_val >= 200 and is_char_sized:
+                elif bg_mean >= 200 and is_char_sized:
                     # Динамическая проверка плотности: убираем только крупные некомпактные объекты (линии)
                     if area > 80 and solidity < 0.28:
                         continue
@@ -719,9 +719,8 @@ class LamaMPEPyTorchInpainter:
                         
                 if is_text:
                     final_mask[comp_mask] = 255
-                    # Детекция скринтона по 25-му перцентилю: на скринтоне есть растровые точки (gray < 195),
-                    # даже если у текста широкая белая обводка (fuchidori), поднимающая среднее bg_mean!
-                    has_screentone = np.percentile(nb_gray, 25) < 195
+                    # Детекция скринтона по расширенному контексту: если p35 < 210 или bg_mean < 225, вокруг есть скринтон!
+                    has_screentone = (p35 < 210) or (bg_mean < 225)
                     if has_screentone:
                         screentone_mask[comp_mask] = 255
                     
