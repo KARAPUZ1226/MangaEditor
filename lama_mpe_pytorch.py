@@ -762,9 +762,17 @@ class LamaMPEPyTorchInpainter:
         # 4. Донорная заливка (fast_exemplar_inpaint) для идеального восстановления тонов и текстур скринтонов
         try:
             from fast_exemplar_inpaint import fast_exemplar_inpaint
-            # Выделяем все оригинальные темные контуры рисунка, чтобы донор не копировал их как текстуру
+            # Выделяем только крупные оригинальные темные контуры рисунка (линии кадра, волос, одежды),
+            # чтобы донор не копировал их как текстуру, но при этом игнорируем мелкие точки скринтона (area < 10)
             gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            donor_edges = (gray_orig < 120).astype(np.uint8) * 255
+            dark_orig = (gray_orig < 120).astype(np.uint8) * 255
+            num_labels_or, labels_or, stats_or, _ = cv2.connectedComponentsWithStats(dark_orig, connectivity=8)
+            
+            donor_edges = np.zeros_like(dark_orig)
+            for i in range(1, num_labels_or):
+                if stats_or[i, cv2.CC_STAT_AREA] >= 10:
+                    donor_edges[labels_or == i] = 255
+                    
             ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=donor_edges)
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")
