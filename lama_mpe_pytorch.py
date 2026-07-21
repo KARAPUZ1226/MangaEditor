@@ -711,12 +711,11 @@ class LamaMPEPyTorchInpainter:
                         pass
                     else:
                         is_text = True
-                elif bg_mean >= 200 and is_char_sized:
-                    # Динамическая проверка плотности: убираем только крупные некомпактные объекты (линии)
-                    if area > 80 and solidity < 0.28:
-                        continue
-                    if survived_erosion or area < 25:
-                        is_text = True
+                elif is_char_sized:
+                    # Надежный фолбэк для компонентов размером с символ (ловит の, ト, даже если U-Net их пропустил)
+                    if aspect_ratio <= 3.5 and solidity >= 0.20 and area >= 10:
+                        if not (solidity < 0.22 and min(w_c, h_c) > 5):
+                            is_text = True
                         
                 if is_text:
                     final_mask[comp_mask] = 255
@@ -725,13 +724,12 @@ class LamaMPEPyTorchInpainter:
                     if has_screentone:
                         screentone_mask[comp_mask] = 255
                     
-            # 3. Точечная дилатация 3px для LaMa и ультра-точечная 1px для донора скринтонов
-            # Это сохраняет 95% оригинального скринтона и не дает маске расширяться на весь кроп
+            # 3. Дилатация на 4px для полного стирания туши букв И широкой белой обводки (fuchidori)
             kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=3)
+            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=4)
             
-            # Ультра-точная маска донора (только чернила букв + 1px граница)
-            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=1)
+            # Маска донора скринтонов (тушь букв + белая обводка fuchidori, 4px дилатация)
+            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=4)
             screentone_mask_dilated[~user_mask_bool] = 0
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
