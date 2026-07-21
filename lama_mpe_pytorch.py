@@ -694,40 +694,21 @@ class LamaMPEPyTorchInpainter:
                 p35 = np.percentile(nb_gray, 35)
                 bg_mean_comp = np.mean(nb_gray)
                 
-                # Защита пуговиц и элементов одежды на чистой белой рубашке/бумаге (bg_mean >= 238)
+                # 1. Защита пуговиц и элементов одежды на чистой белой рубашке/бумаге (bg_mean >= 238)
                 if bg_mean_comp >= 238.0 and not np.any(seg_mask_box[comp_mask] > 0):
                     edges_box[comp_mask] = 255
                     continue
 
-                solidity = area / (w_c * h_c)
-                aspect_ratio = max(w_c, h_c) / (min(w_c, h_c) + 1e-3)
-
-                # Восстанавливаем только НАСТОЯЩИЕ длинные рамки кадров манги, касающиеся края
-                is_panel_line = touches_border and (w_c >= box_w - 6 or h_c >= box_h - 6 or aspect_ratio > 7.0) and (solidity > 0.40) and (area > 150)
+                # 2. Восстанавливаем только НАСТОЯЩИЕ тонкие (1..6px) рамки кадров манги, касающиеся края
+                is_panel_line = touches_border and (min(w_c, h_c) <= 6) and (w_c >= box_w - 10 or h_c >= box_h - 10)
                 if is_panel_line:
                     edges_box[comp_mask] = 255
                     continue
                 
-                is_unet = np.any(seg_mask_box[comp_mask] > 0)
-                is_char_or_word_sized = (min(w_c, h_c) <= 55) and (area <= 3500)
-                
-                is_text = False
-                if is_unet:
-                    # Игнорируем складки одежды, штриховку и мех, даже если U-Net задел их
-                    if (solidity < 0.18 and min(w_c, h_c) > 5 and aspect_ratio > 6.0):
-                        pass
-                    else:
-                        is_text = True
-                elif is_char_or_word_sized:
-                    # Надежный фолбэк для всех японских слов и символов (ловит の, ト, ッ, フ)
-                    if aspect_ratio <= 8.0 and solidity >= 0.08 and area >= 8:
-                        is_text = True
-                        
-                if is_text:
-                    final_mask[comp_mask] = 255
-                    # Детекция скринтона по расширенному контексту: если p35 < 210 или bg_mean < 225, вокруг есть скринтон!
-                    if p35 < 210 or bg_mean_comp < 225:
-                        screentone_mask[comp_mask] = 255
+                # 3. Абсолютно все остальные чернильные компоненты внутри выделения пользователя — ЭТО ТЕКСТ!
+                final_mask[comp_mask] = 255
+                if p35 < 210 or bg_mean_comp < 225:
+                    screentone_mask[comp_mask] = 255
                     
             # 3. Дилатация на 4px для полного стирания туши букв И широкой белой обводки (fuchidori)
             kernel_3 = np.ones((3, 3), np.uint8)
