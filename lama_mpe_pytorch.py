@@ -741,8 +741,8 @@ class LamaMPEPyTorchInpainter:
             donor_fn = lambda img, msk: orientation_aware_donor_fill(img, img, msk, crop_mask_raw)
             crop_ans = repair_outliers(crop_image, crop_ans, outlier_fail_mask, inpaint_fn=donor_fn)
             
-        noise_layer, noise_std = extract_noise_profile(crop_image, crop_mask_dilated)
-        crop_ans = apply_matched_noise(crop_ans, crop_mask_dilated, noise_std)
+        # noise_layer, noise_std = extract_noise_profile(crop_image, crop_mask_dilated)
+        # crop_ans = apply_matched_noise(crop_ans, crop_mask_dilated, noise_std)
             
         # --- ШАГ 7: QC Проверка качественного результата & Строгая изоляция вне маски ---
         M_fail_qc = detect_lama_failures(crop_ans, crop_mask_dilated, patch_size=16, ring_width=20)
