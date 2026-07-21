@@ -811,7 +811,12 @@ class LamaMPEPyTorchInpainter:
                 crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 
                 crop_filled = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=crop_donor)
-                ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_filled
+                
+                # Прямая точечная замена пикселей туши на скринтон (без feather-размытия),
+                # чтобы не было серых мыльных ореолов на границах букв
+                screentone_bool = (crop_mask > 0)
+                crop_ans[screentone_bool] = crop_filled[screentone_bool]
+                ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_ans
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")
             
