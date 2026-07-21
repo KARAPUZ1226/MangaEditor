@@ -627,10 +627,18 @@ class LamaMPEPyTorchInpainter:
         mask_refined = np.zeros((height, width), dtype=np.uint8)
         edges_mask = np.zeros((height, width), dtype=np.uint8)
         
+        y_min_pad, y_max_pad, x_min_pad, x_max_pad = 0, height, 0, width
+        
         if len(y_indices) > 0 and len(x_indices) > 0:
             y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
             x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
             box_h, box_w = y_max - y_min, x_max - x_min
+            
+            # Определяем расширенную область поиска текстуры скринтона (выделение + 128px контекста во все стороны)
+            y_min_pad = max(0, y_min - 128)
+            y_max_pad = min(height, y_max + 128)
+            x_min_pad = max(0, x_min - 128)
+            x_max_pad = min(width, x_max + 128)
             
             crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
             
@@ -772,8 +780,14 @@ class LamaMPEPyTorchInpainter:
             for i in range(1, num_labels_or):
                 if stats_or[i, cv2.CC_STAT_AREA] >= 10:
                     donor_edges[labels_or == i] = 255
-                    
-            ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=donor_edges)
+            
+            # Запускаем донорную заливку локально в расширенной области для идеального поиска периода скринтона
+            crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+            crop_mask = mask_refined[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+            crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+            
+            crop_filled = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=crop_donor)
+            ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_filled
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")
             
