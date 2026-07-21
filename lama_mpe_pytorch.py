@@ -650,6 +650,11 @@ class LamaMPEPyTorchInpainter:
                     
             # 2. Выделение связных компонентов темных чернил (<120)
             dark_ink = (crop_gray < 120).astype(np.uint8) * 255
+            
+            # Эрозия для отсечения тонких линий (рисунка одежды, пуговиц и прочих тонких штрихов)
+            kernel_3 = np.ones((3, 3), np.uint8)
+            eroded_ink = cv2.erode(dark_ink, kernel_3, iterations=1)
+            
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
             
             final_mask = np.zeros_like(dark_ink)
@@ -660,12 +665,17 @@ class LamaMPEPyTorchInpainter:
                     
                 comp_mask = (labels == i)
                 
-                # Если компонент пересекается с маской U-Net -> это точно текст на скринтоне
+                # 2.1. Игнорируем линии панели и другие границы, касающиеся краев выделения
+                touches_border = (x_c <= 3) or (y_c <= 3) or (x_c + w_c >= box_w - 3) or (y_c + h_c >= box_h - 3)
+                if touches_border and (w_c > 35 or h_c > 35 or area > 100):
+                    continue
+                
+                # 2.2. Если компонент пересекается с ИИ-маской U-Net -> это точно текст (на скринтоне или фоне)
                 if np.any(seg_mask_box[comp_mask] > 0):
                     final_mask[comp_mask] = 255
                     continue
                     
-                # Если U-Net "ослеп" на белом фоне (рубашка/бабл), проверяем локальный фон компонента
+                # 2.3. Если ИИ ослеп на белом фоне (рубашка), проверяем локальный фон компонента
                 cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
                 margin = 35
                 y1_m = max(0, cy_i - margin)
@@ -680,8 +690,10 @@ class LamaMPEPyTorchInpainter:
                 bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
                 
-                # Если фон чистый белый (>=200) и размер компонента соответствует символу, то закрашиваем
-                if bg_val >= 200 and is_char_sized:
+                # Объект должен быть размера символа и пережить эрозию (то есть быть толще тонкой линии)
+                survived_erosion = np.any(eroded_ink[comp_mask] > 0)
+                
+                if bg_val >= 200 and is_char_sized and survived_erosion:
                     final_mask[comp_mask] = 255
                     
             # 3. Дилатация 4px для полного покрытия белой обводки текста (fuchidori)
