@@ -690,12 +690,16 @@ class LamaMPEPyTorchInpainter:
                 bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
                 
-                # Объект должен быть размера символа, пережить эрозию и быть достаточно компактным (не тонкой линией)
+                # Объект должен быть размера символа, пережить эрозию
                 survived_erosion = np.any(eroded_ink[comp_mask] > 0)
                 solidity = area / (w_c * h_c)
                 
-                if bg_val >= 200 and is_char_sized and survived_erosion and solidity >= 0.28:
-                    final_mask[comp_mask] = 255
+                if bg_val >= 200 and is_char_sized:
+                    # Динамическая проверка плотности: убираем только крупные некомпактные объекты (линии)
+                    if area > 80 and solidity < 0.28:
+                        continue
+                    if survived_erosion or area < 25:
+                        final_mask[comp_mask] = 255
                     
             # 3. Дилатация 4px для полного покрытия белой обводки текста (fuchidori)
             kernel_3 = np.ones((3, 3), np.uint8)
@@ -747,6 +751,17 @@ class LamaMPEPyTorchInpainter:
             
         ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
         ans = np.clip(ans, 0, 255).astype(np.uint8)
+        
+        # 4. Донорная заливка (fast_exemplar_inpaint) для идеального восстановления тонов и текстур скринтонов
+        try:
+            from fast_exemplar_inpaint import fast_exemplar_inpaint
+            gray_lama = cv2.cvtColor(ans, cv2.COLOR_BGR2GRAY)
+            # Защищаем тонкие линии, нарисованные LaMa
+            lama_edges = (gray_lama < 50).astype(np.uint8) * 255
+            ans = fast_exemplar_inpaint(ans, mask_refined, edges_mask=lama_edges)
+        except Exception as e:
+            print(f"[LaMa] Donor fill error: {e}")
+            
         return ans
 
 
