@@ -667,6 +667,7 @@ class LamaMPEPyTorchInpainter:
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
             
             final_mask = np.zeros_like(dark_ink)
+            screentone_mask = np.zeros_like(dark_ink)
             for i in range(1, num_labels):
                 x_c, y_c, w_c, h_c, area = stats[i]
                 if area < 6:
@@ -679,12 +680,7 @@ class LamaMPEPyTorchInpainter:
                 if touches_border and (w_c > 35 or h_c > 35 or area > 100):
                     continue
                 
-                # 2.2. Если компонент пересекается с ИИ-маской U-Net -> это точно текст (на скринтоне или фоне)
-                if np.any(seg_mask_box[comp_mask] > 0):
-                    final_mask[comp_mask] = 255
-                    continue
-                    
-                # 2.3. Если ИИ ослеп на белом фоне (рубашка), проверяем локальный фон компонента
+                # Считаем яркость локального фона вокруг компонента
                 cx_i, cy_i = int(centroids[i][0]), int(centroids[i][1])
                 margin = 35
                 y1_m = max(0, cy_i - margin)
@@ -698,26 +694,39 @@ class LamaMPEPyTorchInpainter:
                 
                 bg_val = np.percentile(bg_pixels, 85) if len(bg_pixels) > 0 else 255
                 is_char_sized = (w_c <= 45) and (h_c <= 45)
-                
-                # Объект должен быть размера символа, пережить эрозию
                 survived_erosion = np.any(eroded_ink[comp_mask] > 0)
                 solidity = area / (w_c * h_c)
                 
-                if bg_val >= 200 and is_char_sized:
+                is_unet = np.any(seg_mask_box[comp_mask] > 0)
+                
+                is_text = False
+                if is_unet:
+                    is_text = True
+                elif bg_val >= 200 and is_char_sized:
                     # Динамическая проверка плотности: убираем только крупные некомпактные объекты (линии)
                     if area > 80 and solidity < 0.28:
                         continue
                     if survived_erosion or area < 25:
-                        final_mask[comp_mask] = 255
+                        is_text = True
+                        
+                if is_text:
+                    final_mask[comp_mask] = 255
+                    # Если фон темнее 200 (серый скринтон), добавляем в маску для восстановления текстур
+                    if bg_val < 200:
+                        screentone_mask[comp_mask] = 255
                     
-            # 3. Дилатация 4px для полного покрытия белой обводки текста (fuchidori)
+            # 3. Дилатация на 5px для гарантированного удаления белой обводки (fuchidori)
             kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=4)
+            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=5)
+            
+            # Маска для донорной заливки скринтонов (только те буквы, что стояли на сером скринтоне)
+            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=5)
+            screentone_mask_dilated[~user_mask_bool] = 0
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
-            # Маска линий для восстановления (темные пиксели исходника, не являющиеся текстом)
+            # Маска контурных линий для восстановления (темные пиксели исходника, не являющиеся текстом)
             edges_box = ((crop_gray < 120) & (final_mask == 0)).astype(np.uint8) * 255
             edges_mask[y_min:y_max, x_min:x_max] = edges_box
             edges_mask[~user_mask_bool] = 0
@@ -732,6 +741,7 @@ class LamaMPEPyTorchInpainter:
             mask_refined[mask_refined < 127] = 0
             mask_refined[mask_refined >= 127] = 255
             edges_mask = np.zeros_like(mask_refined)
+            screentone_mask_dilated = np.zeros_like(mask_refined)
             
         # 2. LaMa дорисовывает
         pad_h = (8 - height % 8) % 8
@@ -767,27 +777,30 @@ class LamaMPEPyTorchInpainter:
         ans = result.astype(np.float32) * m + img_original.astype(np.float32) * (1.0 - m)
         ans = np.clip(ans, 0, 255).astype(np.uint8)
         
-        # 4. Донорная заливка (fast_exemplar_inpaint) для идеального восстановления тонов и текстур скринтонов
+        # 4. Донорная заливка (fast_exemplar_inpaint) - запускается ТОЛЬКО для областей серого скринтона!
+        # Это защищает белые и черные области от случайного наложения текстур и артефактов.
         try:
-            from fast_exemplar_inpaint import fast_exemplar_inpaint
-            # Выделяем только крупные оригинальные темные контуры рисунка (линии кадра, волос, одежды),
-            # чтобы донор не копировал их как текстуру, но при этом игнорируем мелкие точки скринтона (area < 10)
-            gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
-            dark_orig = (gray_orig < 120).astype(np.uint8) * 255
-            num_labels_or, labels_or, stats_or, _ = cv2.connectedComponentsWithStats(dark_orig, connectivity=8)
-            
-            donor_edges = np.zeros_like(dark_orig)
-            for i in range(1, num_labels_or):
-                if stats_or[i, cv2.CC_STAT_AREA] >= 10:
-                    donor_edges[labels_or == i] = 255
-            
-            # Запускаем донорную заливку локально в расширенной области для идеального поиска периода скринтона
-            crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-            crop_mask = mask_refined[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-            crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-            
-            crop_filled = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=crop_donor)
-            ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_filled
+            if np.sum(screentone_mask_dilated > 0) > 5:
+                from fast_exemplar_inpaint import fast_exemplar_inpaint
+                
+                # Выделяем только крупные оригинальные темные контуры рисунка (линии кадра, волос, одежды),
+                # чтобы донор не копировал их как текстуру, но при этом игнорируем мелкие точки скринтона (area < 10)
+                gray_orig = cv2.cvtColor(img_original, cv2.COLOR_BGR2GRAY)
+                dark_orig = (gray_orig < 120).astype(np.uint8) * 255
+                num_labels_or, labels_or, stats_or, _ = cv2.connectedComponentsWithStats(dark_orig, connectivity=8)
+                
+                donor_edges = np.zeros_like(dark_orig)
+                for i in range(1, num_labels_or):
+                    if stats_or[i, cv2.CC_STAT_AREA] >= 10:
+                        donor_edges[labels_or == i] = 255
+                
+                # Запускаем донорную заливку локально в расширенной области для идеального поиска периода скринтона
+                crop_ans = ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+                crop_mask = screentone_mask_dilated[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+                crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+                
+                crop_filled = fast_exemplar_inpaint(crop_ans, crop_mask, edges_mask=crop_donor)
+                ans[y_min_pad:y_max_pad, x_min_pad:x_max_pad] = crop_filled
         except Exception as e:
             print(f"[LaMa] Donor fill error: {e}")
             
