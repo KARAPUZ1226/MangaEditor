@@ -154,7 +154,7 @@ def feather_blend(result, original, mask, kernel_size=15):
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
-def fast_exemplar_inpaint(image, mask, edges_mask=None, screentone_threshold=3.0):
+def fast_exemplar_inpaint(image, mask, edges_mask=None, screentone_threshold=3.0, fallback_image=None):
     """
     Главная функция быстрого exemplar-based инпейнтинга.
     НЕ использует нейросети, НЕ генерирует текстуру — собирает из окружающих пикселей.
@@ -162,6 +162,7 @@ def fast_exemplar_inpaint(image, mask, edges_mask=None, screentone_threshold=3.0
     image: BGR uint8 (H, W, 3)
     mask:  uint8 (H, W), 255 = заполнить
     edges_mask: uint8 (H, W), 255 = защитить (линии рисунка)
+    fallback_image: BGR uint8 (H, W, 3) результат LaMa в случае отсутствия растра
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
@@ -179,9 +180,10 @@ def fast_exemplar_inpaint(image, mask, edges_mask=None, screentone_threshold=3.0
     # 3. Если есть скринтон — заполняем периодическими сдвигами
     if has_screentone:
         result, remaining = periodic_fill(image, mask, (dy, dx), edges_mask=edges_mask, max_r=25)
-        # Если не все пиксели заполнились периодическим сдвигом, оставляем оригинальный вход (LaMa)
-        # НЕ вызываем nearest_neighbor_fill, так как он создает градиентные лучи при больших масках
     else:
+        # Если четкой структуры скринтона нет, возвращаем чистый результат LaMa!
+        if fallback_image is not None:
+            return fallback_image.copy()
         result = image.copy().astype(np.float32)
         remaining = fill_mask.copy()
         if np.any(remaining):

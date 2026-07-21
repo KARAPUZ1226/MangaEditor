@@ -710,34 +710,29 @@ class LamaMPEPyTorchInpainter:
                 p35 = np.percentile(nb_gray, 35)
                 bg_mean_comp = np.mean(nb_gray)
                 
-                # 1. Защита элементов одежды на чистой белой рубашке/бумаге (bg_mean >= 238)
-                if bg_mean_comp >= 238.0 and not np.any(seg_mask_box[comp_mask] > 0):
-                    edges_box[comp_mask] = 255
-                    continue
-
-                # 2. Восстанавливаем только НАСТОЯЩИЕ тонкие (1..6px) рамки кадров манги, касающиеся края
+                # 1. Восстанавливаем только НАСТОЯЩИЕ тонкие (1..6px) рамки кадров манги, касающиеся края
                 is_panel_line = touches_border and (min(w_c, h_c) <= 6) and (w_c >= box_w - 10 or h_c >= box_h - 10)
                 if is_panel_line:
                     edges_box[comp_mask] = 255
                     continue
                 
-                # 3. Абсолютно все остальные чернильные компоненты внутри выделения пользователя — ЭТО ТЕКСТ!
+                # 2. Абсолютно все остальные чернильные компоненты внутри выделения пользователя — ЭТО ТЕКСТ!
                 final_mask[comp_mask] = 255
                 if p35 < 210 or bg_mean_comp < 225:
                     screentone_mask[comp_mask] = 255
                     
-            # 4. Дилатация туши букв на 6px для ПОЛНОГО поглощения белой обводки (fuchidori) вокруг каждого символа!
+            # 4. Дилатация туши букв на 12px для ПОЛНОГО поглощения белой обводки (fuchidori) вокруг каждого символа!
             kernel_3 = np.ones((3, 3), np.uint8)
-            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=6)
-            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=6)
+            seg_mask_dilated = cv2.dilate(final_mask, kernel_3, iterations=12)
+            screentone_mask_dilated[y_min:y_max, x_min:x_max] = cv2.dilate(screentone_mask, kernel_3, iterations=12)
             screentone_mask_dilated[~user_mask_bool] = 0
             
             mask_refined[y_min:y_max, x_min:x_max] = seg_mask_dilated
             mask_refined[~user_mask_bool] = 0
 
-            # Маска контурных линий для восстановления (темные пиксели исходника, не являющиеся текстом)
-            edges_box = ((crop_gray < 120) & (final_mask == 0)).astype(np.uint8) * 255
+            # Восстановление только истинных рамок кадра (min(w,h) <= 6)
             edges_mask[y_min:y_max, x_min:x_max] = edges_box
+            edges_mask[~user_mask_bool] = 0
             edges_mask[~user_mask_bool] = 0
             
             # Сохраняем отладочные файлы для анализа
@@ -808,7 +803,7 @@ class LamaMPEPyTorchInpainter:
                 crop_mask = screentone_mask_dilated[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 crop_donor = donor_edges[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
                 
-                crop_filled = fast_exemplar_inpaint(crop_orig, crop_mask, edges_mask=crop_donor)
+                crop_filled = fast_exemplar_inpaint(crop_orig, crop_mask, edges_mask=crop_donor, fallback_image=crop_ans)
                 
                 # Математический детектор микро-структуры скринтона (дисперсия + яркость)
                 gray_crop_orig = cv2.cvtColor(crop_orig, cv2.COLOR_BGR2GRAY)
