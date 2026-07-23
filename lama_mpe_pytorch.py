@@ -753,7 +753,6 @@ class LamaMPEPyTorchInpainter:
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
         combined_text_ink_full[y_min:y_max, x_min:x_max] = text_ink_box
-        combined_text_ink_full[~user_mask_bool] = 0
         
         # Сырая маска текста (M_text_raw)
         raw_mask_full = combined_text_ink_full.copy()
@@ -761,7 +760,6 @@ class LamaMPEPyTorchInpainter:
         # Дилатированная маска текста (M_text_dilated) на 3px строго вокруг символов (защищает контурные линии рисунка!)
         kernel_3 = np.ones((3, 3), np.uint8)
         dilated_mask_full = cv2.dilate(combined_text_ink_full, kernel_3, iterations=3)
-        dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
         
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
