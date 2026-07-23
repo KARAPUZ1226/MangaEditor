@@ -745,21 +745,26 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
                 
-        # Дилатируем маску U-Net для надежного захвата внешних белых краев букв
+        # Тёмные чернила букв (исключаем скринтоны и белые области)
+        dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
+        n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+        compact_dark_ink = np.zeros_like(dark_ink)
+        for i in range(1, n_l):
+            w_i = sts[i, cv2.CC_STAT_WIDTH]
+            h_i = sts[i, cv2.CC_STAT_HEIGHT]
+            area_i = sts[i, cv2.CC_STAT_AREA]
+            # Исключаем длинные контурные линии ног/платья и фоновый шум
+            if area_i >= 8 and area_i < 1200 and w_i < 90 and h_i < 90:
+                compact_dark_ink[lbs == i] = 255
+                
         if np.count_nonzero(seg_box_unet) > 5:
-            text_ink_box = cv2.dilate(seg_box_unet, np.ones((5, 5), np.uint8), iterations=2)
+            # Берем чернила, подтвержденные U-Net
+            unet_dilated = cv2.dilate(seg_box_unet, np.ones((5, 5), np.uint8), iterations=1)
+            confirmed_ink = compact_dark_ink & unet_dilated
+            # Расширяем маску СТРОГО вокруг найденных чернил на 3px для захвата белой окантовки
+            text_ink_box = cv2.dilate(confirmed_ink, np.ones((3, 3), np.uint8), iterations=2)
         else:
-            # Резервный поиск букв, если U-Net не загружен
-            dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
-            n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-            text_ink_box = np.zeros_like(dark_ink)
-            for i in range(1, n_l):
-                w_i = sts[i, cv2.CC_STAT_WIDTH]
-                h_i = sts[i, cv2.CC_STAT_HEIGHT]
-                area_i = sts[i, cv2.CC_STAT_AREA]
-                if area_i >= 8 and area_i < 650 and (w_i >= 3 or h_i >= 3) and w_i < 80 and h_i < 80:
-                    text_ink_box[lbs == i] = 255
-            text_ink_box = cv2.dilate(text_ink_box, np.ones((3, 3), np.uint8), iterations=2)
+            text_ink_box = cv2.dilate(compact_dark_ink, np.ones((3, 3), np.uint8), iterations=2)
             
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
