@@ -57,17 +57,9 @@ def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 
         return False
         
     # Считаем высокочастотную энергию шума/растра
-    ring_y, ring_x = np.where(ring)
-    if len(ring_y) == 0:
-        return False
-    ring_patch = gray[max(0, ring_y.min()):min(gray.shape[0], ring_y.max()+1),
-                      max(0, ring_x.min()):min(gray.shape[1], ring_x.max()+1)]
-    if ring_patch.size < 16:
-        return False
-        
-    blurred = cv2.GaussianBlur(ring_patch.astype(np.float32), (5, 5), 0)
-    high_freq = np.abs(ring_patch.astype(np.float32) - blurred)
-    hf_mean = float(high_freq.mean())
+    blurred_full = cv2.GaussianBlur(gray.astype(np.float32), (5, 5), 0)
+    hf_full = np.abs(gray.astype(np.float32) - blurred_full)
+    hf_mean = float(hf_full[ring].mean())
     
     return hf_mean > 7.0
 
@@ -173,7 +165,6 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             norm_donor = (shifted_orig.astype(np.float32) - donor_ring_mean) * (target_std_gray / donor_ring_std) + target_mean_gray
             donor_patch = np.clip(norm_donor, 0, 255).astype(np.uint8)
             
-            blended_comp = feather_blend_patch(result, donor_patch, comp_mask, feather_px=3)
-            result[comp_mask] = blended_comp[comp_mask]
+            result[comp_mask] = donor_patch[comp_mask]
             
     return result
