@@ -149,10 +149,11 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         
         norm_donor = np.clip(shifted_donor.astype(np.float32) + offset, 0, 255).astype(np.uint8)
         
-        # Защита чистого черного и чистого белого от LaMa
+        # Плавно смешиваем донорный скринтон по краям маски (feathering), чтобы полностью скрыть квадратный шов!
         gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
         gray_target_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240)
         
-        result[gray_target_mask] = norm_donor[gray_target_mask]
-        
+        if np.any(gray_target_mask):
+            result = feather_blend_patch(result, norm_donor, gray_target_mask.astype(np.uint8) * 255, feather_px=4)
+            
     return result
