@@ -747,13 +747,11 @@ class LamaMPEPyTorchInpainter:
         if np.any(M_fail_crop > 0):
             crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, M_fail_crop, crop_mask_raw)
             
-        # --- Post-inpaint Artifact Repair + Noise Matching ---
-        from artifact_noise_repair import detect_outlier_patches, repair_outliers, extract_noise_profile, apply_matched_noise
-        
-        outlier_fail_mask = detect_outlier_patches(crop_ans, crop_mask_dilated)
-        if np.any(outlier_fail_mask > 0):
-            donor_fn = lambda img, msk: orientation_aware_donor_fill(img, img, msk, crop_mask_raw)
-            crop_ans = repair_outliers(crop_image, crop_ans, outlier_fail_mask, inpaint_fn=donor_fn)
+        # --- Post-inpaint Artifact Repair (Telea smudging disabled to preserve sharp screentone dots!) ---
+        # outlier_fail_mask = detect_outlier_patches(crop_ans, crop_mask_dilated)
+        # if np.any(outlier_fail_mask > 0):
+        #     donor_fn = lambda img, msk: orientation_aware_donor_fill(img, img, msk, crop_mask_raw)
+        #     crop_ans = repair_outliers(crop_image, crop_ans, outlier_fail_mask, inpaint_fn=donor_fn)
             
         # noise_layer, noise_std = extract_noise_profile(crop_image, crop_mask_dilated)
         # crop_ans = apply_matched_noise(crop_ans, crop_mask_dilated, noise_std)
