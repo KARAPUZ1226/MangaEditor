@@ -745,11 +745,9 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
                 
-        # Строим итоговую маску букв по пересечению темных чернил и маски U-Net
+        # Используем маску U-Net напрямую (совместно с дилатацией), чтобы захватить и буквы, и их белую окантовку/обводку
         if np.count_nonzero(seg_box_unet) > 5:
-            unet_dilated = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
-            text_ink_box = (crop_box_gray < 185).astype(np.uint8) * 255
-            text_ink_box = text_ink_box & unet_dilated
+            text_ink_box = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
         else:
             # Резервный поиск букв, если U-Net не загружен
             dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
