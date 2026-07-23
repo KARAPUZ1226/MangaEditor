@@ -40,10 +40,9 @@ def feather_blend_patch(target: np.ndarray, donor: np.ndarray, mask: np.ndarray,
 
 def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 15) -> bool:
     """
-    Классифицирует тип региона:
-    1. Однородный / белая одежда (ring_std <= 8.0) -> donor НЕ нужен (оставить LaMa).
-    2. Градиентные складки платья / тени (fold shading, p95 - p5 > 45.0) -> donor НЕ нужен (доверяем LaMa с контекстом!).
-    3. Повторяющийся растровый скринтон (flat halftone dots) -> donor нужен.
+    Классифицирует тип региона по высокочастотной энергии растра:
+    1. Однородный / белая одежда (ring_std <= 6.0) -> donor НЕ нужен (оставить LaMa).
+    2. Повторяющийся растровый скринтон (halftone dots, hf_mean > 7.0) -> donor ТРЕБУЕТСЯ для бесшовного растра.
     """
     k_ring = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1))
     ring = (cv2.dilate((mask > 0).astype(np.uint8), k_ring) > 0) & (mask == 0)
@@ -54,17 +53,23 @@ def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 
         return False
         
     ring_std = float(ring_pixels.std())
-    if ring_std <= 8.0:
+    if ring_std <= 6.0:
         return False
         
-    # Проверка на градиентные складки платья (gradient fold shading)
-    p5 = float(np.percentile(ring_pixels, 5))
-    p95 = float(np.percentile(ring_pixels, 95))
-    if (p95 - p5) > 45.0:
-        print("[Donor Classifier] Обнаружена градиентная складка платья/тени (fold shading). Передаем 100% контроля LaMa!")
+    # Считаем высокочастотную энергию шума/растра
+    ring_y, ring_x = np.where(ring)
+    if len(ring_y) == 0:
+        return False
+    ring_patch = gray[max(0, ring_y.min()):min(gray.shape[0], ring_y.max()+1),
+                      max(0, ring_x.min()):min(gray.shape[1], ring_x.max()+1)]
+    if ring_patch.size < 16:
         return False
         
-    return True
+    blurred = cv2.GaussianBlur(ring_patch.astype(np.float32), (5, 5), 0)
+    high_freq = np.abs(ring_patch.astype(np.float32) - blurred)
+    hf_mean = float(high_freq.mean())
+    
+    return hf_mean > 7.0
 
 
 def patch_density(patch: np.ndarray, thresh: int = 128) -> float:
@@ -75,12 +80,7 @@ def patch_density(patch: np.ndarray, thresh: int = 128) -> float:
 
 def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_fail: np.ndarray, M_text_raw: np.ndarray) -> np.ndarray:
     """
-    Заполняет области M_fail с помощью ориентированного поиска доноров и сохранения структуры.
-    
-    image_orig: BGR uint8 оригинал
-    image_lama: BGR uint8 результат LaMa
-    M_fail: uint8 маска провалов (255 = чинить)
-    M_text_raw: uint8 недилатированная маска текста (запрещенная зона для забора донора)
+    Заполняет области M_fail с помощью ориентированного поиска доноров и фазовой подгонки растра.
     """
     if not np.any(M_fail > 0):
         return image_lama.copy()
@@ -103,53 +103,34 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             
         comp_mask = (labels == i)
         
-        # --- ФИКС 2: Проверка "нужен ли вообще донор здесь" ---
+        # Проверка "нужен ли донор для скринтона в этом регионе"
         if not region_needs_texture(image_orig, comp_mask, ring_width=15):
-            continue  # Гладкий фон / белая рубашка — донор НЕ нужен, оставляем чистый LaMa!
+            continue
         
-        # Контур компонента M_fail
-        kernel_3 = np.ones((3, 3), np.uint8)
-        dil = cv2.dilate(comp_mask.astype(np.uint8), kernel_3)
+        # Расширенный контур компонента M_fail для точной подгонки фазы растра
+        kernel_8 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        dil = cv2.dilate(comp_mask.astype(np.uint8), kernel_8)
         boundary_mask = (dil > 0) & (~comp_mask) & donor_valid_mask
         
-        # Средняя яркость и плотность паттерна вокруг дырки
-        if np.any(boundary_mask):
-            target_mean_gray = float(np.mean(gray_orig[boundary_mask]))
-            target_density_val = patch_density(image_orig[boundary_mask], thresh=128)
-            dom_angle = compute_structure_tensor_orientation(gray_orig, boundary_mask)
-        else:
-            target_mean_gray = float(np.mean(gray_orig[comp_mask]))
-            target_density_val = patch_density(image_orig[comp_mask], thresh=128)
-            dom_angle = 0.0
+        if not np.any(boundary_mask):
+            continue
             
-        # --- ФИКС 1: Жестко ограниченное локальное окно поиска (search_radius=60) ---
-        cx, cy = int(centroids[i][0]), int(centroids[i][1])
-        search_radius = 60
-        
-        y0_s = max(0, cy - search_radius)
-        y1_s = min(h, cy + search_radius)
-        x0_s = max(0, cx - search_radius)
-        x1_s = min(w, cx + search_radius)
-        
-        best_donor_shift = None
-        best_score = float('inf')
-        
-        # Ищем донора ТОЛЬКО в локальном радиусе search_radius от target-патча
+        target_mean_gray = float(np.mean(gray_orig[boundary_mask]))
+        target_density_val = patch_density(image_orig[boundary_mask], thresh=128)
+        dom_angle = compute_structure_tensor_orientation(gray_orig, boundary_mask)
+            
+        # 1px шаг для идеальной фазовой подгонки периодических точек скринтона!
         shifts_to_test = []
-        for dy in range(-search_radius, search_radius + 1, 4):
-            for dx in range(-search_radius, search_radius + 1, 4):
-                if abs(dy) < 4 and abs(dx) < 4:
+        for dy in range(-30, 31, 1):
+            for dx in range(-30, 31, 1):
+                if abs(dy) < 3 and abs(dx) < 3:
                     continue
                 shifts_to_test.append((dy, dx))
                 
-        for dy, dx in shifts_to_test:
-            y_shifted = np.clip(y_c + dy, 0, h - h_c)
-            x_shifted = np.clip(x_c + dx, 0, w - w_c)
-            
-            donor_region_valid = donor_valid_mask[y0_s:y1_s, x0_s:x1_s]
-            if not np.any(donor_region_valid):
-                continue
+        best_donor_shift = None
+        best_score = float('inf')
                 
+        for dy, dx in shifts_to_test:
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             
@@ -159,26 +140,26 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
             
-            # --- ФИКС 3: Фильтр кандидатов по плотности растровых точек ---
             candidate_density_val = patch_density(shifted_gray[comp_mask], thresh=128)
-            if abs(target_density_val - candidate_density_val) > 0.15:
-                continue  # Пропускаем кандидата — слишком разная плотность точек растра!
+            if abs(target_density_val - candidate_density_val) > 0.18:
+                continue
                 
             donor_mean_gray = float(np.mean(shifted_gray[comp_mask]))
             bright_diff = abs(donor_mean_gray - target_mean_gray)
-            
-            if bright_diff > 20.0:
+            if bright_diff > 25.0:
                 continue
                 
+            # Точная ошибка фазы на границе приграничного кольца
+            boundary_mse = float(np.mean((shifted_gray[boundary_mask].astype(float) - gray_orig[boundary_mask].astype(float))**2))
             donor_angle = compute_structure_tensor_orientation(shifted_gray, boundary_mask)
             angle_diff = abs(np.arctan2(np.sin(dom_angle - donor_angle), np.cos(dom_angle - donor_angle)))
             
-            score = bright_diff + angle_diff * 15.0
+            score = boundary_mse + angle_diff * 15.0
             if score < best_score:
                 best_score = score
                 best_donor_shift = (dy, dx)
                 
-        if best_donor_shift is not None and best_score < 35.0:
+        if best_donor_shift is not None and best_score < 400.0:
             dy, dx = best_donor_shift
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             donor_patch = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
