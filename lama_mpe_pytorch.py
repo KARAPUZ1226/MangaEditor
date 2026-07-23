@@ -615,6 +615,16 @@ class LamaMPEPyTorchInpainter:
         else:
             self.segmenter = None
             print(f"[LaMa PyTorch] Warning: text segmenter not found at {segmenter_path}")
+            
+        # Загружаем YOLOv8 детектор текста для защиты рисунка и пуговиц (загружает custom_detector.onnx)
+        try:
+            from translator import ComicTextDetector
+            self.text_detector = ComicTextDetector()
+            self.text_detector.load()
+            print("[LaMa PyTorch] Loaded text detector guard successfully.")
+        except Exception as e:
+            self.text_detector = None
+            print(f"[LaMa PyTorch] Warning: failed to load text detector guard: {e}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -689,18 +699,24 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] Square U-Net segmenter error: {e}")
 
-        dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
-        n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-        text_ink_box = np.zeros_like(dark_ink)
-        for i in range(1, n_l):
-            w_i = sts[i, cv2.CC_STAT_WIDTH]
-            h_i = sts[i, cv2.CC_STAT_HEIGHT]
-            area_i = sts[i, cv2.CC_STAT_AREA]
-            # Отфильтровываем длинные вертикальные/горизонтальные линии рисунка (ноги, рамы)
-            if area_i < 1500 and w_i < 120 and h_i < 120:
-                text_ink_box[lbs == i] = 255
-                
-        text_ink_box = cv2.dilate(text_ink_box, np.ones((3, 3), np.uint8), iterations=2)
+        # Используем U-Net сегментатор для строгой локализации текста
+        if np.count_nonzero(seg_box_unet) > 5:
+            # Маска строится только по пересечению темных чернил и расширенной U-Net маски
+            unet_dilated = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
+            text_ink_box = (crop_box_gray < 185).astype(np.uint8) * 255
+            text_ink_box = text_ink_box & unet_dilated
+        else:
+            # Резервный вариант, если U-Net не сработал: берем только компактные темные компоненты
+            dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
+            n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            text_ink_box = np.zeros_like(dark_ink)
+            for i in range(1, n_l):
+                w_i = sts[i, cv2.CC_STAT_WIDTH]
+                h_i = sts[i, cv2.CC_STAT_HEIGHT]
+                area_i = sts[i, cv2.CC_STAT_AREA]
+                if area_i >= 8 and area_i < 650 and (w_i >= 3 or h_i >= 3) and w_i < 80 and h_i < 80:
+                    text_ink_box[lbs == i] = 255
+            text_ink_box = cv2.dilate(text_ink_box, np.ones((3, 3), np.uint8), iterations=2)
 
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
@@ -715,12 +731,34 @@ class LamaMPEPyTorchInpainter:
         dilated_mask_full = cv2.dilate(combined_text_ink_full, kernel_3, iterations=3)
         dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
             
-        crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
-        
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_raw = raw_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         c_h, c_w = crop_image.shape[:2]
+        
+        # Ограничиваем маску инпейнтинга строго рамками, найденными YOLOv8 детектором (защита пуговиц/складок/ног!)
+        if self.text_detector is not None:
+            try:
+                qrects = self.text_detector.detect(crop_image)
+                if qrects:
+                    detector_mask = np.zeros((c_h, c_w), dtype=np.uint8)
+                    for qr in qrects:
+                        rx = int(qr.x())
+                        ry = int(qr.y())
+                        rw = int(qr.width())
+                        rh = int(qr.height())
+                        rx0 = max(0, rx)
+                        ry0 = max(0, ry)
+                        rx1 = min(c_w, rx + rw)
+                        ry1 = min(c_h, ry + rh)
+                        if rx1 > rx0 and ry1 > ry0:
+                            detector_mask[ry0:ry1, rx0:rx1] = 255
+                    # Расширяем рамку детектора на 5px для захвата белого обвода букв
+                    detector_mask_dilated = cv2.dilate(detector_mask, np.ones((5, 5), np.uint8), iterations=1)
+                    # Пересекаем маски: пиксель стирается только если он U-Net текст и внутри YOLOv8 рамки детектора!
+                    crop_mask_dilated = crop_mask_dilated & detector_mask_dilated
+            except Exception as e:
+                print(f"[LaMa Detector Guard] Error: {e}")
         
         # --- ШАГ 3: LaMa Inpaint проход ---
         pad_h = (8 - c_h % 8) % 8
