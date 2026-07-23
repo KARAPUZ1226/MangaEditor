@@ -736,26 +736,31 @@ class LamaMPEPyTorchInpainter:
         crop_mask_raw = raw_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         c_h, c_w = crop_image.shape[:2]
         
-        # Ограничиваем маску инпейнтинга строго рамками, найденными YOLOv8 детектором (защита пуговиц/складок/ног!)
+        # Ограничиваем маску инпейнтинга строго рамками, найденными YOLOv8 детектором на ПОЛНОМ кадре (чтобы масштаб букв был правильным!)
         if self.text_detector is not None:
             try:
-                qrects = self.text_detector.detect(crop_image)
+                # Детектируем на полном оригинальном изображении (где иероглифы имеют нормальный размер)
+                qrects = self.text_detector.detect(image)
                 if qrects:
                     detector_mask = np.zeros((c_h, c_w), dtype=np.uint8)
                     for qr in qrects:
-                        rx = int(qr.x())
-                        ry = int(qr.y())
-                        rw = int(qr.width())
-                        rh = int(qr.height())
-                        rx0 = max(0, rx)
-                        ry0 = max(0, ry)
-                        rx1 = min(c_w, rx + rw)
-                        ry1 = min(c_h, ry + rh)
+                        rx1_full = int(qr.x())
+                        ry1_full = int(qr.y())
+                        rx2_full = int(qr.x() + qr.width())
+                        ry2_full = int(qr.y() + qr.height())
+                        
+                        # Переводим глобальные координаты во внутренние координаты кропа
+                        rx0 = max(0, rx1_full - x_min_pad)
+                        ry0 = max(0, ry1_full - y_min_pad)
+                        rx1 = min(c_w, rx2_full - x_min_pad)
+                        ry1 = min(c_h, ry2_full - y_min_pad)
+                        
                         if rx1 > rx0 and ry1 > ry0:
                             detector_mask[ry0:ry1, rx0:rx1] = 255
-                    # Расширяем рамку детектора на 5px для захвата белого обвода букв
-                    detector_mask_dilated = cv2.dilate(detector_mask, np.ones((5, 5), np.uint8), iterations=1)
-                    # Пересекаем маски: пиксель стирается только если он U-Net текст и внутри YOLOv8 рамки детектора!
+                    
+                    # Расширяем рамку детектора на 9px для гарантированного захвата белой окантовки и мелких краев
+                    detector_mask_dilated = cv2.dilate(detector_mask, np.ones((9, 9), np.uint8), iterations=1)
+                    # Пересекаем маски: стираем только пиксели, подтвержденные YOLOv8-детектором!
                     crop_mask_dilated = crop_mask_dilated & detector_mask_dilated
             except Exception as e:
                 print(f"[LaMa Detector Guard] Error: {e}")
