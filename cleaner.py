@@ -62,6 +62,8 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
         # Дорисовка
         if lama_inpainter is not None:
             try:
+                lama_inpainter.full_image = cv_image
+                lama_inpainter.crop_offset = (x, y)
                 inpainted = lama_inpainter.inpaint(crop, text_mask)
                 crop[:] = inpainted
             except Exception as e:
@@ -126,6 +128,8 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
 
     if lama_inpainter is not None:
         try:
+            lama_inpainter.full_image = cv_image
+            lama_inpainter.crop_offset = (x, y)
             crop = lama_inpainter.inpaint(crop, text_mask)
         except Exception as e:
             print(f"LaMa error: {e}")
