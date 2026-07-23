@@ -136,15 +136,18 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         dy, dx = best_global_shift
         M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
         
-        # Донор берётся из image_lama (где LaMa УЖЕ удалила черновик текста -> 0% скопированных букв!)
-        shifted_orig = cv2.warpAffine(image_lama, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-        shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
+        # Готовим чистый оригинальный фон: буквы текста заменены на подложку LaMa, настоящие растровые точки вокруг сохранены!
+        clean_orig = image_orig.copy()
+        clean_orig[donor_forbidden] = image_lama[donor_forbidden]
+        
+        shifted_donor = cv2.warpAffine(clean_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+        shifted_gray = cv2.cvtColor(shifted_donor, cv2.COLOR_BGR2GRAY) if shifted_donor.ndim == 3 else shifted_donor
         
         # Безопасное смещение средней яркости без умножения контраста (устраняет засветы!)
         donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
         offset = np.clip(target_mean_gray - donor_ring_mean, -15.0, 15.0)
         
-        norm_donor = np.clip(shifted_orig.astype(np.float32) + offset, 0, 255).astype(np.uint8)
+        norm_donor = np.clip(shifted_donor.astype(np.float32) + offset, 0, 255).astype(np.uint8)
         
         # Защита чистого черного и чистого белого от LaMa
         gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
