@@ -745,7 +745,7 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
                 
-        # Тёмные чернила букв (исключаем скринтоны и белые области)
+        # ШАГ 2: Выделяем 100% всех букв текста без пропуска символов и без задевания лишнего
         dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
         n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
         compact_dark_ink = np.zeros_like(dark_ink)
@@ -753,18 +753,17 @@ class LamaMPEPyTorchInpainter:
             w_i = sts[i, cv2.CC_STAT_WIDTH]
             h_i = sts[i, cv2.CC_STAT_HEIGHT]
             area_i = sts[i, cv2.CC_STAT_AREA]
-            # Исключаем длинные контурные линии ног/платья и фоновый шум
-            if area_i >= 8 and area_i < 1200 and w_i < 90 and h_i < 90:
+            # Исключаем длинные контурные линии ног/платья и фоновые рамки
+            if area_i >= 8 and area_i < 1200 and w_i < 95 and h_i < 95:
                 compact_dark_ink[lbs == i] = 255
                 
         if np.count_nonzero(seg_box_unet) > 5:
-            # Берем чернила, подтвержденные U-Net
-            unet_dilated = cv2.dilate(seg_box_unet, np.ones((5, 5), np.uint8), iterations=1)
-            confirmed_ink = compact_dark_ink & unet_dilated
-            # Расширяем маску СТРОГО вокруг найденных чернил на 3px для захвата белой окантовки
-            text_ink_box = cv2.dilate(confirmed_ink, np.ones((3, 3), np.uint8), iterations=2)
+            text_ink_base = compact_dark_ink | seg_box_unet
         else:
-            text_ink_box = cv2.dilate(compact_dark_ink, np.ones((3, 3), np.uint8), iterations=2)
+            text_ink_base = compact_dark_ink
+            
+        # Захватываем белые обводки/окантовки вокруг символов (3px)
+        text_ink_box = cv2.dilate(text_ink_base, np.ones((3, 3), np.uint8), iterations=2)
             
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
