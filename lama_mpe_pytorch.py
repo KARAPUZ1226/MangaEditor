@@ -731,23 +731,23 @@ class LamaMPEPyTorchInpainter:
                 probs_map /= np.maximum(counts, 1.0)
                 crop_probs = probs_map[:b_h, :b_w]
                 
-                # Используем стандартный порог вероятности 0.50 (ваша модель обучена именно под него)
-                raw_unet = (crop_probs > 0.50).astype(np.uint8) * 255
+                # Порог 0.30 идеально объединяет все глифы текста и их белую окантовку, не цепляя пуговицы
+                raw_unet = (crop_probs > 0.30).astype(np.uint8) * 255
                 
-                # Очищаем от случайных шумов и одиночных растровых точек
+                # Очищаем от случайных шумов и микро-точек
                 num_l, lbs, sts, _ = cv2.connectedComponentsWithStats((raw_unet > 0).astype(np.uint8), connectivity=8)
                 for i in range(1, num_l):
                     w_i = sts[i, cv2.CC_STAT_WIDTH]
                     h_i = sts[i, cv2.CC_STAT_HEIGHT]
                     area_i = sts[i, cv2.CC_STAT_AREA]
-                    if area_i >= 8 and (w_i >= 3 or h_i >= 3) and area_i < 1200:
+                    if area_i >= 6 and (w_i >= 2 or h_i >= 2) and area_i < 2500:
                         seg_box_unet[lbs == i] = 255
             except Exception as e:
                 print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
                 
-        # Используем маску U-Net напрямую (совместно с дилатацией), чтобы захватить и буквы, и их белую окантовку/обводку
+        # Дилатируем маску U-Net для надежного захвата внешних белых краев букв
         if np.count_nonzero(seg_box_unet) > 5:
-            text_ink_box = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
+            text_ink_box = cv2.dilate(seg_box_unet, np.ones((5, 5), np.uint8), iterations=2)
         else:
             # Резервный поиск букв, если U-Net не загружен
             dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
