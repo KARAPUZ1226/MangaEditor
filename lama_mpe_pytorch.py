@@ -672,25 +672,35 @@ class LamaMPEPyTorchInpainter:
                     outputs = self.segmenter.run(None, {inp_name: inp})
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    seg_256 = (probs > 0.50).astype(np.uint8) * 255
+                    seg_256 = (probs > 0.20).astype(np.uint8) * 255
                     seg_sq = cv2.resize(seg_256, (max_dim, max_dim), interpolation=cv2.INTER_NEAREST)
-                    seg_box_unet = seg_sq[y_off:y_off+b_h, x_off:x_off+b_w]
+                    raw_unet = seg_sq[y_off:y_off+b_h, x_off:x_off+b_w]
+                    
+                    # Очищаем U-Net маску от одиночных растровых точек (area < 8)
+                    num_l, lbs, sts, _ = cv2.connectedComponentsWithStats((raw_unet > 0).astype(np.uint8), connectivity=8)
+                    seg_box_unet = np.zeros_like(raw_unet)
+                    for i in range(1, num_l):
+                        w_i = sts[i, cv2.CC_STAT_WIDTH]
+                        h_i = sts[i, cv2.CC_STAT_HEIGHT]
+                        area_i = sts[i, cv2.CC_STAT_AREA]
+                        # Точки растра скринтона микроскопические (area < 8), штрихи иероглифов от 8px
+                        if area_i >= 8 and (w_i >= 3 or h_i >= 3) and area_i < 1200:
+                            seg_box_unet[lbs == i] = 255
             except Exception as e:
                 print(f"[LaMa] Square U-Net segmenter error: {e}")
 
-        # Маска строго локализована по U-Net детекции текста (без захвата ног, одежды и контуров!)
-        if np.count_nonzero(seg_box_unet) > 5:
-            text_ink_box = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
-        else:
-            # Если U-Net не нашел текст, берем только темные штрихи ограниченного размера (символы)
-            dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
-            # Фильтруем длинные линии рисунка (ноги, контуры) по размеру связных компонентов
-            n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-            text_ink_box = np.zeros_like(dark_ink)
-            for i in range(1, n_l):
-                w_i, h_i, area_i = sts[i, cv2.CC_STAT_WIDTH], sts[i, cv2.CC_STAT_HEIGHT], sts[i, cv2.CC_STAT_AREA]
-                if area_i < 650 and w_i < 80 and h_i < 80:  # Изолируем только компактные глифы символов!
-                    text_ink_box[lbs == i] = 255
+        dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
+        n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+        text_ink_box = np.zeros_like(dark_ink)
+        for i in range(1, n_l):
+            w_i = sts[i, cv2.CC_STAT_WIDTH]
+            h_i = sts[i, cv2.CC_STAT_HEIGHT]
+            area_i = sts[i, cv2.CC_STAT_AREA]
+            # Отфильтровываем длинные вертикальные/горизонтальные линии рисунка (ноги, рамы)
+            if area_i < 1500 and w_i < 120 and h_i < 120:
+                text_ink_box[lbs == i] = 255
+                
+        text_ink_box = cv2.dilate(text_ink_box, np.ones((3, 3), np.uint8), iterations=2)
 
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
