@@ -661,52 +661,97 @@ class LamaMPEPyTorchInpainter:
         x_min_pad = max(0, x_min - pad_extra)
         x_max_pad = min(width, x_max + pad_extra)
 
-        # --- ШАГ 2: U-Net маска текста с сохранением пропорций (1:1 aspect ratio) ---
+        # --- ШАГ 2: U-Net маска текста с помощью скользящего окна 256x256 без сжатия пропорций ---
         crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
         b_h, b_w = crop_box_gray.shape
-        max_dim = max(b_h, b_w)
         
-        sq_img = np.full((max_dim, max_dim), 255, dtype=np.uint8)
-        y_off = (max_dim - b_h) // 2
-        x_off = (max_dim - b_w) // 2
-        sq_img[y_off:y_off+b_h, x_off:x_off+b_w] = crop_box_gray
-
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
-        if self.segmenter is not None and max_dim >= 8:
+        if self.segmenter is not None:
             try:
-                inp_info = self.segmenter.get_inputs()[0]
-                inp_name = inp_info.name
-                if inp_name == "input":
-                    sq_256 = cv2.resize(sq_img, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (sq_256.astype(np.float32) / 255.0)[None, None, :, :]
+                patch_size = 256
+                stride = 128
+                
+                # Дополняем кроп до минимального размера 256x256, если нужно
+                pad_h = max(0, patch_size - b_h)
+                pad_w = max(0, patch_size - b_w)
+                
+                if pad_h > 0 or pad_w > 0:
+                    padded_img = cv2.copyMakeBorder(crop_box_gray, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
+                else:
+                    padded_img = crop_box_gray
+                    
+                ph, pw = padded_img.shape
+                probs_map = np.zeros((ph, pw), dtype=np.float32)
+                counts = np.zeros((ph, pw), dtype=np.float32)
+                
+                inp_name = self.segmenter.get_inputs()[0].name
+                
+                # Проходы скользящего окна
+                for y in range(0, ph - patch_size + 1, stride):
+                    for x in range(0, pw - patch_size + 1, stride):
+                        patch = padded_img[y:y+patch_size, x:x+patch_size]
+                        inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
+                        outputs = self.segmenter.run(None, {inp_name: inp})
+                        logits = outputs[0][0, 0]
+                        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                        
+                        probs_map[y:y+patch_size, x:x+patch_size] += probs
+                        counts[y:y+patch_size, x:x+patch_size] += 1.0
+                
+                # Крайние проходы по нижним и правым границам
+                final_y = ph - patch_size
+                final_x = pw - patch_size
+                
+                for x in range(0, pw - patch_size + 1, stride):
+                    patch = padded_img[final_y:final_y+patch_size, x:x+patch_size]
+                    inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
                     outputs = self.segmenter.run(None, {inp_name: inp})
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    seg_256 = (probs > 0.20).astype(np.uint8) * 255
-                    seg_sq = cv2.resize(seg_256, (max_dim, max_dim), interpolation=cv2.INTER_NEAREST)
-                    raw_unet = seg_sq[y_off:y_off+b_h, x_off:x_off+b_w]
+                    probs_map[final_y:final_y+patch_size, x:x+patch_size] += probs
+                    counts[final_y:final_y+patch_size, x:x+patch_size] += 1.0
                     
-                    # Очищаем U-Net маску от одиночных растровых точек (area < 8)
-                    num_l, lbs, sts, _ = cv2.connectedComponentsWithStats((raw_unet > 0).astype(np.uint8), connectivity=8)
-                    seg_box_unet = np.zeros_like(raw_unet)
-                    for i in range(1, num_l):
-                        w_i = sts[i, cv2.CC_STAT_WIDTH]
-                        h_i = sts[i, cv2.CC_STAT_HEIGHT]
-                        area_i = sts[i, cv2.CC_STAT_AREA]
-                        # Точки растра скринтона микроскопические (area < 8), штрихи иероглифов от 8px
-                        if area_i >= 8 and (w_i >= 3 or h_i >= 3) and area_i < 1200:
-                            seg_box_unet[lbs == i] = 255
+                for y in range(0, ph - patch_size + 1, stride):
+                    patch = padded_img[y:y+patch_size, final_x:final_x+patch_size]
+                    inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
+                    outputs = self.segmenter.run(None, {inp_name: inp})
+                    logits = outputs[0][0, 0]
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                    probs_map[y:y+patch_size, final_x:final_x+patch_size] += probs
+                    counts[y:y+patch_size, final_x:final_x+patch_size] += 1.0
+                    
+                patch = padded_img[final_y:final_y+patch_size, final_x:final_x+patch_size]
+                inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
+                outputs = self.segmenter.run(None, {inp_name: inp})
+                logits = outputs[0][0, 0]
+                probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                probs_map[final_y:final_y+patch_size, final_x:final_x+patch_size] += probs
+                counts[final_y:final_y+patch_size, final_x:final_x+patch_size] += 1.0
+                
+                probs_map /= np.maximum(counts, 1.0)
+                crop_probs = probs_map[:b_h, :b_w]
+                
+                # Используем стандартный порог вероятности 0.50 (ваша модель обучена именно под него)
+                raw_unet = (crop_probs > 0.50).astype(np.uint8) * 255
+                
+                # Очищаем от случайных шумов и одиночных растровых точек
+                num_l, lbs, sts, _ = cv2.connectedComponentsWithStats((raw_unet > 0).astype(np.uint8), connectivity=8)
+                for i in range(1, num_l):
+                    w_i = sts[i, cv2.CC_STAT_WIDTH]
+                    h_i = sts[i, cv2.CC_STAT_HEIGHT]
+                    area_i = sts[i, cv2.CC_STAT_AREA]
+                    if area_i >= 8 and (w_i >= 3 or h_i >= 3) and area_i < 1200:
+                        seg_box_unet[lbs == i] = 255
             except Exception as e:
-                print(f"[LaMa] Square U-Net segmenter error: {e}")
-
-        # Используем U-Net сегментатор для строгой локализации текста
+                print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
+                
+        # Строим итоговую маску букв по пересечению темных чернил и маски U-Net
         if np.count_nonzero(seg_box_unet) > 5:
-            # Маска строится только по пересечению темных чернил и расширенной U-Net маски
             unet_dilated = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
             text_ink_box = (crop_box_gray < 185).astype(np.uint8) * 255
             text_ink_box = text_ink_box & unet_dilated
         else:
-            # Резервный вариант, если U-Net не сработал: берем только компактные темные компоненты
+            # Резервный поиск букв, если U-Net не загружен
             dark_ink = (crop_box_gray < 185).astype(np.uint8) * 255
             n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
             text_ink_box = np.zeros_like(dark_ink)
@@ -717,53 +762,24 @@ class LamaMPEPyTorchInpainter:
                 if area_i >= 8 and area_i < 650 and (w_i >= 3 or h_i >= 3) and w_i < 80 and h_i < 80:
                     text_ink_box[lbs == i] = 255
             text_ink_box = cv2.dilate(text_ink_box, np.ones((3, 3), np.uint8), iterations=2)
-
+            
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
         combined_text_ink_full[y_min:y_max, x_min:x_max] = text_ink_box
         combined_text_ink_full[~user_mask_bool] = 0
-
+        
         # Сырая маска текста (M_text_raw)
         raw_mask_full = combined_text_ink_full.copy()
-
+        
         # Дилатированная маска текста (M_text_dilated) на 3px строго вокруг символов (защищает контурные линии рисунка!)
         kernel_3 = np.ones((3, 3), np.uint8)
         dilated_mask_full = cv2.dilate(combined_text_ink_full, kernel_3, iterations=3)
         dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
-            
+        
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_raw = raw_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         c_h, c_w = crop_image.shape[:2]
-        
-        # Ограничиваем маску инпейнтинга строго рамками, найденными YOLOv8 детектором на ПОЛНОМ кадре (чтобы масштаб букв был правильным!)
-        if self.text_detector is not None:
-            try:
-                # Детектируем на полном оригинальном изображении (где иероглифы имеют нормальный размер)
-                qrects = self.text_detector.detect(image)
-                if qrects:
-                    detector_mask = np.zeros((c_h, c_w), dtype=np.uint8)
-                    for qr in qrects:
-                        rx1_full = int(qr.x())
-                        ry1_full = int(qr.y())
-                        rx2_full = int(qr.x() + qr.width())
-                        ry2_full = int(qr.y() + qr.height())
-                        
-                        # Переводим глобальные координаты во внутренние координаты кропа
-                        rx0 = max(0, rx1_full - x_min_pad)
-                        ry0 = max(0, ry1_full - y_min_pad)
-                        rx1 = min(c_w, rx2_full - x_min_pad)
-                        ry1 = min(c_h, ry2_full - y_min_pad)
-                        
-                        if rx1 > rx0 and ry1 > ry0:
-                            detector_mask[ry0:ry1, rx0:rx1] = 255
-                    
-                    # Расширяем рамку детектора на 9px для гарантированного захвата белой окантовки и мелких краев
-                    detector_mask_dilated = cv2.dilate(detector_mask, np.ones((9, 9), np.uint8), iterations=1)
-                    # Пересекаем маски: стираем только пиксели, подтвержденные YOLOv8-детектором!
-                    crop_mask_dilated = crop_mask_dilated & detector_mask_dilated
-            except Exception as e:
-                print(f"[LaMa Detector Guard] Error: {e}")
         
         # --- ШАГ 3: LaMa Inpaint проход ---
         pad_h = (8 - c_h % 8) % 8
