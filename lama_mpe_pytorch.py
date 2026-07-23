@@ -648,8 +648,15 @@ class LamaMPEPyTorchInpainter:
             return image
             
         y_indices, x_indices = np.where(user_mask_bool)
-        y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
-        x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
+        y_min_raw, y_max_raw = int(y_indices.min()), int(y_indices.max()) + 1
+        x_min_raw, x_max_raw = int(x_indices.min()), int(x_indices.max()) + 1
+        
+        # Расширяем область детекции по горизонтали (+130px влево/вправо), чтобы гарантированно захватывать целые строки текста
+        y_min = max(0, y_min_raw - 15)
+        y_max = min(height, y_max_raw + 15)
+        x_min = max(0, x_min_raw - 130)
+        x_max = min(width, x_max_raw + 130)
+        
         box_h, box_w = y_max - y_min, x_max - x_min
         
         # --- ШАГ 1: Кроп с контекстом padding = 1.5x (до 512px) ---
