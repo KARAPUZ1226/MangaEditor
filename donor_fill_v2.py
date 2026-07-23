@@ -149,19 +149,20 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         if best_donor_shift is not None:
             dy, dx = best_donor_shift
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-            shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+            # Донор берётся из image_lama (где LaMa УЖЕ удалила черновик текста -> 0% скопированных букв!)
+            shifted_orig = cv2.warpAffine(image_lama, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
             
+            # Безопасное смещение средней яркости без умножения контраста (устраняет засветы!)
             donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
-            donor_ring_std = float(np.std(shifted_gray[block_boundary])) + 1e-5
+            offset = np.clip(target_mean_gray - donor_ring_mean, -15.0, 15.0)
             
-            norm_donor = (shifted_orig.astype(np.float32) - donor_ring_mean) * (target_std_gray / donor_ring_std) + target_mean_gray
-            donor_patch = np.clip(norm_donor, 0, 255).astype(np.uint8)
+            norm_donor = np.clip(shifted_orig.astype(np.float32) + offset, 0, 255).astype(np.uint8)
             
             # Защита чистого черного и чистого белого от LaMa
             gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
             gray_target_mask = comp_mask & (gray_lama >= 15) & (gray_lama <= 240)
             
-            result[gray_target_mask] = donor_patch[gray_target_mask]
+            result[gray_target_mask] = norm_donor[gray_target_mask]
             
     return result
