@@ -93,6 +93,22 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
     donor_forbidden = (M_text_raw > 0)
     donor_valid_mask = (~donor_forbidden) & (M_fail == 0)
     
+    # Проверка "нужен ли донор для скринтона" на всем блоке M_fail
+    block_needs_texture = region_needs_texture(image_orig, M_fail, ring_width=15)
+    if not block_needs_texture:
+        return image_lama.copy()
+        
+    # Кольцо 10px снаружи ВСЕГО блока M_fail для эталонного забора растровых точек
+    k_block = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    block_boundary = (cv2.dilate(M_fail, k_block) > 0) & (M_fail == 0) & donor_valid_mask
+    if not np.any(block_boundary):
+        return image_lama.copy()
+        
+    target_mean_gray = float(np.mean(gray_orig[block_boundary]))
+    target_std_gray = float(np.std(gray_orig[block_boundary])) + 1e-5
+    target_density_val = patch_density(image_orig[block_boundary], thresh=128)
+    dom_angle = compute_structure_tensor_orientation(gray_orig, block_boundary)
+    
     # 2. Выделяем связные компоненты провалов M_fail
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(M_fail, connectivity=8)
     
@@ -103,22 +119,6 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             
         comp_mask = (labels == i)
         
-        # Проверка "нужен ли донор для скринтона в этом регионе"
-        if not region_needs_texture(image_orig, comp_mask, ring_width=15):
-            continue
-        
-        # Расширенный контур компонента M_fail для точной подгонки фазы растра
-        kernel_8 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        dil = cv2.dilate(comp_mask.astype(np.uint8), kernel_8)
-        boundary_mask = (dil > 0) & (~comp_mask) & donor_valid_mask
-        
-        if not np.any(boundary_mask):
-            continue
-            
-        target_mean_gray = float(np.mean(gray_orig[boundary_mask]))
-        target_density_val = patch_density(image_orig[boundary_mask], thresh=128)
-        dom_angle = compute_structure_tensor_orientation(gray_orig, boundary_mask)
-            
         # 1px шаг для идеальной фазовой подгонки периодических точек скринтона!
         shifts_to_test = []
         for dy in range(-30, 31, 1):
@@ -134,24 +134,24 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             
-            if not np.all(shifted_valid[comp_mask] > 0):
+            if np.mean(shifted_valid[comp_mask] > 0) < 0.65:
                 continue
                 
             shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
             
             candidate_density_val = patch_density(shifted_gray[comp_mask], thresh=128)
-            if abs(target_density_val - candidate_density_val) > 0.18:
+            if abs(target_density_val - candidate_density_val) > 0.20:
                 continue
                 
-            donor_mean_gray = float(np.mean(shifted_gray[comp_mask]))
+            donor_mean_gray = float(np.mean(shifted_gray[block_boundary]))
             bright_diff = abs(donor_mean_gray - target_mean_gray)
-            if bright_diff > 25.0:
+            if bright_diff > 30.0:
                 continue
                 
-            # Точная ошибка фазы на границе приграничного кольца
-            boundary_mse = float(np.mean((shifted_gray[boundary_mask].astype(float) - gray_orig[boundary_mask].astype(float))**2))
-            donor_angle = compute_structure_tensor_orientation(shifted_gray, boundary_mask)
+            # Точная ошибка фазы на эталонном кольце block_boundary
+            boundary_mse = float(np.mean((shifted_gray[block_boundary].astype(float) - gray_orig[block_boundary].astype(float))**2))
+            donor_angle = compute_structure_tensor_orientation(shifted_gray, block_boundary)
             angle_diff = abs(np.arctan2(np.sin(dom_angle - donor_angle), np.cos(dom_angle - donor_angle)))
             
             score = boundary_mse + angle_diff * 15.0
@@ -159,12 +159,21 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
                 best_score = score
                 best_donor_shift = (dy, dx)
                 
-        if best_donor_shift is not None and best_score < 400.0:
+        print(f"[Donor Fill] Comp {i}: best_shift={best_donor_shift}, best_score={best_score:.2f}")
+        if best_donor_shift is not None:
             dy, dx = best_donor_shift
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-            donor_patch = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+            shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+            shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
             
-            blended_comp = feather_blend_patch(result, donor_patch, comp_mask, feather_px=4)
+            # Подгонка средней яркости и контраста донора под локальное кольцо (Gain & Offset)
+            donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
+            donor_ring_std = float(np.std(shifted_gray[block_boundary])) + 1e-5
+            
+            norm_donor = (shifted_orig.astype(np.float32) - donor_ring_mean) * (target_std_gray / donor_ring_std) + target_mean_gray
+            donor_patch = np.clip(norm_donor, 0, 255).astype(np.uint8)
+            
+            blended_comp = feather_blend_patch(result, donor_patch, comp_mask, feather_px=3)
             result[comp_mask] = blended_comp[comp_mask]
             
     return result
