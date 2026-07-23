@@ -101,7 +101,7 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
     target_density_val = patch_density(image_orig[block_boundary], thresh=128)
     dom_angle = compute_structure_tensor_orientation(gray_orig, block_boundary)
     
-    # 2. Выделяем связные компоненты провалов M_fail
+    # 2. Выделяем связные компоненты провалов M_fail и подбираем фазовый сдвиг
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(M_fail, connectivity=8)
     
     for i in range(1, num_labels):
@@ -111,54 +111,44 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             
         comp_mask = (labels == i)
         
-        # 1px шаг для идеальной фазовой подгонки периодических точек скринтона!
-        shifts_to_test = []
-        for dy in range(-30, 31, 1):
-            for dx in range(-30, 31, 1):
-                if abs(dy) < 3 and abs(dx) < 3:
-                    continue
-                shifts_to_test.append((dy, dx))
-                
+        # 1px шаг для идеальной фазовой подгонки в пределах растрового периода [-25, 25]px
         best_donor_shift = None
         best_score = float('inf')
+        
+        for dy in range(-25, 26, 1):
+            for dx in range(-25, 26, 1):
+                if abs(dy) < 3 and abs(dx) < 3:
+                    continue
+                    
+                M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
+                shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
                 
-        for dy, dx in shifts_to_test:
-            M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-            shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            
-            if np.mean(shifted_valid[comp_mask] > 0) < 0.65:
-                continue
+                if np.mean(shifted_valid[comp_mask] > 0) < 0.50:
+                    continue
+                    
+                shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+                shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
                 
-            shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-            shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
-            
-            candidate_density_val = patch_density(shifted_gray[comp_mask], thresh=128)
-            if abs(target_density_val - candidate_density_val) > 0.20:
-                continue
+                donor_mean_gray = float(np.mean(shifted_gray[block_boundary]))
+                bright_diff = abs(donor_mean_gray - target_mean_gray)
+                if bright_diff > 35.0:
+                    continue
+                    
+                boundary_mse = float(np.mean((shifted_gray[block_boundary].astype(float) - gray_orig[block_boundary].astype(float))**2))
+                donor_angle = compute_structure_tensor_orientation(shifted_gray, block_boundary)
+                angle_diff = abs(np.arctan2(np.sin(dom_angle - donor_angle), np.cos(dom_angle - donor_angle)))
                 
-            donor_mean_gray = float(np.mean(shifted_gray[block_boundary]))
-            bright_diff = abs(donor_mean_gray - target_mean_gray)
-            if bright_diff > 30.0:
-                continue
-                
-            # Точная ошибка фазы на эталонном кольце block_boundary
-            boundary_mse = float(np.mean((shifted_gray[block_boundary].astype(float) - gray_orig[block_boundary].astype(float))**2))
-            donor_angle = compute_structure_tensor_orientation(shifted_gray, block_boundary)
-            angle_diff = abs(np.arctan2(np.sin(dom_angle - donor_angle), np.cos(dom_angle - donor_angle)))
-            
-            score = boundary_mse + angle_diff * 15.0
-            if score < best_score:
-                best_score = score
-                best_donor_shift = (dy, dx)
-                
-        print(f"[Donor Fill] Comp {i}: best_shift={best_donor_shift}, best_score={best_score:.2f}")
+                score = boundary_mse + angle_diff * 15.0
+                if score < best_score:
+                    best_score = score
+                    best_donor_shift = (dy, dx)
+                    
         if best_donor_shift is not None:
             dy, dx = best_donor_shift
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
             
-            # Подгонка средней яркости и контраста донора под локальное кольцо (Gain & Offset)
             donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
             donor_ring_std = float(np.std(shifted_gray[block_boundary])) + 1e-5
             
