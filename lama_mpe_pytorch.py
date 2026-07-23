@@ -753,8 +753,8 @@ class LamaMPEPyTorchInpainter:
             w_i = sts[i, cv2.CC_STAT_WIDTH]
             h_i = sts[i, cv2.CC_STAT_HEIGHT]
             area_i = sts[i, cv2.CC_STAT_AREA]
-            # Исключаем длинные контурные линии ног/платья и фоновые рамки
-            if area_i >= 8 and area_i < 1200 and w_i < 95 and h_i < 95:
+            # Разрешаем слитные слова текста (высота или ширина <= 80px), исключая ноги и платья (у которых и w > 80, и h > 80)
+            if area_i >= 8 and area_i < 4500 and (w_i <= 80 or h_i <= 80):
                 compact_dark_ink[lbs == i] = 255
                 
         if np.count_nonzero(seg_box_unet) > 5:
