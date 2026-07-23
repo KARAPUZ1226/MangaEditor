@@ -136,20 +136,24 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
                 
     if best_global_shift is not None:
         dy, dx = best_global_shift
-        M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
         
-        # Готовим чистый оригинальный фон без белесого шума LaMa:
-        # Заполняем область текста идеальной локальной интерполяцией растровой сетки Telea
-        clean_orig = cv2.inpaint(image_orig, (donor_forbidden).astype(np.uint8) * 255, 5, cv2.INPAINT_TELEA)
+        # Двунаправленный забор чистых растровых точек из оригинального изображения (0% шума LaMa, 0% размытия Telea)
+        M_shift1 = np.float32([[1, 0, dx], [0, 1, dy]])
+        shifted_donor1 = cv2.warpAffine(image_orig, M_shift1, (w, h), borderMode=cv2.BORDER_REFLECT)
+        shifted_forbidden1 = cv2.warpAffine(donor_forbidden.astype(np.uint8), M_shift1, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=1) > 0
         
-        shifted_donor = cv2.warpAffine(clean_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-        shifted_gray = cv2.cvtColor(shifted_donor, cv2.COLOR_BGR2GRAY) if shifted_donor.ndim == 3 else shifted_donor
+        M_shift2 = np.float32([[1, 0, -dx], [0, 1, -dy]])
+        shifted_donor2 = cv2.warpAffine(image_orig, M_shift2, (w, h), borderMode=cv2.BORDER_REFLECT)
         
-        # Безопасное смещение средней яркости без умножения контраста (устраняет засветы!)
+        # Если сдвиг +1 попадает на текст, берём чистый растр со сдвига -1
+        pure_donor = shifted_donor1.copy()
+        pure_donor[shifted_forbidden1] = shifted_donor2[shifted_forbidden1]
+        
+        shifted_gray = cv2.cvtColor(pure_donor, cv2.COLOR_BGR2GRAY) if pure_donor.ndim == 3 else pure_donor
         donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
         offset = np.clip(target_mean_gray - donor_ring_mean, -15.0, 15.0)
         
-        norm_donor = np.clip(shifted_donor.astype(np.float32) + offset, 0, 255).astype(np.uint8)
+        norm_donor = np.clip(pure_donor.astype(np.float32) + offset, 0, 255).astype(np.uint8)
         
         # Плавно смешиваем донорный скринтон по краям маски (feathering), чтобы полностью скрыть квадратный шов!
         gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
