@@ -642,49 +642,7 @@ class LamaMPEPyTorchInpainter:
         x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
         box_h, box_w = y_max - y_min, x_max - x_min
         
-        # --- ШАГ 1: U-Net маска (M_text_raw и M_text_dilated) ---
-        seg_mask_box = np.zeros((box_h, box_w), dtype=np.uint8)
-        if self.segmenter is not None and box_h >= 8 and box_w >= 8:
-            try:
-                crop_gray_u = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-                inp_info = self.segmenter.get_inputs()[0]
-                inp_name = inp_info.name
-                if inp_name == "input":
-                    crop_256 = cv2.resize(crop_gray_u, (256, 256), interpolation=cv2.INTER_AREA)
-                    inp = (crop_256.astype(np.float32) / 255.0)[None, None, :, :]
-                    outputs = self.segmenter.run(None, {inp_name: inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    seg_256 = (probs > 0.08).astype(np.uint8) * 255
-                    seg_mask_box = cv2.resize(seg_256, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
-            except Exception as e:
-                print(f"[LaMa] U-Net segmenter error: {e}")
-                
-        crop_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-        dark_ink = (crop_gray < 185).astype(np.uint8) * 255
-        
-        if np.count_nonzero(seg_mask_box) > 10:
-            combined_text_ink = cv2.bitwise_or(dark_ink & seg_mask_box, dark_ink)
-        else:
-            combined_text_ink = dark_ink
-            
-        # Недилатированная сырая маска текста (M_text_raw) — запретная зона для донора
-        raw_mask_crop = combined_text_ink.copy()
-        raw_mask_full = np.zeros((height, width), dtype=np.uint8)
-        raw_mask_full[y_min:y_max, x_min:x_max] = raw_mask_crop
-        
-        # Дилатированная маска текста (M_text_dilated) на 10px для поглощения Fuchidori
-        kernel_3 = np.ones((3, 3), np.uint8)
-        dilated_mask_crop = cv2.dilate(combined_text_ink, kernel_3, iterations=10)
-        dilated_mask_full = np.zeros((height, width), dtype=np.uint8)
-        dilated_mask_full[y_min:y_max, x_min:x_max] = dilated_mask_crop
-        
-        if np.sum(dilated_mask_full > 0) < 5:
-            dilated_mask_full = cv2.dilate(mask, kernel_3, iterations=3)
-            dilated_mask_full[dilated_mask_full < 127] = 0
-            dilated_mask_full[dilated_mask_full >= 127] = 255
-            
-        # --- ШАГ 2: Кроп с контекстом padding = 1.5x (до 512px) ---
+        # --- ШАГ 1: Кроп с контекстом padding = 1.5x (до 512px) ---
         pad_extra = int(max(box_w, box_h) * 0.5)
         pad_extra = max(64, min(128, pad_extra))
         
@@ -692,6 +650,60 @@ class LamaMPEPyTorchInpainter:
         y_max_pad = min(height, y_max + pad_extra)
         x_min_pad = max(0, x_min - pad_extra)
         x_max_pad = min(width, x_max + pad_extra)
+
+        # --- ШАГ 2: U-Net маска текста с сохранением пропорций (1:1 aspect ratio) ---
+        crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
+        b_h, b_w = crop_box_gray.shape
+        max_dim = max(b_h, b_w)
+        
+        sq_img = np.full((max_dim, max_dim), 255, dtype=np.uint8)
+        y_off = (max_dim - b_h) // 2
+        x_off = (max_dim - b_w) // 2
+        sq_img[y_off:y_off+b_h, x_off:x_off+b_w] = crop_box_gray
+
+        seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
+        if self.segmenter is not None and max_dim >= 8:
+            try:
+                inp_info = self.segmenter.get_inputs()[0]
+                inp_name = inp_info.name
+                if inp_name == "input":
+                    sq_256 = cv2.resize(sq_img, (256, 256), interpolation=cv2.INTER_AREA)
+                    inp = (sq_256.astype(np.float32) / 255.0)[None, None, :, :]
+                    outputs = self.segmenter.run(None, {inp_name: inp})
+                    logits = outputs[0][0, 0]
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                    seg_256 = (probs > 0.25).astype(np.uint8) * 255
+                    seg_sq = cv2.resize(seg_256, (max_dim, max_dim), interpolation=cv2.INTER_NEAREST)
+                    seg_box_unet = seg_sq[y_off:y_off+b_h, x_off:x_off+b_w]
+            except Exception as e:
+                print(f"[LaMa] Square U-Net segmenter error: {e}")
+
+        dark_ink_box = (crop_box_gray < 165).astype(np.uint8) * 255
+        if np.count_nonzero(seg_box_unet) > 10:
+            text_ink_box = dark_ink_box & seg_box_unet
+        else:
+            text_ink_box = dark_ink_box
+
+        # Размещаем точную маску текста в полноразмерной маске
+        combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
+        combined_text_ink_full[y_min:y_max, x_min:x_max] = text_ink_box
+        combined_text_ink_full[~user_mask_bool] = 0
+
+        # Сырая маска текста (M_text_raw)
+        raw_mask_full = combined_text_ink_full.copy()
+
+        # Дилатированная маска текста (M_text_dilated) на 4px вокруг букв для захвата Fuchidori
+        kernel_3 = np.ones((3, 3), np.uint8)
+        dilated_mask_full = cv2.dilate(combined_text_ink_full, kernel_3, iterations=4)
+        dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
+
+        if np.sum(dilated_mask_full[y_min:y_max, x_min:x_max] > 0) < 5:
+            dilated_mask_full = cv2.dilate(mask, kernel_3, iterations=2)
+            dilated_mask_full[dilated_mask_full < 127] = 0
+            dilated_mask_full[dilated_mask_full >= 127] = 255
+            dilated_mask_full[~user_mask_bool] = 0
+            
+        crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
