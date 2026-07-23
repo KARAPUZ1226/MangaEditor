@@ -104,65 +104,52 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
     target_density_val = patch_density(image_orig[block_boundary], thresh=128)
     dom_angle = compute_structure_tensor_orientation(gray_orig, block_boundary)
     
-    # 2. Выделяем связные компоненты провалов M_fail и подбираем фазовый сдвиг
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(M_fail, connectivity=8)
+    # 2. Вычисляем ЕДИНЫЙ глобальный фазовый сдвиг (dy, dx) для всего блока M_fail
+    # Это полностью исключает разрывы сетки, лоскуты и грязь ("лоскутное одеяло")!
+    best_global_shift = None
+    best_score = float('inf')
     
-    for i in range(1, num_labels):
-        x_c, y_c, w_c, h_c, area = stats[i]
-        if area < 4:
-            continue
-            
-        comp_mask = (labels == i)
-        
-        # 1px шаг для идеальной фазовой подгонки в пределах растрового периода [-25, 25]px
-        best_donor_shift = None
-        best_score = float('inf')
-        
-        for dy in range(-25, 26, 1):
-            for dx in range(-25, 26, 1):
-                if abs(dy) < 3 and abs(dx) < 3:
-                    continue
-                    
-                M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-                shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # Высокочастотный слой для выравнивания растра
+    gray_float = gray_orig.astype(np.float32)
+    gray_blur = cv2.GaussianBlur(gray_float, (5, 5), 0)
+    hf_orig = gray_float - gray_blur
+    
+    for dy in range(-25, 26, 1):
+        for dx in range(-25, 26, 1):
+            if abs(dy) < 2 and abs(dx) < 2:
+                continue
                 
-                if np.mean(shifted_valid[comp_mask] > 0) < 0.50:
-                    continue
-                    
-                shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-                shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
-                
-                donor_mean_gray = float(np.mean(shifted_gray[block_boundary]))
-                bright_diff = abs(donor_mean_gray - target_mean_gray)
-                if bright_diff > 35.0:
-                    continue
-                    
-                boundary_mse = float(np.mean((shifted_gray[block_boundary].astype(float) - gray_orig[block_boundary].astype(float))**2))
-                donor_angle = compute_structure_tensor_orientation(shifted_gray, block_boundary)
-                angle_diff = abs(np.arctan2(np.sin(dom_angle - donor_angle), np.cos(dom_angle - donor_angle)))
-                
-                score = boundary_mse + angle_diff * 15.0
-                if score < best_score:
-                    best_score = score
-                    best_donor_shift = (dy, dx)
-                    
-        if best_donor_shift is not None:
-            dy, dx = best_donor_shift
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-            # Донор берётся из image_lama (где LaMa УЖЕ удалила черновик текста -> 0% скопированных букв!)
-            shifted_orig = cv2.warpAffine(image_lama, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-            shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
+            shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             
-            # Безопасное смещение средней яркости без умножения контраста (устраняет засветы!)
-            donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
-            offset = np.clip(target_mean_gray - donor_ring_mean, -15.0, 15.0)
+            if np.mean(shifted_valid[M_fail > 0] > 0) < 0.40:
+                continue
+                
+            shifted_hf = cv2.warpAffine(hf_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+            boundary_mse = float(np.mean((shifted_hf[block_boundary] - hf_orig[block_boundary])**2))
             
-            norm_donor = np.clip(shifted_orig.astype(np.float32) + offset, 0, 255).astype(np.uint8)
-            
-            # Защита чистого черного и чистого белого от LaMa
-            gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
-            gray_target_mask = comp_mask & (gray_lama >= 15) & (gray_lama <= 240)
-            
-            result[gray_target_mask] = norm_donor[gray_target_mask]
-            
+            if boundary_mse < best_score:
+                best_score = boundary_mse
+                best_global_shift = (dy, dx)
+                
+    if best_global_shift is not None:
+        dy, dx = best_global_shift
+        M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
+        
+        # Донор берётся из image_lama (где LaMa УЖЕ удалила черновик текста -> 0% скопированных букв!)
+        shifted_orig = cv2.warpAffine(image_lama, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+        shifted_gray = cv2.cvtColor(shifted_orig, cv2.COLOR_BGR2GRAY)
+        
+        # Безопасное смещение средней яркости без умножения контраста (устраняет засветы!)
+        donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
+        offset = np.clip(target_mean_gray - donor_ring_mean, -15.0, 15.0)
+        
+        norm_donor = np.clip(shifted_orig.astype(np.float32) + offset, 0, 255).astype(np.uint8)
+        
+        # Защита чистого черного и чистого белого от LaMa
+        gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
+        gray_target_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240)
+        
+        result[gray_target_mask] = norm_donor[gray_target_mask]
+        
     return result
