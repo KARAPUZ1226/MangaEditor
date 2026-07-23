@@ -55,16 +55,17 @@ def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 
     ring_std = float(ring_pixels.std())
     ring_mean = float(ring_pixels.mean())
     
-    # Защита белых областей (>240), черных теней (<15) и гладких градиентов (std <= 8.0)
-    if ring_std <= 8.0 or ring_mean > 240.0 or ring_mean < 15.0:
+    # Защита чистых монохромных областей (чисто белый background >248, черная тень <10)
+    if ring_mean > 248.0 or ring_mean < 10.0:
         return False
         
-    # Считаем высокочастотную энергию шума/растра (варианты серого в 4-8px)
+    # Считаем высокочастотную энергию шума/растра
     blurred_full = cv2.GaussianBlur(gray.astype(np.float32), (5, 5), 0)
     hf_full = np.abs(gray.astype(np.float32) - blurred_full)
     hf_mean = float(hf_full[ring].mean())
     
-    return (ring_std >= 10.0) and (hf_mean > 6.5)
+    # Любой скринтон с мелким растром (std > 2.5 или hf_mean > 1.8) требует донорной заливки!
+    return (ring_std >= 2.5) or (hf_mean > 1.8)
 
 
 def patch_density(patch: np.ndarray, thresh: int = 128) -> float:
@@ -122,7 +123,7 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
             shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             
-            if np.mean(shifted_valid[M_fail > 0] > 0) < 0.40:
+            if np.mean(shifted_valid[M_fail > 0] > 0) < 0.05:
                 continue
                 
             shifted_hf = cv2.warpAffine(hf_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
