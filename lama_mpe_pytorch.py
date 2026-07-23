@@ -762,8 +762,8 @@ class LamaMPEPyTorchInpainter:
         else:
             text_ink_base = compact_dark_ink
             
-        # Захватываем белые обводки/окантовки вокруг символов (3px)
-        text_ink_box = cv2.dilate(text_ink_base, np.ones((3, 3), np.uint8), iterations=2)
+        # Захватываем белые обводки/окантовки вокруг символов (до 7px)
+        text_ink_box = cv2.dilate(text_ink_base, np.ones((5, 5), np.uint8), iterations=3)
             
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)

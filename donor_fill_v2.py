@@ -85,8 +85,9 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
     gray_orig = cv2.cvtColor(image_orig, cv2.COLOR_BGR2GRAY)
     h, w = gray_orig.shape
     
-    # 1. Запрещенная зона для выбора доноров — исходные недилатированные чернила текста
-    donor_forbidden = (M_text_raw > 0)
+    # 1. Запрещенная зона для выбора доноров — текст и его белые ореолы/обводки (с запасом 11px)
+    k_forb = np.ones((11, 11), np.uint8)
+    donor_forbidden = (cv2.dilate((M_text_raw > 0).astype(np.uint8), k_forb) > 0)
     donor_valid_mask = (~donor_forbidden) & (M_fail == 0)
     
     # Проверка "нужен ли донор для скринтона" на всем блоке M_fail
