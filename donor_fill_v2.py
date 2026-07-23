@@ -41,8 +41,8 @@ def feather_blend_patch(target: np.ndarray, donor: np.ndarray, mask: np.ndarray,
 def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 15) -> bool:
     """
     Классифицирует тип региона по высокочастотной энергии растра:
-    1. Однородный / белая одежда (ring_std <= 6.0) -> donor НЕ нужен (оставить LaMa).
-    2. Повторяющийся растровый скринтон (halftone dots, hf_mean > 7.0) -> donor ТРЕБУЕТСЯ для бесшовного растра.
+    1. Однородный / белая одежда / черная тень -> donor НЕ нужен (оставить 100% LaMa).
+    2. Повторяющийся растровый скринтон (halftone dots) -> donor ТРЕБУЕТСЯ для бесшовного растра.
     """
     k_ring = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_width * 2 + 1, ring_width * 2 + 1))
     ring = (cv2.dilate((mask > 0).astype(np.uint8), k_ring) > 0) & (mask == 0)
@@ -53,15 +53,18 @@ def region_needs_texture(image: np.ndarray, mask: np.ndarray, ring_width: int = 
         return False
         
     ring_std = float(ring_pixels.std())
-    if ring_std <= 6.0:
+    ring_mean = float(ring_pixels.mean())
+    
+    # Защита белых областей (>240), черных теней (<15) и гладких градиентов (std <= 8.0)
+    if ring_std <= 8.0 or ring_mean > 240.0 or ring_mean < 15.0:
         return False
         
-    # Считаем высокочастотную энергию шума/растра
+    # Считаем высокочастотную энергию шума/растра (варианты серого в 4-8px)
     blurred_full = cv2.GaussianBlur(gray.astype(np.float32), (5, 5), 0)
     hf_full = np.abs(gray.astype(np.float32) - blurred_full)
     hf_mean = float(hf_full[ring].mean())
     
-    return hf_mean > 7.0
+    return (ring_std >= 10.0) and (hf_mean > 6.5)
 
 
 def patch_density(patch: np.ndarray, thresh: int = 128) -> float:
@@ -155,6 +158,10 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             norm_donor = (shifted_orig.astype(np.float32) - donor_ring_mean) * (target_std_gray / donor_ring_std) + target_mean_gray
             donor_patch = np.clip(norm_donor, 0, 255).astype(np.uint8)
             
-            result[comp_mask] = donor_patch[comp_mask]
+            # Защита чистого черного и чистого белого от LaMa
+            gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
+            gray_target_mask = comp_mask & (gray_lama >= 15) & (gray_lama <= 240)
+            
+            result[gray_target_mask] = donor_patch[gray_target_mask]
             
     return result

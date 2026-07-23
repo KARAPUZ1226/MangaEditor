@@ -672,15 +672,15 @@ class LamaMPEPyTorchInpainter:
                     outputs = self.segmenter.run(None, {inp_name: inp})
                     logits = outputs[0][0, 0]
                     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    seg_256 = (probs > 0.25).astype(np.uint8) * 255
+                    seg_256 = (probs > 0.50).astype(np.uint8) * 255
                     seg_sq = cv2.resize(seg_256, (max_dim, max_dim), interpolation=cv2.INTER_NEAREST)
                     seg_box_unet = seg_sq[y_off:y_off+b_h, x_off:x_off+b_w]
             except Exception as e:
                 print(f"[LaMa] Square U-Net segmenter error: {e}")
 
-        dark_ink_box = (crop_box_gray < 185).astype(np.uint8) * 255
+        dark_ink_box = (crop_box_gray < 165).astype(np.uint8) * 255
         if np.count_nonzero(seg_box_unet) > 10:
-            text_ink_box = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
+            text_ink_box = dark_ink_box & seg_box_unet
         else:
             text_ink_box = dark_ink_box
 
