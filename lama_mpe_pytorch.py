@@ -678,11 +678,19 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] Square U-Net segmenter error: {e}")
 
-        if np.count_nonzero(seg_box_unet) > 10:
+        # Маска строго локализована по U-Net детекции текста (без захвата ног, одежды и контуров!)
+        if np.count_nonzero(seg_box_unet) > 5:
             text_ink_box = cv2.dilate(seg_box_unet, np.ones((3, 3), np.uint8), iterations=2)
         else:
-            dark_ink_box = (crop_box_gray < 165).astype(np.uint8) * 255
-            text_ink_box = dark_ink_box
+            # Если U-Net не нашел текст, берем только темные штрихи ограниченного размера (символы)
+            dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
+            # Фильтруем длинные линии рисунка (ноги, контуры) по размеру связных компонентов
+            n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            text_ink_box = np.zeros_like(dark_ink)
+            for i in range(1, n_l):
+                w_i, h_i, area_i = sts[i, cv2.CC_STAT_WIDTH], sts[i, cv2.CC_STAT_HEIGHT], sts[i, cv2.CC_STAT_AREA]
+                if area_i < 650 and w_i < 80 and h_i < 80:  # Изолируем только компактные глифы символов!
+                    text_ink_box[lbs == i] = 255
 
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
@@ -696,12 +704,6 @@ class LamaMPEPyTorchInpainter:
         kernel_3 = np.ones((3, 3), np.uint8)
         dilated_mask_full = cv2.dilate(combined_text_ink_full, kernel_3, iterations=3)
         dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
-
-        if np.sum(dilated_mask_full[y_min:y_max, x_min:x_max] > 0) < 5:
-            dilated_mask_full = cv2.dilate(mask, kernel_3, iterations=2)
-            dilated_mask_full[dilated_mask_full < 127] = 0
-            dilated_mask_full[dilated_mask_full >= 127] = 255
-            dilated_mask_full[~user_mask_bool] = 0
             
         crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         
