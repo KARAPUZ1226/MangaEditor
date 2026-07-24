@@ -184,21 +184,26 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         dy, dx = best_global_shift
         M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
         
-        clean_orig = image_orig.copy()
-        clean_orig[donor_forbidden] = image_lama[donor_forbidden]
+        # Забираем 100% ЧИСТЫЙ оригинальный растровый скринтон из image_orig (без LaMa смаза!)
+        shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+        shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0
         
-        shifted_donor = cv2.warpAffine(clean_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-        
-        # Разделение на НЧ (освещение LaMa) и ВЧ (растровые точки донора)
+        clean_donor = shifted_orig.copy()
+        invalid_donor = ~shifted_valid
+        if np.any(invalid_donor):
+            inv_shift = cv2.warpAffine(image_orig, np.float32([[1, 0, -dx], [0, 1, -dy]]), (w, h), borderMode=cv2.BORDER_REFLECT)
+            clean_donor[invalid_donor] = inv_shift[invalid_donor]
+            
+        # Разделение на НЧ (подложка освещения LaMa) и ВЧ (настоящие оригинальные точки растра)
         lama_float = image_lama.astype(np.float32)
-        donor_float = shifted_donor.astype(np.float32)
+        donor_float = clean_donor.astype(np.float32)
         
         k_size = (15, 15)
         lama_lf = cv2.GaussianBlur(lama_float, k_size, 0)
         donor_lf = cv2.GaussianBlur(donor_float, k_size, 0)
         donor_hf = donor_float - donor_lf
         
-        # Идеальный бесшовный патч: подложка освещения от LaMa + точные растровые точки от донора
+        # Настоящий 100% четкий растровый патч без мыла
         seamless_donor = np.clip(lama_lf + donor_hf, 0, 255).astype(np.uint8)
         
         # Защита черного (<=15), белого (>=240) и гладких областей (ВЧ < 4.0)
