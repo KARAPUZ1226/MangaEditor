@@ -154,10 +154,11 @@ def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_f
     else:
         T = 4.28
         
-    # 4. Находим точную фазу u0, v0 по максимальной корреляции на кольце
+    # 4. Находим точную фазу u0, v0 с субпиксельной точностью (0.01px)
     best_u0, best_v0 = 0.0, 0.0
     best_score = -float('inf')
     
+    # Шаг 1: Грубый поиск фазы
     for u0_step in np.linspace(0, T, 10, endpoint=False):
         for v0_step in np.linspace(0, T, 10, endpoint=False):
             u_grid = ((u_raw - u0_step) % T) - (T / 2.0)
@@ -169,7 +170,25 @@ def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_f
                 best_score = score
                 best_u0, best_v0 = u0_step, v0_step
                 
-    u0, v0 = best_u0, best_v0
+    # Шаг 2: Субпиксельное уточнение фазы с точностью 0.01px
+    fine_u0, fine_v0 = best_u0, best_v0
+    fine_score = best_score
+    delta = T / 10.0
+    
+    for du in np.linspace(-delta, delta, 9):
+        for dv in np.linspace(-delta, delta, 9):
+            u_cand = best_u0 + du
+            v_cand = best_v0 + dv
+            u_grid = ((u_raw - u_cand) % T) - (T / 2.0)
+            v_grid = ((v_raw - v_cand) % T) - (T / 2.0)
+            dist_sq = u_grid**2 + v_grid**2
+            
+            score = -float(np.mean(dist_sq[block_boundary] * hf_orig[block_boundary]))
+            if score > fine_score:
+                fine_score = score
+                fine_u0, fine_v0 = u_cand, v_cand
+                
+    u0, v0 = fine_u0, fine_v0
     
     # 5. Генерируем 45° диагональный манга-скринтон
     u_grid = ((u_raw - u0) % T) - (T / 2.0)
