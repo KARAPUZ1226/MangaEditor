@@ -648,15 +648,8 @@ class LamaMPEPyTorchInpainter:
             return image
             
         y_indices, x_indices = np.where(user_mask_bool)
-        y_min_raw, y_max_raw = int(y_indices.min()), int(y_indices.max()) + 1
-        x_min_raw, x_max_raw = int(x_indices.min()), int(x_indices.max()) + 1
-        
-        # Расширяем область детекции по горизонтали (+130px влево/вправо), чтобы гарантированно захватывать целые строки текста
-        y_min = max(0, y_min_raw - 15)
-        y_max = min(height, y_max_raw + 15)
-        x_min = max(0, x_min_raw - 130)
-        x_max = min(width, x_max_raw + 130)
-        
+        y_min, y_max = int(y_indices.min()), int(y_indices.max()) + 1
+        x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
         box_h, box_w = y_max - y_min, x_max - x_min
         
         # --- ШАГ 1: Кроп с контекстом padding = 1.5x (до 512px) ---
@@ -738,21 +731,44 @@ class LamaMPEPyTorchInpainter:
                 probs_map /= np.maximum(counts, 1.0)
                 crop_probs = probs_map[:b_h, :b_w]
                 
-                # Прямая маска обученной модели U-Net с порогом 0.20 и дилатацией 5x5
-                raw_unet = (crop_probs > 0.20).astype(np.uint8) * 255
-                seg_box_unet = cv2.dilate(raw_unet, np.ones((5, 5), np.uint8), iterations=2)
+                # Порог 0.30 идеально объединяет все глифы текста и их белую окантовку, не цепляя пуговицы
+                raw_unet = (crop_probs > 0.30).astype(np.uint8) * 255
+                
+                # Очищаем от случайных шумов и микро-точек
+                num_l, lbs, sts, _ = cv2.connectedComponentsWithStats((raw_unet > 0).astype(np.uint8), connectivity=8)
+                for i in range(1, num_l):
+                    w_i = sts[i, cv2.CC_STAT_WIDTH]
+                    h_i = sts[i, cv2.CC_STAT_HEIGHT]
+                    area_i = sts[i, cv2.CC_STAT_AREA]
+                    if area_i >= 6 and (w_i >= 2 or h_i >= 2) and area_i < 2500:
+                        seg_box_unet[lbs == i] = 255
             except Exception as e:
                 print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
                 
+        # ШАГ 2: Выделяем 100% всех букв текста без пропуска символов и без задевания лишнего
+        dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
+        n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+        compact_dark_ink = np.zeros_like(dark_ink)
+        for i in range(1, n_l):
+            w_i = sts[i, cv2.CC_STAT_WIDTH]
+            h_i = sts[i, cv2.CC_STAT_HEIGHT]
+            area_i = sts[i, cv2.CC_STAT_AREA]
+            # Исключаем только гигантские внешние рамки всего кадра
+            if area_i >= 6 and w_i < (c_w * 0.85) and h_i < (c_h * 0.85):
+                compact_dark_ink[lbs == i] = 255
+                
         if np.count_nonzero(seg_box_unet) > 5:
-            text_ink_box = seg_box_unet
+            text_ink_base = compact_dark_ink | seg_box_unet
         else:
-            dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
-            text_ink_box = cv2.dilate(dark_ink, np.ones((5, 5), np.uint8), iterations=2)
+            text_ink_base = compact_dark_ink
+            
+        # Захватываем белые обводки/окантовки вокруг символов (3px)
+        text_ink_box = cv2.dilate(text_ink_base, np.ones((3, 3), np.uint8), iterations=2)
             
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
         combined_text_ink_full[y_min:y_max, x_min:x_max] = text_ink_box
+        combined_text_ink_full[~user_mask_bool] = 0
         
         # Сырая маска текста (M_text_raw)
         raw_mask_full = combined_text_ink_full.copy()
@@ -760,6 +776,7 @@ class LamaMPEPyTorchInpainter:
         # Дилатированная маска текста (M_text_dilated) на 3px строго вокруг символов (защищает контурные линии рисунка!)
         kernel_3 = np.ones((3, 3), np.uint8)
         dilated_mask_full = cv2.dilate(combined_text_ink_full, kernel_3, iterations=3)
+        dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
         
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         crop_mask_dilated = dilated_mask_full[y_min_pad:y_max_pad, x_min_pad:x_max_pad]

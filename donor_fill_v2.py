@@ -72,7 +72,7 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
                 best_shift = (dy, dx)
                 
     dy, dx = best_shift
-    if best_err > 45.0 or (dy == 0 and dx == 0):
+    if dy == 0 and dx == 0:
         return image_lama.copy()
         
     M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
