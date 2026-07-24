@@ -113,112 +113,98 @@ def estimate_screentone_period(gray: np.ndarray, mask_boundary: np.ndarray):
     return tx, ty
 
 
-def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_fail: np.ndarray, M_text_raw: np.ndarray) -> np.ndarray:
+def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_fail: np.ndarray, donor_forbidden: np.ndarray) -> np.ndarray:
     """
-    Заполняет области M_fail с помощью фазово-выровненного донора (Phase-Locked Grid) и выборочной растровой фильтрации.
+    Математический синтезатор растрового скринтона (Halftone Synthesizer).
+    Генерирует 100% чистую фазовую решетку точек без шума, мыла и муара.
     """
-    if not np.any(M_fail > 0):
-        return image_lama.copy()
-        
     result = image_lama.copy()
-    gray_orig = cv2.cvtColor(image_orig, cv2.COLOR_BGR2GRAY)
+    gray_orig = cv2.cvtColor(image_orig, cv2.COLOR_BGR2GRAY) if image_orig.ndim == 3 else image_orig
     h, w = gray_orig.shape
     
-    # 1. Запрещенная зона для выбора доноров — исходные недилатированные чернила текста
-    donor_forbidden = (M_text_raw > 0)
-    donor_valid_mask = (~donor_forbidden) & (M_fail == 0)
-    
-    # Проверка "нужен ли донор для скринтона" на всем блоке M_fail
-    block_needs_texture = region_needs_texture(image_orig, M_fail, ring_width=15)
-    if not block_needs_texture:
-        return image_lama.copy()
-        
-    # Кольцо 10px снаружи ВСЕГО блока M_fail для эталонного забора растровых точек
+    # 1. Приграничное кольцо вокруг маски M_fail
     k_block = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-    block_boundary = (cv2.dilate(M_fail, k_block) > 0) & (M_fail == 0) & donor_valid_mask
+    block_boundary = (cv2.dilate(M_fail, k_block) > 0) & (M_fail == 0) & (~donor_forbidden)
     if not np.any(block_boundary):
         return image_lama.copy()
         
-    target_mean_gray = float(np.mean(gray_orig[block_boundary]))
+    ring_pixels = gray_orig[block_boundary]
+    ring_min = float(np.percentile(ring_pixels, 10))  # Темный центр точки
+    ring_max = float(np.percentile(ring_pixels, 90))  # Светлый межточечный фон
     
-    # 2. Вычисляем точный период решетки скринтона Tx, Ty для идеальной фазовой состыковки
+    # 2. Вычисляем точный период решетки Tx, Ty по автокорреляции ВЧ-слоя
     tx, ty = estimate_screentone_period(gray_orig, block_boundary)
-    
-    # Формируем кандидатов сдвига strictly кратно периодам Tx, Ty (Phase-Locked Grid)
-    shift_candidates = []
-    if tx > 1 and ty > 1:
-        for mult_y in range(-5, 6):
-            for mult_x in range(-5, 6):
-                if mult_y == 0 and mult_x == 0:
-                    continue
-                shift_candidates.append((mult_y * ty, mult_x * tx))
-    else:
-        for dy in range(-25, 26, 2):
-            for dx in range(-25, 26, 2):
-                if abs(dy) < 2 and abs(dx) < 2:
-                    continue
-                shift_candidates.append((dy, dx))
-                
-    best_global_shift = None
-    best_score = float('inf')
-    
+    if tx <= 1 or ty <= 1:
+        tx, ty = 6, 6
+        
+    # 3. Находим точную фазу точек (x0, y0) по максимальной корреляции на кольце
     gray_float = gray_orig.astype(np.float32)
     gray_blur = cv2.GaussianBlur(gray_float, (5, 5), 0)
     hf_orig = gray_float - gray_blur
     
-    for dy, dx in shift_candidates:
-        M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-        shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        
-        if np.mean(shifted_valid[M_fail > 0] > 0) < 0.40:
-            continue
+    y_coords, x_coords = np.indices((h, w))
+    
+    best_phase = (0, 0)
+    best_score = -float('inf')
+    
+    for y0 in range(ty):
+        for x0 in range(tx):
+            grid_x = ((x_coords - x0) % tx) - (tx / 2.0)
+            grid_y = ((y_coords - y0) % ty) - (ty / 2.0)
+            dist_sq = grid_x**2 + grid_y**2
             
-        shifted_hf = cv2.warpAffine(hf_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-        boundary_mse = float(np.mean((shifted_hf[block_boundary] - hf_orig[block_boundary])**2))
+            score = -float(np.mean(dist_sq[block_boundary] * hf_orig[block_boundary]))
+            if score > best_score:
+                best_score = score
+                best_phase = (x0, y0)
+                
+    x0, y0 = best_phase
+    
+    # 4. Генерируем идеальный математический растровый патч
+    grid_x = ((x_coords - x0) % tx) - (tx / 2.0)
+    grid_y = ((y_coords - y0) % ty) - (ty / 2.0)
+    dist = np.sqrt(grid_x**2 + grid_y**2)
+    
+    dot_ratio = float((ring_pixels < (ring_min + ring_max) / 2.0).mean())
+    radius = np.sqrt(max(0.01, dot_ratio) * tx * ty / np.pi)
+    
+    smooth_dot = np.clip((dist - radius) / 1.2, -1.0, 1.0)
+    norm_dot = (smooth_dot + 1.0) / 2.0  # [0..1]
+    
+    synth_gray = ring_min + norm_dot * (ring_max - ring_min)
+    
+    # 5. Совмещаем плавную подложку освещения LaMa (LF) и 100% чистые растровые точки (HF)
+    lama_float = image_lama.astype(np.float32)
+    lama_lf = cv2.GaussianBlur(lama_float, (15, 15), 0)
+    
+    synth_float = np.tile(synth_gray[:, :, None], (1, 1, 3)) if image_lama.ndim == 3 else synth_gray
+    synth_lf = cv2.GaussianBlur(synth_float, (15, 15), 0)
+    synth_hf = synth_float - synth_lf
+    
+    clean_halftone = np.clip(lama_lf + synth_hf, 0, 255).astype(np.uint8)
+    
+    # 6. Бесшовное наложение только на область растрового скринтона с плавной гауссовой альфа-маской
+    gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
+    texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240)
+    
+    alpha_mask = cv2.GaussianBlur(texture_pixel_mask.astype(np.float32), (7, 7), 2.0)
+    if result.ndim == 3:
+        alpha_mask = alpha_mask[:, :, np.newaxis]
         
-        if boundary_mse < best_score:
-            best_score = boundary_mse
-            best_global_shift = (dy, dx)
-            
-    if best_global_shift is not None:
-        dy, dx = best_global_shift
-        M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
+    blended = clean_halftone.astype(np.float32) * alpha_mask + result.astype(np.float32) * (1.0 - alpha_mask)
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_fail: np.ndarray, M_text_raw: np.ndarray) -> np.ndarray:
+    """
+    Заполняет области M_fail с помощью математического синтезатора чистых скринтонов.
+    """
+    if not np.any(M_fail > 0):
+        return image_lama.copy()
         
-        # Забираем 100% ЧИСТЫЙ оригинальный растровый скринтон из image_orig (без LaMa смаза!)
-        shifted_orig = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-        shifted_valid = cv2.warpAffine(donor_valid_mask.astype(np.uint8), M_shift, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    donor_forbidden = (M_text_raw > 0)
+    block_needs_texture = region_needs_texture(image_orig, M_fail, ring_width=15)
+    if not block_needs_texture:
+        return image_lama.copy()
         
-        clean_donor = shifted_orig.copy()
-        invalid_donor = ~shifted_valid
-        if np.any(invalid_donor):
-            inv_shift = cv2.warpAffine(image_orig, np.float32([[1, 0, -dx], [0, 1, -dy]]), (w, h), borderMode=cv2.BORDER_REFLECT)
-            clean_donor[invalid_donor] = inv_shift[invalid_donor]
-            
-        # Разделение на НЧ (подложка освещения LaMa) и ВЧ (настоящие оригинальные точки растра)
-        lama_float = image_lama.astype(np.float32)
-        donor_float = clean_donor.astype(np.float32)
-        
-        k_size = (15, 15)
-        lama_lf = cv2.GaussianBlur(lama_float, k_size, 0)
-        donor_lf = cv2.GaussianBlur(donor_float, k_size, 0)
-        donor_hf = donor_float - donor_lf
-        
-        # Настоящий 100% четкий растровый патч без мыла
-        seamless_donor = np.clip(lama_lf + donor_hf, 0, 255).astype(np.uint8)
-        
-        # Защита черного (<=15), белого (>=240) и гладких областей (ВЧ < 4.0)
-        gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
-        gray_lama_float = gray_lama.astype(np.float32)
-        hf_lama = np.abs(gray_lama_float - cv2.GaussianBlur(gray_lama_float, (5, 5), 0))
-        
-        # Применяем бесшовный донор с плавной гауссовой альфа-маской (убирает жесткие границы)
-        texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240)
-        
-        alpha_mask = cv2.GaussianBlur(texture_pixel_mask.astype(np.float32), (7, 7), 2.0)
-        if result.ndim == 3:
-            alpha_mask = alpha_mask[:, :, np.newaxis]
-            
-        blended = seamless_donor.astype(np.float32) * alpha_mask + result.astype(np.float32) * (1.0 - alpha_mask)
-        result = np.clip(blended, 0, 255).astype(np.uint8)
-        
-    return result
+    return synthesize_halftone_fill(image_orig, image_lama, M_fail, donor_forbidden)
