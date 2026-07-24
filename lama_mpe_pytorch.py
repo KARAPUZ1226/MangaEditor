@@ -749,6 +749,7 @@ class LamaMPEPyTorchInpainter:
         dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
         n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
         compact_dark_ink = np.zeros_like(dark_ink)
+        c_h, c_w = crop_box_gray.shape
         for i in range(1, n_l):
             w_i = sts[i, cv2.CC_STAT_WIDTH]
             h_i = sts[i, cv2.CC_STAT_HEIGHT]
