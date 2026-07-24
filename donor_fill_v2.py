@@ -44,6 +44,7 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         return image_lama.copy()
         
     # Создаем чистый оригинал без чернил текста (заменяем места текста на готовую гладкую LaMa)
+    valid_donor_zone = (~donor_forbidden)
     clean_orig = image_orig.copy()
     clean_orig[donor_forbidden] = image_lama[donor_forbidden]
     clean_gray = cv2.cvtColor(clean_orig, cv2.COLOR_BGR2GRAY) if clean_orig.ndim == 3 else clean_orig
