@@ -115,8 +115,8 @@ def estimate_screentone_period(gray: np.ndarray, mask_boundary: np.ndarray):
 
 def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_fail: np.ndarray, donor_forbidden: np.ndarray) -> np.ndarray:
     """
-    Математический синтезатор растрового скринтона (Halftone Synthesizer).
-    Генерирует 100% чистую фазовую решетку точек без шума, мыла и муара.
+    Математический синтезатор растрового скринтона (Halftone Synthesizer) с углом растра 45°.
+    Генерирует 100% чистую диагональную фазовую решетку точек без шума, мыла и муара.
     """
     result = image_lama.copy()
     gray_orig = cv2.cvtColor(image_orig, cv2.COLOR_BGR2GRAY) if image_orig.ndim == 3 else image_orig
@@ -129,51 +129,64 @@ def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_f
         return image_lama.copy()
         
     ring_pixels = gray_orig[block_boundary]
-    ring_min = float(np.percentile(ring_pixels, 10))  # Темный центр точки
-    ring_max = float(np.percentile(ring_pixels, 90))  # Светлый межточечный фон
+    ring_min = float(np.percentile(ring_pixels, 5))   # Тёмный центр точки
+    ring_max = float(np.percentile(ring_pixels, 95))   # Светлый межточечный фон
     
-    # 2. Вычисляем точный период решетки Tx, Ty по автокорреляции ВЧ-слоя
-    tx, ty = estimate_screentone_period(gray_orig, block_boundary)
-    if tx <= 1 or ty <= 1:
-        tx, ty = 6, 6
-        
-    # 3. Находим точную фазу точек (x0, y0) по максимальной корреляции на кольце
+    # 2. ПОВОРОТ КООРДИНАТ НА 45 ГРАДУСОВ (диагональная печатная сетка манги)
+    y_coords, x_coords = np.indices((h, w), dtype=np.float32)
+    u_raw = (x_coords + y_coords) / np.sqrt(2.0)
+    v_raw = (-x_coords + y_coords) / np.sqrt(2.0)
+    
     gray_float = gray_orig.astype(np.float32)
     gray_blur = cv2.GaussianBlur(gray_float, (5, 5), 0)
     hf_orig = gray_float - gray_blur
     
-    y_coords, x_coords = np.indices((h, w))
+    # 3. Оцениваем диагональный период T по 45-градусному сдвигу
+    best_T = 6.0
+    best_corr = -float('inf')
     
-    best_phase = (0, 0)
+    for T_cand in np.arange(4.0, 14.0, 0.5):
+        u_grid = ((u_raw) % T_cand) - (T_cand / 2.0)
+        v_grid = ((v_raw) % T_cand) - (T_cand / 2.0)
+        dist_sq = u_grid**2 + v_grid**2
+        score = -float(np.mean(dist_sq[block_boundary] * hf_orig[block_boundary]))
+        if score > best_corr:
+            best_corr = score
+            best_T = T_cand
+            
+    T = best_T
+    
+    # 4. Находим точную фазу u0, v0 по максимальной корреляции на кольце
+    best_u0, best_v0 = 0.0, 0.0
     best_score = -float('inf')
     
-    for y0 in range(ty):
-        for x0 in range(tx):
-            grid_x = ((x_coords - x0) % tx) - (tx / 2.0)
-            grid_y = ((y_coords - y0) % ty) - (ty / 2.0)
-            dist_sq = grid_x**2 + grid_y**2
+    for u0_step in np.linspace(0, T, 12, endpoint=False):
+        for v0_step in np.linspace(0, T, 12, endpoint=False):
+            u_grid = ((u_raw - u0_step) % T) - (T / 2.0)
+            v_grid = ((v_raw - v0_step) % T) - (T / 2.0)
+            dist_sq = u_grid**2 + v_grid**2
             
             score = -float(np.mean(dist_sq[block_boundary] * hf_orig[block_boundary]))
             if score > best_score:
                 best_score = score
-                best_phase = (x0, y0)
+                best_u0, best_v0 = u0_step, v0_step
                 
-    x0, y0 = best_phase
+    u0, v0 = best_u0, best_v0
     
-    # 4. Генерируем идеальный математический растровый патч
-    grid_x = ((x_coords - x0) % tx) - (tx / 2.0)
-    grid_y = ((y_coords - y0) % ty) - (ty / 2.0)
-    dist = np.sqrt(grid_x**2 + grid_y**2)
+    # 5. Генерируем 45° диагональный манга-скринтон
+    u_grid = ((u_raw - u0) % T) - (T / 2.0)
+    v_grid = ((v_raw - v0) % T) - (T / 2.0)
+    dist = np.sqrt(u_grid**2 + v_grid**2)
     
     dot_ratio = float((ring_pixels < (ring_min + ring_max) / 2.0).mean())
-    radius = np.sqrt(max(0.01, dot_ratio) * tx * ty / np.pi)
+    radius = np.sqrt(max(0.01, dot_ratio) * T * T / np.pi)
     
-    smooth_dot = np.clip((dist - radius) / 1.2, -1.0, 1.0)
+    smooth_dot = np.clip((dist - radius) / 1.0, -1.0, 1.0)
     norm_dot = (smooth_dot + 1.0) / 2.0  # [0..1]
     
     synth_gray = ring_min + norm_dot * (ring_max - ring_min)
     
-    # 5. Совмещаем плавную подложку освещения LaMa (LF) и 100% чистые растровые точки (HF)
+    # 6. Совмещаем плавную подложку освещения LaMa (LF) и 100% чистые 45° растровые точки (HF)
     lama_float = image_lama.astype(np.float32)
     lama_lf = cv2.GaussianBlur(lama_float, (15, 15), 0)
     
@@ -183,7 +196,7 @@ def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_f
     
     clean_halftone = np.clip(lama_lf + synth_hf, 0, 255).astype(np.uint8)
     
-    # 6. Бесшовное наложение только на область растрового скринтона с плавной гауссовой альфа-маской
+    # 7. Бесшовное наложение только на область растрового скринтона с плавной гауссовой альфа-маской
     gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
     texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240)
     
