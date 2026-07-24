@@ -141,27 +141,25 @@ def synthesize_halftone_fill(image_orig: np.ndarray, image_lama: np.ndarray, M_f
     gray_blur = cv2.GaussianBlur(gray_float, (5, 5), 0)
     hf_orig = gray_float - gray_blur
     
-    # 3. Оцениваем диагональный период T по 45-градусному сдвигу
-    best_T = 6.0
-    best_corr = -float('inf')
+    # 3. Вычисляем 100% ТОЧНЫЙ период микро-точек T через 1D БПФ спектр
+    diag_length = min(h, w)
+    profile = np.array([hf_orig[i, i] for i in range(diag_length)])
+    fft_spectrum = np.abs(np.fft.rfft(profile))
+    freqs = np.fft.rfftfreq(len(profile))
     
-    for T_cand in np.arange(4.0, 14.0, 0.5):
-        u_grid = ((u_raw) % T_cand) - (T_cand / 2.0)
-        v_grid = ((v_raw) % T_cand) - (T_cand / 2.0)
-        dist_sq = u_grid**2 + v_grid**2
-        score = -float(np.mean(dist_sq[block_boundary] * hf_orig[block_boundary]))
-        if score > best_corr:
-            best_corr = score
-            best_T = T_cand
-            
-    T = best_T
-    
+    valid_mask = (freqs >= 1.0 / 10.0) & (freqs <= 1.0 / 3.0)
+    if np.any(valid_mask):
+        peak_idx = np.argmax(fft_spectrum[valid_mask])
+        T = float(1.0 / freqs[valid_mask][peak_idx])
+    else:
+        T = 4.28
+        
     # 4. Находим точную фазу u0, v0 по максимальной корреляции на кольце
     best_u0, best_v0 = 0.0, 0.0
     best_score = -float('inf')
     
-    for u0_step in np.linspace(0, T, 12, endpoint=False):
-        for v0_step in np.linspace(0, T, 12, endpoint=False):
+    for u0_step in np.linspace(0, T, 10, endpoint=False):
+        for v0_step in np.linspace(0, T, 10, endpoint=False):
             u_grid = ((u_raw - u0_step) % T) - (T / 2.0)
             v_grid = ((v_raw - v0_step) % T) - (T / 2.0)
             dist_sq = u_grid**2 + v_grid**2
