@@ -43,7 +43,10 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
     if not np.any(block_boundary):
         return image_lama.copy()
         
-    valid_donor_zone = (~donor_forbidden)
+    # Создаем чистый оригинал без чернил текста (заменяем места текста на готовую гладкую LaMa)
+    clean_orig = image_orig.copy()
+    clean_orig[donor_forbidden] = image_lama[donor_forbidden]
+    clean_gray = cv2.cvtColor(clean_orig, cv2.COLOR_BGR2GRAY) if clean_orig.ndim == 3 else clean_orig
     
     best_shift = (0, 0)
     best_err = float('inf')
@@ -60,12 +63,12 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
             if np.count_nonzero(shifted_valid & (M_fail > 0)) < 0.30 * np.count_nonzero(M_fail > 0):
                 continue
                 
-            shifted_orig = cv2.warpAffine(gray_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+            shifted_gray = cv2.warpAffine(clean_gray, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
             ring_valid = block_boundary & shifted_valid
             if not np.any(ring_valid):
                 continue
                 
-            l1_err = float(np.mean(np.abs(shifted_orig[ring_valid].astype(np.float32) - gray_orig[ring_valid].astype(np.float32))))
+            l1_err = float(np.mean(np.abs(shifted_gray[ring_valid].astype(np.float32) - gray_orig[ring_valid].astype(np.float32))))
             
             if l1_err < best_err:
                 best_err = l1_err
@@ -76,7 +79,7 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         return image_lama.copy()
         
     M_shift = np.float32([[1, 0, dx], [0, 1, dy]])
-    shifted_donor = cv2.warpAffine(image_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
+    shifted_donor = cv2.warpAffine(clean_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
     
     # Разделение на НЧ (освещение LaMa) и ВЧ (100% реальные точки оригинального скринтона)
     lama_float = image_lama.astype(np.float32)
