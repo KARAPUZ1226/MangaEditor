@@ -206,9 +206,14 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         gray_lama_float = gray_lama.astype(np.float32)
         hf_lama = np.abs(gray_lama_float - cv2.GaussianBlur(gray_lama_float, (5, 5), 0))
         
-        # Применяем бесшовный донор только на области растрового скринтона!
+        # Применяем бесшовный донор с плавной гауссовой альфа-маской (убирает жесткие границы)
         texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240) & (hf_lama >= 4.0)
         
-        result[texture_pixel_mask] = seamless_donor[texture_pixel_mask]
+        alpha_mask = cv2.GaussianBlur(texture_pixel_mask.astype(np.float32), (7, 7), 2.0)
+        if result.ndim == 3:
+            alpha_mask = alpha_mask[:, :, np.newaxis]
+            
+        blended = seamless_donor.astype(np.float32) * alpha_mask + result.astype(np.float32) * (1.0 - alpha_mask)
+        result = np.clip(blended, 0, 255).astype(np.uint8)
         
     return result

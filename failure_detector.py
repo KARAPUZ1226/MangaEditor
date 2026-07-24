@@ -80,6 +80,8 @@ def detect_lama_failures(image_lama: np.ndarray, mask_dilated: np.ndarray, patch
                 angle_failure = (ring_var > 20.0)  # Снаружи есть четкая текстура, а внутри мыло
                 
             if var_failure or angle_failure:
-                M_fail[y:y_end, x:x_end][patch_mask] = 255
+                # Помечаем СТРОГО стираемые пиксели текста без квадратной блочности
+                M_fail_patch = M_fail[y:y_end, x:x_end]
+                M_fail_patch[patch_mask] = 255
                 
     return M_fail
