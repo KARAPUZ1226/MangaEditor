@@ -763,9 +763,9 @@ class LamaMPEPyTorchInpainter:
         else:
             text_ink_base = compact_dark_ink
             
-        # Захватываем белые обводки/окантовки вокруг символов (до 7px)
-        k_halo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        text_ink_box = cv2.dilate(text_ink_base, k_halo, iterations=2)
+        # Захватываем белые обводки/окантовки вокруг символов (аккуратные 4px)
+        k_halo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        text_ink_box = cv2.dilate(text_ink_base, k_halo, iterations=1)
             
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
@@ -775,8 +775,8 @@ class LamaMPEPyTorchInpainter:
         # Сырая маска текста (M_text_raw)
         raw_mask_full = combined_text_ink_full.copy()
         
-        # Дилатированная маска текста (M_text_dilated) для полного удаления белых контуров
-        dilated_mask_full = cv2.dilate(combined_text_ink_full, k_halo, iterations=1)
+        # Дилатированная маска текста (M_text_dilated)
+        dilated_mask_full = combined_text_ink_full.copy()
         dilated_mask_full[~user_mask_bool] = 0  # СТРОГОЕ ограничение выделенной областью пользователя!
         
         crop_image = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
