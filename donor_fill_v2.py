@@ -188,21 +188,27 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         clean_orig[donor_forbidden] = image_lama[donor_forbidden]
         
         shifted_donor = cv2.warpAffine(clean_orig, M_shift, (w, h), borderMode=cv2.BORDER_REFLECT)
-        shifted_gray = cv2.cvtColor(shifted_donor, cv2.COLOR_BGR2GRAY) if shifted_donor.ndim == 3 else shifted_donor
         
-        donor_ring_mean = float(np.mean(shifted_gray[block_boundary]))
-        offset = np.clip(target_mean_gray - donor_ring_mean, -15.0, 15.0)
+        # Разделение на НЧ (освещение LaMa) и ВЧ (растровые точки донора)
+        lama_float = image_lama.astype(np.float32)
+        donor_float = shifted_donor.astype(np.float32)
         
-        norm_donor = np.clip(shifted_donor.astype(np.float32) + offset, 0, 255).astype(np.uint8)
+        k_size = (15, 15)
+        lama_lf = cv2.GaussianBlur(lama_float, k_size, 0)
+        donor_lf = cv2.GaussianBlur(donor_float, k_size, 0)
+        donor_hf = donor_float - donor_lf
+        
+        # Идеальный бесшовный патч: подложка освещения от LaMa + точные растровые точки от донора
+        seamless_donor = np.clip(lama_lf + donor_hf, 0, 255).astype(np.uint8)
         
         # Защита черного (<=15), белого (>=240) и гладких областей (ВЧ < 4.0)
         gray_lama = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY) if result.ndim == 3 else result
         gray_lama_float = gray_lama.astype(np.float32)
         hf_lama = np.abs(gray_lama_float - cv2.GaussianBlur(gray_lama_float, (5, 5), 0))
         
-        # Применяем донор только на области растрового скринтона!
+        # Применяем бесшовный донор только на области растрового скринтона!
         texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240) & (hf_lama >= 4.0)
         
-        result[texture_pixel_mask] = norm_donor[texture_pixel_mask]
+        result[texture_pixel_mask] = seamless_donor[texture_pixel_mask]
         
     return result
