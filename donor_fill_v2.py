@@ -207,7 +207,7 @@ def orientation_aware_donor_fill(image_orig: np.ndarray, image_lama: np.ndarray,
         hf_lama = np.abs(gray_lama_float - cv2.GaussianBlur(gray_lama_float, (5, 5), 0))
         
         # Применяем бесшовный донор с плавной гауссовой альфа-маской (убирает жесткие границы)
-        texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240) & (hf_lama >= 4.0)
+        texture_pixel_mask = (M_fail > 0) & (gray_lama >= 15) & (gray_lama <= 240)
         
         alpha_mask = cv2.GaussianBlur(texture_pixel_mask.astype(np.float32), (7, 7), 2.0)
         if result.ndim == 3:
