@@ -661,6 +661,9 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
         kernel_close = np.ones((2, 2), np.uint8)
         mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
         
+        print(f"[PIPELINE DEBUG] raw (>0.4): {np.count_nonzero(raw_unet_mask)} px")
+        print(f"[PIPELINE DEBUG] after MORPH_CLOSE: {np.count_nonzero(mask_closed)} px")
+        
         # 1. Геометрический фильтр U-Net маски
         num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(mask_closed, connectivity=8)
         filtered_mask = np.zeros_like(mask_closed)
@@ -674,9 +677,10 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 continue
             filtered_mask[lbs == i] = 255
 
+        print(f"[PIPELINE DEBUG] after geometric filter (is_long_line/is_huge_block/area<6): {np.count_nonzero(filtered_mask)} px")
+
         # 2. УЖЕСТОЧЕННЫЙ КОНТЕКСТНЫЙ ПРОБРОС МАРКЕРОВ (■):
         if np.any(filtered_mask > 0):
-            # Медиана высоты уже найденных U-Net текстовых компонент
             text_heights = [sts[i, cv2.CC_STAT_HEIGHT] for i in range(1, num_l) if (filtered_mask[lbs == i] > 0).any()]
             median_h = float(np.median(text_heights)) if len(text_heights) > 0 else 20.0
             
@@ -700,14 +704,21 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 size_matches_font = (h_i >= 4 and h_i <= 2.5 * median_h)
                 same_line = not (comp_y_max < text_y_min - 12 or comp_y_min > text_y_max + 12)
                 
-                if is_square_ish and size_matches_font and same_line:
+                surrounding = gray[max(0, comp_y_min - 10):comp_y_min, :]
+                is_on_white_bubble = (surrounding.size > 0) and (surrounding.mean() > 220)
+                
+                if is_square_ish and size_matches_font and same_line and is_on_white_bubble:
                     comp_mask = (lbs_d == i)
                     if np.any(comp_mask & near_text_zone):
                         filtered_mask[comp_mask] = 255
 
+        print(f"[PIPELINE DEBUG] after marker recovery (SQUARE MARKER): {np.count_nonzero(filtered_mask)} px")
+
         # 3. Расширенная safety-дилатацией 5x5 (2px) для 100% полного закрытия контуров
         k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        return cv2.dilate(filtered_mask, k_safety, iterations=1)
+        final_mask = cv2.dilate(filtered_mask, k_safety, iterations=1)
+        print(f"[PIPELINE DEBUG] after 5x5 safety dilate: {np.count_nonzero(final_mask)} px")
+        return final_mask
     except Exception as e:
         print(f"[run_tiled_unet Error]: {e}")
         import traceback
@@ -759,6 +770,11 @@ class LamaMPEPyTorchInpainter:
         x_min, x_max = int(x_indices.min()), int(x_indices.max()) + 1
         box_h, box_w = y_max - y_min, x_max - x_min
         
+        print(f"[BOX DEBUG] y_min={y_min} y_max={y_max} x_min={x_min} x_max={x_max}")
+        print(f"[BOX DEBUG] box size: {box_h}x{box_w}")
+        print(f"[BOX DEBUG] user_mask bbox: {np.where(user_mask_bool)[0].min()}-{np.where(user_mask_bool)[0].max()}, "
+              f"{np.where(user_mask_bool)[1].min()}-{np.where(user_mask_bool)[1].max()}")
+        
         # --- ШАГ 1: Кроп с контекстом padding = 1.5x (до 512px) ---
         pad_extra = int(max(box_w, box_h) * 0.5)
         pad_extra = max(64, min(128, pad_extra))
@@ -769,6 +785,7 @@ class LamaMPEPyTorchInpainter:
         x_max_pad = min(width, x_max + pad_extra)
 
         crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
+        cv2.imwrite("DEBUG_live_crop_box_gray.png", crop_box_gray)
         b_h, b_w = box_h, box_w
 
         # U-Net сегментация текста на узком кропе (12px padding) без складок одежды вокруг
@@ -888,6 +905,10 @@ class LamaMPEPyTorchInpainter:
             result = result[:c_h, :c_w]
         crop_lama_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
+        cv2.imwrite("DEBUG_crop_mask_dilated_final.png", crop_mask_dilated)
+        cv2.imwrite("DEBUG_crop_lama_raw.png", crop_lama_bgr)
+        print("mask dtype:", crop_mask_dilated.dtype, "unique values:", np.unique(crop_mask_dilated)[:20])
+
         crop_ans = crop_image.copy()
         erase_mask_crop = (crop_mask_dilated > 0)
         crop_ans[erase_mask_crop] = crop_lama_bgr[erase_mask_crop]
