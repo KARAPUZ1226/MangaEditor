@@ -717,8 +717,8 @@ class LamaMPEPyTorchInpainter:
         
         has_unet = (self.segmenter is not None and np.any(seg_box_unet > 0))
         if has_unet:
-            # Зона детекции U-Net с запасом на обводку
-            k_unet_zone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            # Зона детекции U-Net с точечным микро-запасом (3x3 вместо 11x11)
+            k_unet_zone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             unet_zone = cv2.dilate(seg_box_unet, k_unet_zone, iterations=1) > 0
             
         k_bg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
@@ -733,6 +733,11 @@ class LamaMPEPyTorchInpainter:
             is_long_line = (aspect_r > 3.5 and (w_i > c_w * 0.40 or h_i > c_h * 0.40))
             is_huge_block = (w_i > c_w * 0.85 or h_i > c_h * 0.85)
             if is_long_line or is_huge_block:
+                continue
+                
+            # 2. Исключаем мелкие почти круглые точки скринтона (< 15px, aspect_r < 1.8)
+            is_screentone_dot = (area_i < 15 and aspect_r < 1.8)
+            if is_screentone_dot:
                 continue
                 
             comp_mask = (lbs == i)
