@@ -762,6 +762,29 @@ class LamaMPEPyTorchInpainter:
         # ШАГ 2: Формируем точную маску текста (M_text): U-Net нейросеть (источник данных №1!)
         has_unet = (self.segmenter is not None and np.any(seg_box_unet > 0))
         if has_unet:
+            # Контекстное восстановление маркеров реплик (■, пули) в радиусе 15px от текста U-Net
+            k_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            near_text_zone = cv2.dilate(seg_box_unet, k_near, iterations=1) > 0
+            
+            dark_ink = (crop_box_gray < 160).astype(np.uint8) * 255
+            num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            c_h, c_w = crop_box_gray.shape
+            
+            for i in range(1, num_l):
+                area_i = sts[i, cv2.CC_STAT_AREA]
+                w_i = sts[i, cv2.CC_STAT_WIDTH]
+                h_i = sts[i, cv2.CC_STAT_HEIGHT]
+                aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
+                
+                is_long_line = (aspect_r > 4.0 and (w_i > c_w * 0.40 or h_i > c_h * 0.40))
+                is_huge_block = (w_i > c_w * 0.85 or h_i > c_h * 0.85)
+                if is_long_line or is_huge_block or area_i < 6:
+                    continue
+                    
+                comp_mask = (lbs == i)
+                if np.any(comp_mask & near_text_zone):
+                    seg_box_unet[comp_mask] = 255
+                    
             text_ink_base = seg_box_unet.copy()
         else:
             dark_ink = (crop_box_gray < 160).astype(np.uint8) * 255
