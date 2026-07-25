@@ -26,8 +26,8 @@ def extract_clean_text_ink_mask(gray_crop):
     white_fuchidori = (gray_crop > 200).astype(np.uint8) * 255
     
     ink_mask = ink_filtered | (dilated_ink & white_fuchidori)
-    k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    ink_mask = cv2.dilate(ink_mask, k_safety, iterations=1)
+    cv2.imwrite("DEBUG_ink_mask.png", ink_mask)
+    print(f"[DEBUG_INK_MASK] sum: {ink_mask.sum()} | count_nonzero: {np.count_nonzero(ink_mask)} | shape: {ink_mask.shape}")
     return ink_mask
 
 
