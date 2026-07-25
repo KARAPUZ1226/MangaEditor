@@ -737,19 +737,22 @@ class LamaMPEPyTorchInpainter:
         x_min_pad = max(0, x_min - pad_extra)
         x_max_pad = min(width, x_max + pad_extra)
 
-        # --- ШАГ 2: U-Net маска текста на полноконтекстном кропе ---
-        crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
-        b_h, b_w = crop_box_gray.shape
+        # U-Net сегментация текста на узком кропе (12px padding) без складок одежды вокруг
+        pad_tight = 12
+        ty_min = max(0, y_min - pad_tight)
+        ty_max = min(height, y_max + pad_tight)
+        tx_min = max(0, x_min - pad_tight)
+        tx_max = min(width, x_max + pad_tight)
         
-        crop_pad = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
+        crop_tight = image[ty_min:ty_max, tx_min:tx_max]
         
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
         if self.segmenter is not None:
             try:
-                full_pad_mask = run_tiled_unet(crop_pad, self.segmenter, threshold=0.40)
-                off_y = y_min - y_min_pad
-                off_x = x_min - x_min_pad
-                seg_box_unet = full_pad_mask[off_y:off_y+b_h, off_x:off_x+b_w]
+                tight_mask = run_tiled_unet(crop_tight, self.segmenter, threshold=0.40)
+                off_y = y_min - ty_min
+                off_x = x_min - tx_min
+                seg_box_unet = tight_mask[off_y:off_y+b_h, off_x:off_x+b_w]
             except Exception as e:
                 print(f"[LaMa] U-Net segmenter error: {e}")
                 
