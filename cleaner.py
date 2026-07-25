@@ -6,9 +6,18 @@ from lama_mpe_pytorch import LamaMPEPyTorchInpainter as LaMaInpainter
 
 
 def extract_clean_text_ink_mask(gray_crop):
-    """Извлекает 100% маску текста + антиалиасинг + белая обводка с фильтрацией шума."""
-    ink_base = (gray_crop < 190).astype(np.uint8) * 255
+    """Адаптивная бинаризация Otsu с фильтрацией шумов и sanity-фильтром скринтонов."""
+    h, w = gray_crop.shape[:2]
     
+    # 1. Адаптивный порог Otsu для отделения текста от фона
+    blur = cv2.GaussianBlur(gray_crop, (3, 3), 0)
+    _, ink_base = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Sanity-фильтр: если маска покрывает > 25% бабла — это шумит скринтон фона!
+    if np.count_nonzero(ink_base) / max(1, h * w) > 0.25:
+        # Переходим на жесткий локальный адаптивный порог
+        ink_base = cv2.adaptiveThreshold(gray_crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 8)
+        
     num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(ink_base, connectivity=8)
     ink_filtered = np.zeros_like(ink_base)
     for i in range(1, num_l):
@@ -26,6 +35,9 @@ def extract_clean_text_ink_mask(gray_crop):
     white_fuchidori = (gray_crop > 200).astype(np.uint8) * 255
     
     ink_mask = ink_filtered | (dilated_ink & white_fuchidori)
+    k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ink_mask = cv2.dilate(ink_mask, k_safety, iterations=1)
+    
     cv2.imwrite("DEBUG_ink_mask.png", ink_mask)
     print(f"[DEBUG_INK_MASK] sum: {ink_mask.sum()} | count_nonzero: {np.count_nonzero(ink_mask)} | shape: {ink_mask.shape}")
     return ink_mask

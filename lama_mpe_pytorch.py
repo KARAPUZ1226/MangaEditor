@@ -736,46 +736,27 @@ class LamaMPEPyTorchInpainter:
             except Exception as e:
                 print(f"[LaMa] U-Net segmenter error: {e}")
                 
-        # ШАГ 2: Формируем точную маску текста (M_text): символы туши + белая обводка (fuchidori)
-        dark_ink = (crop_box_gray < 160).astype(np.uint8) * 255
-        
-        num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-        text_ink_base = np.zeros_like(dark_ink)
-        c_h, c_w = crop_box_gray.shape
-        
+        # ШАГ 2: Формируем точную маску текста (M_text): U-Net нейросеть (источник данных №1!)
         has_unet = (self.segmenter is not None and np.any(seg_box_unet > 0))
         if has_unet:
-            # Зона детекции U-Net с точечным микро-запасом (3x3 вместо 11x11)
-            k_unet_zone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            unet_zone = cv2.dilate(seg_box_unet, k_unet_zone, iterations=1) > 0
+            text_ink_base = seg_box_unet.copy()
+        else:
+            dark_ink = (crop_box_gray < 160).astype(np.uint8) * 255
+            num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            text_ink_base = np.zeros_like(dark_ink)
+            c_h, c_w = crop_box_gray.shape
             
-        k_bg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        
-        for i in range(1, num_l):
-            w_i = sts[i, cv2.CC_STAT_WIDTH]
-            h_i = sts[i, cv2.CC_STAT_HEIGHT]
-            area_i = sts[i, cv2.CC_STAT_AREA]
-            aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
-            
-            # 1. Исключаем длинные линии кадров, ног и рамок
-            is_long_line = (aspect_r > 3.5 and (w_i > c_w * 0.40 or h_i > c_h * 0.40))
-            is_huge_block = (w_i > c_w * 0.85 or h_i > c_h * 0.85)
-            if is_long_line or is_huge_block:
-                continue
+            for i in range(1, num_l):
+                w_i = sts[i, cv2.CC_STAT_WIDTH]
+                h_i = sts[i, cv2.CC_STAT_HEIGHT]
+                area_i = sts[i, cv2.CC_STAT_AREA]
+                aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
                 
-            # 2. Исключаем мелкие почти круглые точки скринтона (< 15px, aspect_r < 1.8)
-            is_screentone_dot = (area_i < 15 and aspect_r < 1.8)
-            if is_screentone_dot:
-                continue
-                
-            comp_mask = (lbs == i)
-            if has_unet:
-                inter_px = np.count_nonzero(unet_zone & comp_mask)
-                # Пропускаем компонент, только если не менее 30% его площади лежит внутри зоны U-Net
-                if (inter_px / max(1, area_i)) < 0.30:
+                is_long_line = (aspect_r > 3.5 and (w_i > c_w * 0.40 or h_i > c_h * 0.40))
+                is_huge_block = (w_i > c_w * 0.85 or h_i > c_h * 0.85)
+                if is_long_line or is_huge_block or (area_i < 15 and aspect_r < 1.8):
                     continue
-                    
-            text_ink_base[comp_mask] = 255
+                text_ink_base[lbs == i] = 255
                 
         # Точечный захват белого ореола обводки (fuchidori) строго в радиусе 2px вокруг букв
         k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
