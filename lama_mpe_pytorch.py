@@ -696,9 +696,9 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 comp_y_max = comp_y_min + h_i
                 
                 aspect_ratio = w_i / max(1, h_i)
-                is_square_ish = (0.6 <= aspect_ratio <= 1.6)
-                size_matches_font = (0.4 * median_h <= h_i <= 2.2 * median_h)
-                same_line = not (comp_y_max < text_y_min - 8 or comp_y_min > text_y_max + 8)
+                is_square_ish = (0.5 <= aspect_ratio <= 1.8)
+                size_matches_font = (h_i >= 4 and h_i <= 2.5 * median_h)
+                same_line = not (comp_y_max < text_y_min - 12 or comp_y_min > text_y_max + 12)
                 
                 if is_square_ish and size_matches_font and same_line:
                     comp_mask = (lbs_d == i)
@@ -888,11 +888,9 @@ class LamaMPEPyTorchInpainter:
             result = result[:c_h, :c_w]
         crop_lama_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
-        # Легкое размытие (feathering) 5x5 маски перед наложением для бесшовного плавного перехода без прямоугольных границ
-        mask_feathered = cv2.GaussianBlur(crop_mask_dilated.astype(np.float32), (5, 5), 0) / 255.0
-        mask_feathered = np.clip(mask_feathered * 1.2, 0.0, 1.0)[:, :, None]
-        
-        crop_ans = (crop_lama_bgr.astype(np.float32) * mask_feathered + crop_image.astype(np.float32) * (1.0 - mask_feathered)).astype(np.uint8)
+        crop_ans = crop_image.copy()
+        erase_mask_crop = (crop_mask_dilated > 0)
+        crop_ans[erase_mask_crop] = crop_lama_bgr[erase_mask_crop]
         
         # --- ШАГИ 4 и 5: Orientation-Aware Donor Fill (100% прямое применение на скринтонах) ---
         from donor_fill_v2 import region_needs_texture, orientation_aware_donor_fill
