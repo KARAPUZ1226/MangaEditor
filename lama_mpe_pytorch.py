@@ -623,8 +623,8 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
         pad_w = max(0, max(256, ((orig_w + 127) // 128) * 128) - orig_w)
         
         if pad_h > 0 or pad_w > 0:
-            gray_padded = cv2.copyMakeBorder(gray, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=255)
-            rgb_padded = cv2.copyMakeBorder(img_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+            gray_padded = cv2.copyMakeBorder(gray, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
+            rgb_padded = cv2.copyMakeBorder(img_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
         else:
             gray_padded = gray
             rgb_padded = img_rgb
