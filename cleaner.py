@@ -52,8 +52,16 @@ def extract_clean_text_ink_mask(gray_crop, text_segmenter=None):
             raw_unet_mask = (probs_orig > 0.40).astype(np.uint8) * 255
             kernel_close = np.ones((2, 2), np.uint8)
             mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            ink_mask = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel_open)
+            
+            # 1. Захват белого ореола обводки (fuchidori) 5x5
+            k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            dilated = cv2.dilate(mask_closed, k_outline, iterations=1)
+            white_fuchidori = (gray_crop > 200).astype(np.uint8) * 255
+            mask_final = mask_closed | (dilated & white_fuchidori)
+            
+            # 2. Защитная окантовка 1-2px (k_safety 3x3) для полного укрытия градиента антиалиасинга
+            k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            ink_mask = cv2.dilate(mask_final, k_safety, iterations=1)
             
             cv2.imwrite("DEBUG_ink_mask.png", ink_mask)
             print(f"[DEBUG_INK_MASK] sum: {ink_mask.sum()} | count_nonzero: {np.count_nonzero(ink_mask)} | shape: {ink_mask.shape}")
