@@ -2,74 +2,21 @@ import cv2
 import numpy as np
 
 
-from lama_mpe_pytorch import LamaMPEPyTorchInpainter as LaMaInpainter
+from lama_mpe_pytorch import LamaMPEPyTorchInpainter as LaMaInpainter, run_tiled_unet
 
 
 def extract_clean_text_ink_mask(gray_crop, text_segmenter=None):
-    """Единый источник истины: сегментация текста нейросетью U-Net (1:1 тайлы 256x256, порог 0.40)."""
-    h, w = gray_crop.shape[:2]
-    
+    """Вызывает единую общую функцию тайлового инференса U-Net из lama_mpe_pytorch."""
     if text_segmenter is not None:
         try:
-            inp_name = text_segmenter.get_inputs()[0].name
-            
-            if h <= 320 and w <= 320:
-                patch_resized = cv2.resize(gray_crop, (256, 256))
-                inp = (patch_resized.astype(np.float32) / 255.0)[None, None, :, :]
-                outputs = text_segmenter.run(None, {inp_name: inp})
-                logits = outputs[0][0, 0]
-                probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                probs_orig = cv2.resize(probs_256, (w, h), interpolation=cv2.INTER_LINEAR)
-            else:
-                probs_orig = np.zeros((h, w), dtype=np.float32)
-                counts_orig = np.zeros((h, w), dtype=np.float32)
-                tile_size = 256
-                stride = 128
-                
-                for y in range(0, h, stride):
-                    for x in range(0, w, stride):
-                        y1 = min(y, max(0, h - tile_size))
-                        x1 = min(x, max(0, w - tile_size))
-                        y2 = min(h, y1 + tile_size)
-                        x2 = min(w, x1 + tile_size)
-                        
-                        patch = gray_crop[y1:y2, x1:x2]
-                        if patch.shape[0] != 256 or patch.shape[1] != 256:
-                            patch = cv2.resize(patch, (256, 256))
-                            
-                        inp_patch = (patch.astype(np.float32) / 255.0)[None, None, :, :]
-                        out_patch = text_segmenter.run(None, {inp_name: inp_patch})[0][0, 0]
-                        p_patch = 1.0 / (1.0 + np.exp(-np.clip(out_patch, -80.0, 80.0)))
-                        
-                        if (y2 - y1) != 256 or (x2 - x1) != 256:
-                            p_patch = cv2.resize(p_patch, (x2 - x1, y2 - y1))
-                            
-                        probs_orig[y1:y2, x1:x2] += p_patch
-                        counts_orig[y1:y2, x1:x2] += 1.0
-                        
-                probs_orig /= np.maximum(1.0, counts_orig)
-                
-            raw_unet_mask = (probs_orig > 0.40).astype(np.uint8) * 255
-            kernel_close = np.ones((2, 2), np.uint8)
-            mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
-            
-            # 1. Захват белого ореола обводки (fuchidori) 5x5
-            k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            dilated = cv2.dilate(mask_closed, k_outline, iterations=1)
-            white_fuchidori = (gray_crop > 200).astype(np.uint8) * 255
-            mask_final = mask_closed | (dilated & white_fuchidori)
-            
-            # 2. Защитная окантовка 1-2px (k_safety 3x3) для полного укрытия градиента антиалиасинга
-            k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            ink_mask = cv2.dilate(mask_final, k_safety, iterations=1)
-            
+            ink_mask = run_tiled_unet(gray_crop, text_segmenter, threshold=0.40)
             cv2.imwrite("DEBUG_ink_mask.png", ink_mask)
             print(f"[DEBUG_INK_MASK] sum: {ink_mask.sum()} | count_nonzero: {np.count_nonzero(ink_mask)} | shape: {ink_mask.shape}")
             return ink_mask
         except Exception as e:
             print(f"[Cleaner U-Net Error]: {e}")
             
-    return np.zeros((h, w), dtype=np.uint8)
+    return np.zeros(gray_crop.shape[:2], dtype=np.uint8)
 
 
 def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainter=None, text_segmenter=None):

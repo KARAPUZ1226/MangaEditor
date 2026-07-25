@@ -598,6 +598,72 @@ def load_lama_mpe(model_path, device, use_mpe: bool = True, large_arch: bool = F
     return model
 
 
+def run_tiled_unet(image_crop, segmenter, threshold=0.40):
+    """Универсальная общая функция 1:1 тайлового инференса U-Net на 3-канальном RGB входе."""
+    if segmenter is None or image_crop is None:
+        return np.zeros(image_crop.shape[:2], dtype=np.uint8)
+        
+    if len(image_crop.shape) == 2:
+        img_rgb = cv2.cvtColor(image_crop, cv2.COLOR_GRAY2RGB)
+    elif image_crop.shape[2] == 3:
+        img_rgb = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
+    else:
+        img_rgb = image_crop.copy()
+        
+    cp_h, cp_w = img_rgb.shape[:2]
+    inp_name = segmenter.get_inputs()[0].name
+    
+    if cp_h <= 320 and cp_w <= 320:
+        patch_resized = cv2.resize(img_rgb, (256, 256))
+        inp_tensor = (patch_resized.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
+        outputs = segmenter.run(None, {inp_name: inp_tensor})
+        logits = outputs[0][0, 0]
+        probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+        probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        probs_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
+        counts_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
+        tile_size = 256
+        stride = 128
+        
+        for y in range(0, cp_h, stride):
+            for x in range(0, cp_w, stride):
+                y1 = min(y, max(0, cp_h - tile_size))
+                x1 = min(x, max(0, cp_w - tile_size))
+                y2 = min(cp_h, y1 + tile_size)
+                x2 = min(cp_w, x1 + tile_size)
+                
+                patch = img_rgb[y1:y2, x1:x2]
+                if patch.shape[0] != 256 or patch.shape[1] != 256:
+                    patch = cv2.resize(patch, (256, 256))
+                    
+                inp_patch = (patch.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
+                out_patch = segmenter.run(None, {inp_name: inp_patch})[0][0, 0]
+                p_patch = 1.0 / (1.0 + np.exp(-np.clip(out_patch, -80.0, 80.0)))
+                
+                if (y2 - y1) != 256 or (x2 - x1) != 256:
+                    p_patch = cv2.resize(p_patch, (x2 - x1, y2 - y1))
+                    
+                probs_orig[y1:y2, x1:x2] += p_patch
+                counts_orig[y1:y2, x1:x2] += 1.0
+                
+        probs_orig /= np.maximum(1.0, counts_orig)
+        
+    raw_unet_mask = (probs_orig > threshold).astype(np.uint8) * 255
+    kernel_close = np.ones((2, 2), np.uint8)
+    mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
+    
+    k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated = cv2.dilate(mask_closed, k_outline, iterations=1)
+    
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    white_fuchidori = (gray > 200).astype(np.uint8) * 255
+    mask_final = mask_closed | (dilated & white_fuchidori)
+    
+    k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.dilate(mask_final, k_safety, iterations=1)
+
+
 class LamaMPEPyTorchInpainter:
     def __init__(self, model_path):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -627,16 +693,6 @@ class LamaMPEPyTorchInpainter:
             print(f"[LaMa PyTorch] Warning: failed to load text detector guard: {e}")
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """
-        Manga Text Removal Pipeline v2 (7 шагов спецификации):
-        1. U-Net / Ink segmentation (M_text_raw) + Dilation (M_text_dilated)
-        2. Bbox crop + padding (1.5x, max_size 512px)
-        3. LaMa Inpaint (per-crop)
-        4. Детектор провала LaMa (M_fail по variance и Sobel углу градиентов)
-        5. Orientation-Aware Donor-Fill (на M_fail с запретом M_text_raw)
-        6. Blending (feather alpha)
-        7. QC-контроль результатов
-        """
         from failure_detector import detect_lama_failures
         from donor_fill_v2 import orientation_aware_donor_fill
         
@@ -661,78 +717,19 @@ class LamaMPEPyTorchInpainter:
         x_min_pad = max(0, x_min - pad_extra)
         x_max_pad = min(width, x_max + pad_extra)
 
-        # --- ШАГ 2: U-Net маска текста на полноконтекстном кропе (с контекстом вокруг текста!) ---
+        # --- ШАГ 2: U-Net маска текста на полноконтекстном кропе ---
         crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
         b_h, b_w = crop_box_gray.shape
         
-        crop_pad_gray = cv2.cvtColor(image[y_min_pad:y_max_pad, x_min_pad:x_max_pad], cv2.COLOR_BGR2GRAY)
-        cp_h, cp_w = crop_pad_gray.shape
+        crop_pad = image[y_min_pad:y_max_pad, x_min_pad:x_max_pad]
         
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
         if self.segmenter is not None:
             try:
-                inp_name = self.segmenter.get_inputs()[0].name
-                
-                # Если кроп небольшой (<=320px) — делаем быстрый однопроходный прогон
-                if cp_h <= 320 and cp_w <= 320:
-                    patch_resized = cv2.resize(crop_pad_gray, (256, 256))
-                    inp = (patch_resized.astype(np.float32) / 255.0)[None, None, :, :]
-                    outputs = self.segmenter.run(None, {inp_name: inp})
-                    logits = outputs[0][0, 0]
-                    probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    # 1:1 Скользящие тайлы 256x256 без даунскейла (сохраняет 100% частоту растра!)
-                    probs_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
-                    counts_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
-                    tile_size = 256
-                    stride = 128
-                    
-                    for y in range(0, cp_h, stride):
-                        for x in range(0, cp_w, stride):
-                            y1 = min(y, max(0, cp_h - tile_size))
-                            x1 = min(x, max(0, cp_w - tile_size))
-                            y2 = min(cp_h, y1 + tile_size)
-                            x2 = min(cp_w, x1 + tile_size)
-                            
-                            patch = crop_pad_gray[y1:y2, x1:x2]
-                            if patch.shape[0] != 256 or patch.shape[1] != 256:
-                                patch = cv2.resize(patch, (256, 256))
-                                
-                            inp_patch = (patch.astype(np.float32) / 255.0)[None, None, :, :]
-                            out_patch = self.segmenter.run(None, {inp_name: inp_patch})[0][0, 0]
-                            p_patch = 1.0 / (1.0 + np.exp(-np.clip(out_patch, -80.0, 80.0)))
-                            
-                            if (y2 - y1) != 256 or (x2 - x1) != 256:
-                                p_patch = cv2.resize(p_patch, (x2 - x1, y2 - y1))
-                                
-                            probs_orig[y1:y2, x1:x2] += p_patch
-                            counts_orig[y1:y2, x1:x2] += 1.0
-                            
-                    probs_orig /= np.maximum(1.0, counts_orig)
-                
+                full_pad_mask = run_tiled_unet(crop_pad, self.segmenter, threshold=0.40)
                 off_y = y_min - y_min_pad
                 off_x = x_min - x_min_pad
-                crop_probs = probs_orig[off_y:off_y+b_h, off_x:off_x+b_w]
-                
-                # Порог 0.40 — точная граница между фоновым скринтоном (0.20-0.25) и текстом (>0.40)
-                raw_unet_mask = (crop_probs > 0.40).astype(np.uint8) * 255
-                
-                # Морфологическое склеивание разрывов тонких штрихов фуриганы (MORPH_CLOSE)
-                kernel_close = np.ones((2, 2), np.uint8)
-                mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
-                
-                # Морфологическая чистка от микро-точек (MORPH_OPEN)
-                kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel_open)
-                
-                # Connected Components + фильтр по площади (отсекаем одиночные точечные брызги < 6px)
-                num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(mask_opened, connectivity=8)
-                seg_box_unet = np.zeros_like(mask_opened)
-                for i in range(1, num_l):
-                    area_i = sts[i, cv2.CC_STAT_AREA]
-                    if area_i >= 6:
-                        seg_box_unet[lbs == i] = 255
+                seg_box_unet = full_pad_mask[off_y:off_y+b_h, off_x:off_x+b_w]
             except Exception as e:
                 print(f"[LaMa] U-Net segmenter error: {e}")
                 
