@@ -53,11 +53,17 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
         if crop.size == 0:
             continue
 
-        # Маска только на центральную часть (сам бабл), оставляя контекст вокруг
+        # Маска только на текстовые символы (чернила) внутри бабла, оставляя контекст вокруг
         text_mask = np.zeros((h, w), dtype=np.uint8)
-        mask_x = x0 - x
-        mask_y = y0 - y
-        text_mask[mask_y:mask_y+h0, mask_x:mask_x+w0] = 255
+        mask_x = max(0, x0 - x)
+        mask_y = max(0, y0 - y)
+        mask_w = min(w - mask_x, w0)
+        mask_h = min(h - mask_y, h0)
+        if mask_w > 0 and mask_h > 0:
+            bubble_crop = crop[mask_y:mask_y+mask_h, mask_x:mask_x+mask_w]
+            bubble_gray = cv2.cvtColor(bubble_crop, cv2.COLOR_BGR2GRAY)
+            ink_mask = (bubble_gray < 175).astype(np.uint8) * 255
+            text_mask[mask_y:mask_y+mask_h, mask_x:mask_x+mask_w] = ink_mask
 
         # Дорисовка
         if lama_inpainter is not None:
@@ -120,7 +126,10 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
     mx1 = min(w, x0 + w0 - x)
     my1 = min(h, y0 + h0 - y)
     if mx1 > mx0 and my1 > my0:
-        text_mask[my0:my1, mx0:mx1] = 255
+        rect_crop = crop[my0:my1, mx0:mx1]
+        rect_gray = cv2.cvtColor(rect_crop, cv2.COLOR_BGR2GRAY)
+        ink_mask = (rect_gray < 175).astype(np.uint8) * 255
+        text_mask[my0:my1, mx0:mx1] = ink_mask
 
     if dilation_pixels > 0:
         kernel = np.ones((3, 3), np.uint8)
