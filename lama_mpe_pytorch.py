@@ -736,12 +736,12 @@ class LamaMPEPyTorchInpainter:
                 continue
                 
             comp_mask = (lbs == i)
-            overlaps_unet = np.any(unet_zone & comp_mask) if has_unet else True
-            
-            # Когда нейросеть U-Net активна, маска туши подхватывается СТРОГО внутри зоны U-Net!
-            if has_unet and not overlaps_unet:
-                continue
-                
+            if has_unet:
+                inter_px = np.count_nonzero(unet_zone & comp_mask)
+                # Пропускаем компонент, только если не менее 30% его площади лежит внутри зоны U-Net
+                if (inter_px / max(1, area_i)) < 0.30:
+                    continue
+                    
             text_ink_base[comp_mask] = 255
                 
         # Точечный захват белого ореола обводки (fuchidori) строго в радиусе 2px вокруг букв
