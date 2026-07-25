@@ -677,6 +677,19 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 continue
             filtered_mask[lbs == i] = 255
 
+        # Убираем компоненты, которые лежат на текстуре/тени, а не на белом бабле
+        num_f, lbs_f, sts_f, _ = cv2.connectedComponentsWithStats(filtered_mask, connectivity=8)
+        for i in range(1, num_f):
+            comp_mask_f = (lbs_f == i)
+            y0, x0 = sts_f[i, cv2.CC_STAT_TOP], sts_f[i, cv2.CC_STAT_LEFT]
+            h_f, w_f = sts_f[i, cv2.CC_STAT_HEIGHT], sts_f[i, cv2.CC_STAT_WIDTH]
+            pad = 6
+            by0, by1 = max(0, y0 - pad), min(gray.shape[0], y0 + h_f + pad)
+            bx0, bx1 = max(0, x0 - pad), min(gray.shape[1], x0 + w_f + pad)
+            surrounding = gray[by0:by1, bx0:bx1]
+            if surrounding.size > 0 and surrounding.mean() < 200:
+                filtered_mask[comp_mask_f] = 0
+
         print(f"[PIPELINE DEBUG] after geometric filter (is_long_line/is_huge_block/area<6): {np.count_nonzero(filtered_mask)} px")
 
         # 2. УЖЕСТОЧЕННЫЙ КОНТЕКСТНЫЙ ПРОБРОС МАРКЕРОВ (■):
