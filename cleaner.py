@@ -5,6 +5,32 @@ import numpy as np
 from lama_mpe_pytorch import LamaMPEPyTorchInpainter as LaMaInpainter
 
 
+def extract_clean_text_ink_mask(gray_crop):
+    """Извлекает 100% маску текста + антиалиасинг + белая обводка с фильтрацией шума."""
+    ink_base = (gray_crop < 190).astype(np.uint8) * 255
+    
+    num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(ink_base, connectivity=8)
+    ink_filtered = np.zeros_like(ink_base)
+    for i in range(1, num_l):
+        area_i = sts[i, cv2.CC_STAT_AREA]
+        w_i = sts[i, cv2.CC_STAT_WIDTH]
+        h_i = sts[i, cv2.CC_STAT_HEIGHT]
+        aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
+        
+        if area_i < 8 or (area_i < 15 and aspect_r < 1.8):
+            continue
+        ink_filtered[lbs == i] = 255
+        
+    k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated_ink = cv2.dilate(ink_filtered, k_outline, iterations=1)
+    white_fuchidori = (gray_crop > 200).astype(np.uint8) * 255
+    
+    ink_mask = ink_filtered | (dilated_ink & white_fuchidori)
+    k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ink_mask = cv2.dilate(ink_mask, k_safety, iterations=1)
+    return ink_mask
+
+
 def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainter=None, text_segmenter=None):
     if cv_image is None or not bubble_items:
         return cv_image, 0
@@ -62,8 +88,7 @@ def smart_clean_bubbles(cv_image, bubble_items, dilation_pixels=0, lama_inpainte
         if mask_w > 0 and mask_h > 0:
             bubble_crop = crop[mask_y:mask_y+mask_h, mask_x:mask_x+mask_w]
             bubble_gray = cv2.cvtColor(bubble_crop, cv2.COLOR_BGR2GRAY)
-            ink_mask = (bubble_gray < 175).astype(np.uint8) * 255
-            text_mask[mask_y:mask_y+mask_h, mask_x:mask_x+mask_w] = ink_mask
+            text_mask[mask_y:mask_y+mask_h, mask_x:mask_x+mask_w] = extract_clean_text_ink_mask(bubble_gray)
 
         # Дорисовка
         if lama_inpainter is not None:
@@ -128,8 +153,7 @@ def smart_inpaint_rect(cv_image, rect, dilation_pixels=0, lama_inpainter=None, t
     if mx1 > mx0 and my1 > my0:
         rect_crop = crop[my0:my1, mx0:mx1]
         rect_gray = cv2.cvtColor(rect_crop, cv2.COLOR_BGR2GRAY)
-        ink_mask = (rect_gray < 175).astype(np.uint8) * 255
-        text_mask[my0:my1, mx0:mx1] = ink_mask
+        text_mask[my0:my1, mx0:mx1] = extract_clean_text_ink_mask(rect_gray)
 
     if dilation_pixels > 0:
         kernel = np.ones((3, 3), np.uint8)
