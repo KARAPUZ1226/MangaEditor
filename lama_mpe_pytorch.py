@@ -598,7 +598,7 @@ def load_lama_mpe(model_path, device, use_mpe: bool = True, large_arch: bool = F
     return model
 
 
-def run_tiled_unet(image_crop, segmenter, threshold=0.30):
+def run_tiled_unet(image_crop, segmenter, threshold=0.40):
     """Универсальная общая функция 1:1 тайлового инференса U-Net с паддингом границ без искажений."""
     if segmenter is None or image_crop is None:
         return np.zeros(image_crop.shape[:2], dtype=np.uint8)
@@ -746,7 +746,7 @@ class LamaMPEPyTorchInpainter:
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
         if self.segmenter is not None:
             try:
-                full_pad_mask = run_tiled_unet(crop_pad, self.segmenter, threshold=0.30)
+                full_pad_mask = run_tiled_unet(crop_pad, self.segmenter, threshold=0.40)
                 off_y = y_min - y_min_pad
                 off_x = x_min - x_min_pad
                 seg_box_unet = full_pad_mask[off_y:off_y+b_h, off_x:off_x+b_w]
