@@ -599,69 +599,87 @@ def load_lama_mpe(model_path, device, use_mpe: bool = True, large_arch: bool = F
 
 
 def run_tiled_unet(image_crop, segmenter, threshold=0.40):
-    """Универсальная общая функция 1:1 тайлового инференса U-Net на 3-канальном RGB входе."""
+    """Универсальная общая функция 1:1 тайлового инференса U-Net с автодетектированием входа ONNX (1 или 3 канала)."""
     if segmenter is None or image_crop is None:
         return np.zeros(image_crop.shape[:2], dtype=np.uint8)
         
-    if len(image_crop.shape) == 2:
-        img_rgb = cv2.cvtColor(image_crop, cv2.COLOR_GRAY2RGB)
-    elif image_crop.shape[2] == 3:
-        img_rgb = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
-    else:
-        img_rgb = image_crop.copy()
+    try:
+        inp_info = segmenter.get_inputs()[0]
+        inp_name = inp_info.name
+        expected_shape = inp_info.shape
+        in_channels = expected_shape[1] if (len(expected_shape) > 1 and isinstance(expected_shape[1], int)) else 1
         
-    cp_h, cp_w = img_rgb.shape[:2]
-    inp_name = segmenter.get_inputs()[0].name
-    
-    if cp_h <= 320 and cp_w <= 320:
-        patch_resized = cv2.resize(img_rgb, (256, 256))
-        inp_tensor = (patch_resized.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
-        outputs = segmenter.run(None, {inp_name: inp_tensor})
-        logits = outputs[0][0, 0]
-        probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-        probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
-    else:
-        probs_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
-        counts_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
-        tile_size = 256
-        stride = 128
+        if len(image_crop.shape) == 3:
+            gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
+            img_rgb = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
+        else:
+            gray = image_crop.copy()
+            img_rgb = cv2.cvtColor(image_crop, cv2.COLOR_GRAY2RGB)
+            
+        cp_h, cp_w = gray.shape[:2]
         
-        for y in range(0, cp_h, stride):
-            for x in range(0, cp_w, stride):
-                y1 = min(y, max(0, cp_h - tile_size))
-                x1 = min(x, max(0, cp_w - tile_size))
-                y2 = min(cp_h, y1 + tile_size)
-                x2 = min(cp_w, x1 + tile_size)
-                
-                patch = img_rgb[y1:y2, x1:x2]
-                if patch.shape[0] != 256 or patch.shape[1] != 256:
-                    patch = cv2.resize(patch, (256, 256))
+        def prepare_patch_tensor(patch_gray, patch_rgb):
+            if in_channels == 1:
+                return (patch_gray.astype(np.float32) / 255.0)[None, None, :, :]
+            else:
+                return (patch_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
+
+        if cp_h <= 320 and cp_w <= 320:
+            patch_g = cv2.resize(gray, (256, 256))
+            patch_r = cv2.resize(img_rgb, (256, 256))
+            inp_tensor = prepare_patch_tensor(patch_g, patch_r)
+            outputs = segmenter.run(None, {inp_name: inp_tensor})
+            logits = outputs[0][0, 0]
+            probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+            probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            probs_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
+            counts_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
+            tile_size = 256
+            stride = 128
+            
+            for y in range(0, cp_h, stride):
+                for x in range(0, cp_w, stride):
+                    y1 = min(y, max(0, cp_h - tile_size))
+                    x1 = min(x, max(0, cp_w - tile_size))
+                    y2 = min(cp_h, y1 + tile_size)
+                    x2 = min(cp_w, x1 + tile_size)
                     
-                inp_patch = (patch.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, :, :, :]
-                out_patch = segmenter.run(None, {inp_name: inp_patch})[0][0, 0]
-                p_patch = 1.0 / (1.0 + np.exp(-np.clip(out_patch, -80.0, 80.0)))
-                
-                if (y2 - y1) != 256 or (x2 - x1) != 256:
-                    p_patch = cv2.resize(p_patch, (x2 - x1, y2 - y1))
+                    pg = gray[y1:y2, x1:x2]
+                    pr = img_rgb[y1:y2, x1:x2]
+                    if pg.shape[0] != 256 or pg.shape[1] != 256:
+                        pg = cv2.resize(pg, (256, 256))
+                        pr = cv2.resize(pr, (256, 256))
+                        
+                    inp_patch = prepare_patch_tensor(pg, pr)
+                    out_patch = segmenter.run(None, {inp_name: inp_patch})[0][0, 0]
+                    p_patch = 1.0 / (1.0 + np.exp(-np.clip(out_patch, -80.0, 80.0)))
                     
-                probs_orig[y1:y2, x1:x2] += p_patch
-                counts_orig[y1:y2, x1:x2] += 1.0
-                
-        probs_orig /= np.maximum(1.0, counts_orig)
+                    if (y2 - y1) != 256 or (x2 - x1) != 256:
+                        p_patch = cv2.resize(p_patch, (x2 - x1, y2 - y1))
+                        
+                    probs_orig[y1:y2, x1:x2] += p_patch
+                    counts_orig[y1:y2, x1:x2] += 1.0
+                    
+            probs_orig /= np.maximum(1.0, counts_orig)
+            
+        raw_unet_mask = (probs_orig > threshold).astype(np.uint8) * 255
+        kernel_close = np.ones((2, 2), np.uint8)
+        mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
         
-    raw_unet_mask = (probs_orig > threshold).astype(np.uint8) * 255
-    kernel_close = np.ones((2, 2), np.uint8)
-    mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
-    
-    k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    dilated = cv2.dilate(mask_closed, k_outline, iterations=1)
-    
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    white_fuchidori = (gray > 200).astype(np.uint8) * 255
-    mask_final = mask_closed | (dilated & white_fuchidori)
-    
-    k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    return cv2.dilate(mask_final, k_safety, iterations=1)
+        k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        dilated = cv2.dilate(mask_closed, k_outline, iterations=1)
+        
+        white_fuchidori = (gray > 200).astype(np.uint8) * 255
+        mask_final = mask_closed | (dilated & white_fuchidori)
+        
+        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        return cv2.dilate(mask_final, k_safety, iterations=1)
+    except Exception as e:
+        print(f"[run_tiled_unet Error]: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros(image_crop.shape[:2], dtype=np.uint8)
 
 
 class LamaMPEPyTorchInpainter:
