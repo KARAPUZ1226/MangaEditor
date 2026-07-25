@@ -671,17 +671,45 @@ class LamaMPEPyTorchInpainter:
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
         if self.segmenter is not None:
             try:
-                # Прямой однопроходный прогон U-Net 256x256 по контекстному кропу манги
-                patch_resized = cv2.resize(crop_pad_gray, (256, 256))
-                inp = (patch_resized.astype(np.float32) / 255.0)[None, None, :, :]
-                
                 inp_name = self.segmenter.get_inputs()[0].name
-                outputs = self.segmenter.run(None, {inp_name: inp})
-                logits = outputs[0][0, 0]
-                probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                 
-                # Масштабируем вероятности назад в размеры контекстного кропа
-                probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
+                # Если кроп небольшой (<=320px) — делаем быстрый однопроходный прогон
+                if cp_h <= 320 and cp_w <= 320:
+                    patch_resized = cv2.resize(crop_pad_gray, (256, 256))
+                    inp = (patch_resized.astype(np.float32) / 255.0)[None, None, :, :]
+                    outputs = self.segmenter.run(None, {inp_name: inp})
+                    logits = outputs[0][0, 0]
+                    probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+                    probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    # 1:1 Скользящие тайлы 256x256 без даунскейла (сохраняет 100% частоту растра!)
+                    probs_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
+                    counts_orig = np.zeros((cp_h, cp_w), dtype=np.float32)
+                    tile_size = 256
+                    stride = 128
+                    
+                    for y in range(0, cp_h, stride):
+                        for x in range(0, cp_w, stride):
+                            y1 = min(y, max(0, cp_h - tile_size))
+                            x1 = min(x, max(0, cp_w - tile_size))
+                            y2 = min(cp_h, y1 + tile_size)
+                            x2 = min(cp_w, x1 + tile_size)
+                            
+                            patch = crop_pad_gray[y1:y2, x1:x2]
+                            if patch.shape[0] != 256 or patch.shape[1] != 256:
+                                patch = cv2.resize(patch, (256, 256))
+                                
+                            inp_patch = (patch.astype(np.float32) / 255.0)[None, None, :, :]
+                            out_patch = self.segmenter.run(None, {inp_name: inp_patch})[0][0, 0]
+                            p_patch = 1.0 / (1.0 + np.exp(-np.clip(out_patch, -80.0, 80.0)))
+                            
+                            if (y2 - y1) != 256 or (x2 - x1) != 256:
+                                p_patch = cv2.resize(p_patch, (x2 - x1, y2 - y1))
+                                
+                            probs_orig[y1:y2, x1:x2] += p_patch
+                            counts_orig[y1:y2, x1:x2] += 1.0
+                            
+                    probs_orig /= np.maximum(1.0, counts_orig)
                 
                 off_y = y_min - y_min_pad
                 off_x = x_min - x_min_pad
