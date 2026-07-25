@@ -674,8 +674,15 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 continue
             filtered_mask[lbs == i] = 255
 
-        # 2. КОНТЕКСТНЫЙ ПРОБРОС МАРКЕРОВ (■): добавляем темную тушь (< 160) в радиусе 25px от текста U-Net!
+        # 2. УЖЕСТОЧЕННЫЙ КОНТЕКСТНЫЙ ПРОБРОС МАРКЕРОВ (■):
         if np.any(filtered_mask > 0):
+            # Медиана высоты уже найденных U-Net текстовых компонент
+            text_heights = [sts[i, cv2.CC_STAT_HEIGHT] for i in range(1, num_l) if (filtered_mask[lbs == i] > 0).any()]
+            median_h = float(np.median(text_heights)) if len(text_heights) > 0 else 20.0
+            
+            text_ys = np.where(np.any(filtered_mask, axis=1))[0]
+            text_y_min, text_y_max = text_ys.min(), text_ys.max()
+            
             k_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
             near_text_zone = cv2.dilate(filtered_mask, k_near, iterations=1) > 0
             
@@ -683,19 +690,20 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
             num_d, lbs_d, sts_d, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
             
             for i in range(1, num_d):
-                area_i = sts_d[i, cv2.CC_STAT_AREA]
                 w_i = sts_d[i, cv2.CC_STAT_WIDTH]
                 h_i = sts_d[i, cv2.CC_STAT_HEIGHT]
-                aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
+                comp_y_min = sts_d[i, cv2.CC_STAT_TOP]
+                comp_y_max = comp_y_min + h_i
                 
-                is_long_line = (aspect_r > 4.0 and (w_i > orig_w * 0.40 or h_i > orig_h * 0.40))
-                is_huge_block = (w_i > orig_w * 0.85 or h_i > orig_h * 0.85)
-                if is_long_line or is_huge_block or area_i < 6:
-                    continue
-                    
-                comp_mask = (lbs_d == i)
-                if np.any(comp_mask & near_text_zone):
-                    filtered_mask[comp_mask] = 255
+                aspect_ratio = w_i / max(1, h_i)
+                is_square_ish = (0.6 <= aspect_ratio <= 1.6)
+                size_matches_font = (0.4 * median_h <= h_i <= 2.2 * median_h)
+                same_line = not (comp_y_max < text_y_min - 8 or comp_y_min > text_y_max + 8)
+                
+                if is_square_ish and size_matches_font and same_line:
+                    comp_mask = (lbs_d == i)
+                    if np.any(comp_mask & near_text_zone):
+                        filtered_mask[comp_mask] = 255
 
         # 3. Расширенная safety-дилатацией 5x5 (2px) для 100% полного закрытия контуров
         k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -880,9 +888,11 @@ class LamaMPEPyTorchInpainter:
             result = result[:c_h, :c_w]
         crop_lama_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
         
-        crop_ans = crop_image.copy()
-        erase_mask_crop = (crop_mask_dilated > 0)
-        crop_ans[erase_mask_crop] = crop_lama_bgr[erase_mask_crop]
+        # Легкое размытие (feathering) 5x5 маски перед наложением для бесшовного плавного перехода без прямоугольных границ
+        mask_feathered = cv2.GaussianBlur(crop_mask_dilated.astype(np.float32), (5, 5), 0) / 255.0
+        mask_feathered = np.clip(mask_feathered * 1.2, 0.0, 1.0)[:, :, None]
+        
+        crop_ans = (crop_lama_bgr.astype(np.float32) * mask_feathered + crop_image.astype(np.float32) * (1.0 - mask_feathered)).astype(np.uint8)
         
         # --- ШАГИ 4 и 5: Orientation-Aware Donor Fill (100% прямое применение на скринтонах) ---
         from donor_fill_v2 import region_needs_texture, orientation_aware_donor_fill
