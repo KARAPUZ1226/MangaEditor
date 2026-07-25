@@ -1236,7 +1236,7 @@ class MangaEditorApp(QMainWindow):
             self.original_cv_image = smart_inpaint_rect(
                 self.original_cv_image, 
                 scene_rect, 
-                dilation_pixels=6,
+                dilation_pixels=0,
                 lama_inpainter=self.lama_inpainter,
                 text_segmenter=self.text_segmenter
             )
