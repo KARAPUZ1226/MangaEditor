@@ -828,10 +828,13 @@ class LamaMPEPyTorchInpainter:
         if qc_fail_count > 0:
             print(f"[LaMa Pipeline v2 QC] {qc_fail_count} px отмечены для внимания QC.")
             
-        # --- DEBUG CHECKLIST ---
-        print("[DEBUG MASK] mask dtype:", crop_mask_dilated.dtype, "unique values:", np.unique(crop_mask_dilated))
-        print("[DEBUG MASK] mask sum (pixels marked):", np.count_nonzero(crop_mask_dilated > 0), "/ total:", crop_mask_dilated.size)
-        print("[DEBUG MASK] crop shape:", crop_image.shape, "mask shape:", crop_mask_dilated.shape)
+        # --- DEBUG EXACT METRICS ---
+        print(f"[EXACT MASK METRICS] input_user_mask sum: {np.count_nonzero(user_mask_bool)} px")
+        print(f"[EXACT MASK METRICS] seg_box_unet (U-Net 0.40): {np.count_nonzero(seg_box_unet)} px")
+        print(f"[EXACT MASK METRICS] text_ink_base (Filtered Ink): {np.count_nonzero(text_ink_base)} px")
+        print(f"[EXACT MASK METRICS] text_ink_box (Text + 2px Halo): {np.count_nonzero(text_ink_box)} px")
+        print(f"[EXACT MASK METRICS] crop_mask_raw: {np.count_nonzero(crop_mask_raw > 0)} px")
+        print(f"[EXACT MASK METRICS] crop_mask_dilated (Final LaMa Input): {np.count_nonzero(crop_mask_dilated > 0)} px")
 
         diff_outside_dbg = np.abs(crop_ans.astype(int) - crop_image.astype(int))
         diff_outside_dbg[crop_mask_dilated > 0] = 0
