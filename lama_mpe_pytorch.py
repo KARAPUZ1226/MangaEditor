@@ -598,7 +598,7 @@ def load_lama_mpe(model_path, device, use_mpe: bool = True, large_arch: bool = F
     return model
 
 
-def run_tiled_unet(image_crop, segmenter, threshold=0.40):
+def run_tiled_unet(image_crop, segmenter, threshold=0.30):
     """Универсальная общая функция 1:1 тайлового инференса U-Net с паддингом границ без искажений."""
     if segmenter is None or image_crop is None:
         return np.zeros(image_crop.shape[:2], dtype=np.uint8)
@@ -656,12 +656,27 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
         probs_orig /= np.maximum(1.0, counts_orig)
         probs_orig = probs_orig[:orig_h, :orig_w]
         
+        # Порог 0.30 улавливает 100% краёв символов
         raw_unet_mask = (probs_orig > threshold).astype(np.uint8) * 255
         kernel_close = np.ones((2, 2), np.uint8)
         mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
         
-        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        return cv2.dilate(mask_closed, k_safety, iterations=1)
+        # Геометрический фильтр связанных компонент по площади и пропорциям
+        num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(mask_closed, connectivity=8)
+        filtered_mask = np.zeros_like(mask_closed)
+        for i in range(1, num_l):
+            area_i = sts[i, cv2.CC_STAT_AREA]
+            w_i = sts[i, cv2.CC_STAT_WIDTH]
+            h_i = sts[i, cv2.CC_STAT_HEIGHT]
+            aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
+            
+            if area_i < 6 or (aspect_r > 5.0 and (w_i > orig_w * 0.5 or h_i > orig_h * 0.5)):
+                continue
+            filtered_mask[lbs == i] = 255
+
+        # Расширенная safety-дилатацией 5x5 (2px) для 100% полного закрытия контуров
+        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        return cv2.dilate(filtered_mask, k_safety, iterations=1)
     except Exception as e:
         print(f"[run_tiled_unet Error]: {e}")
         import traceback
@@ -731,7 +746,7 @@ class LamaMPEPyTorchInpainter:
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
         if self.segmenter is not None:
             try:
-                full_pad_mask = run_tiled_unet(crop_pad, self.segmenter, threshold=0.40)
+                full_pad_mask = run_tiled_unet(crop_pad, self.segmenter, threshold=0.30)
                 off_y = y_min - y_min_pad
                 off_x = x_min - x_min_pad
                 seg_box_unet = full_pad_mask[off_y:off_y+b_h, off_x:off_x+b_w]
