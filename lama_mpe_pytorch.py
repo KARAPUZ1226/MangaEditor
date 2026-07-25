@@ -687,19 +687,23 @@ class LamaMPEPyTorchInpainter:
                 off_x = x_min - x_min_pad
                 crop_probs = probs_orig[off_y:off_y+b_h, off_x:off_x+b_w]
                 
-                # Порог 0.45 чисто отсекает фоновый скринтон (0.20-0.25) и выделяет 100% текста
-                raw_unet_mask = (crop_probs > 0.45).astype(np.uint8) * 255
+                # Порог 0.40 — точная граница между фоновым скринтоном (0.20-0.25) и текстом (>0.40)
+                raw_unet_mask = (crop_probs > 0.40).astype(np.uint8) * 255
                 
-                # Морфологическая чистка MORPH_OPEN (убирает мелкий шум/blobs)
+                # Морфологическое склеивание разрывов тонких штрихов фуриганы (MORPH_CLOSE)
+                kernel_close = np.ones((2, 2), np.uint8)
+                mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
+                
+                # Морфологическая чистка от микро-точек (MORPH_OPEN)
                 kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                mask_opened = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_OPEN, kernel_open)
+                mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel_open)
                 
-                # Connected Components + фильтр по площади (отсекаем мусор < 8px)
+                # Connected Components + фильтр по площади (отсекаем одиночные точечные брызги < 6px)
                 num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(mask_opened, connectivity=8)
                 seg_box_unet = np.zeros_like(mask_opened)
                 for i in range(1, num_l):
                     area_i = sts[i, cv2.CC_STAT_AREA]
-                    if area_i >= 8:
+                    if area_i >= 6:
                         seg_box_unet[lbs == i] = 255
             except Exception as e:
                 print(f"[LaMa] U-Net segmenter error: {e}")
