@@ -820,9 +820,10 @@ class LamaMPEPyTorchInpainter:
         # --- ШАГИ 4 и 5: Orientation-Aware Donor Fill (100% прямое применение на скринтонах) ---
         from donor_fill_v2 import region_needs_texture, orientation_aware_donor_fill
         
-        is_screentone = region_needs_texture(crop_image, crop_mask_raw, ring_width=20)
-        if is_screentone:
-            crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, crop_mask_raw, crop_mask_raw)
+        # Отключен donor_fill, копировавший контуры одежды вокруг бабла в зону текста
+        # is_screentone = region_needs_texture(crop_image, crop_mask_raw, ring_width=20)
+        # if is_screentone:
+        #     crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, crop_mask_raw, crop_mask_raw)
             
         # --- Post-inpaint Artifact Repair (Telea smudging disabled to preserve sharp screentone dots!) ---
         # outlier_fail_mask = detect_outlier_patches(crop_ans, crop_mask_dilated)
