@@ -661,7 +661,7 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
         kernel_close = np.ones((2, 2), np.uint8)
         mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
         
-        # Геометрический фильтр связанных компонент по площади и пропорциям
+        # 1. Геометрический фильтр U-Net маски
         num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(mask_closed, connectivity=8)
         filtered_mask = np.zeros_like(mask_closed)
         for i in range(1, num_l):
@@ -674,7 +674,30 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 continue
             filtered_mask[lbs == i] = 255
 
-        # Расширенная safety-дилатацией 5x5 (2px) для 100% полного закрытия контуров
+        # 2. КОНТЕКСТНЫЙ ПРОБРОС МАРКЕРОВ (■): добавляем темную тушь (< 160) в радиусе 25px от текста U-Net!
+        if np.any(filtered_mask > 0):
+            k_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
+            near_text_zone = cv2.dilate(filtered_mask, k_near, iterations=1) > 0
+            
+            dark_ink = (gray < 160).astype(np.uint8) * 255
+            num_d, lbs_d, sts_d, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+            
+            for i in range(1, num_d):
+                area_i = sts_d[i, cv2.CC_STAT_AREA]
+                w_i = sts_d[i, cv2.CC_STAT_WIDTH]
+                h_i = sts_d[i, cv2.CC_STAT_HEIGHT]
+                aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
+                
+                is_long_line = (aspect_r > 4.0 and (w_i > orig_w * 0.40 or h_i > orig_h * 0.40))
+                is_huge_block = (w_i > orig_w * 0.85 or h_i > orig_h * 0.85)
+                if is_long_line or is_huge_block or area_i < 6:
+                    continue
+                    
+                comp_mask = (lbs_d == i)
+                if np.any(comp_mask & near_text_zone):
+                    filtered_mask[comp_mask] = 255
+
+        # 3. Расширенная safety-дилатацией 5x5 (2px) для 100% полного закрытия контуров
         k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         return cv2.dilate(filtered_mask, k_safety, iterations=1)
     except Exception as e:
