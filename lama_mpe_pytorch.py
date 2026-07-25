@@ -737,6 +737,9 @@ class LamaMPEPyTorchInpainter:
         x_min_pad = max(0, x_min - pad_extra)
         x_max_pad = min(width, x_max + pad_extra)
 
+        crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
+        b_h, b_w = box_h, box_w
+
         # U-Net сегментация текста на узком кропе (12px padding) без складок одежды вокруг
         pad_tight = 12
         ty_min = max(0, y_min - pad_tight)
