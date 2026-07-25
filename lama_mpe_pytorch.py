@@ -661,111 +661,104 @@ class LamaMPEPyTorchInpainter:
         x_min_pad = max(0, x_min - pad_extra)
         x_max_pad = min(width, x_max + pad_extra)
 
-        # --- ШАГ 2: U-Net маска текста с помощью скользящего окна 256x256 без сжатия пропорций ---
+        # --- ШАГ 2: U-Net маска текста на полноконтекстном кропе (с контекстом вокруг текста!) ---
         crop_box_gray = cv2.cvtColor(image[y_min:y_max, x_min:x_max], cv2.COLOR_BGR2GRAY)
         b_h, b_w = crop_box_gray.shape
+        
+        crop_pad_gray = cv2.cvtColor(image[y_min_pad:y_max_pad, x_min_pad:x_max_pad], cv2.COLOR_BGR2GRAY)
+        cp_h, cp_w = crop_pad_gray.shape
         
         seg_box_unet = np.zeros((b_h, b_w), dtype=np.uint8)
         if self.segmenter is not None:
             try:
-                patch_size = 256
-                stride = 128
-                
-                # Дополняем кроп до минимального размера 256x256, если нужно
-                pad_h = max(0, patch_size - b_h)
-                pad_w = max(0, patch_size - b_w)
-                
-                if pad_h > 0 or pad_w > 0:
-                    padded_img = cv2.copyMakeBorder(crop_box_gray, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
-                else:
-                    padded_img = crop_box_gray
-                    
-                ph, pw = padded_img.shape
-                probs_map = np.zeros((ph, pw), dtype=np.float32)
-                counts = np.zeros((ph, pw), dtype=np.float32)
+                # Прямой однопроходный прогон U-Net 256x256 по контекстному кропу манги
+                patch_resized = cv2.resize(crop_pad_gray, (256, 256))
+                inp = (patch_resized.astype(np.float32) / 255.0)[None, None, :, :]
                 
                 inp_name = self.segmenter.get_inputs()[0].name
-                
-                # Проходы скользящего окна
-                for y in range(0, ph - patch_size + 1, stride):
-                    for x in range(0, pw - patch_size + 1, stride):
-                        patch = padded_img[y:y+patch_size, x:x+patch_size]
-                        inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
-                        outputs = self.segmenter.run(None, {inp_name: inp})
-                        logits = outputs[0][0, 0]
-                        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                        
-                        probs_map[y:y+patch_size, x:x+patch_size] += probs
-                        counts[y:y+patch_size, x:x+patch_size] += 1.0
-                
-                # Крайние проходы по нижним и правым границам
-                final_y = ph - patch_size
-                final_x = pw - patch_size
-                
-                for x in range(0, pw - patch_size + 1, stride):
-                    patch = padded_img[final_y:final_y+patch_size, x:x+patch_size]
-                    inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
-                    outputs = self.segmenter.run(None, {inp_name: inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    probs_map[final_y:final_y+patch_size, x:x+patch_size] += probs
-                    counts[final_y:final_y+patch_size, x:x+patch_size] += 1.0
-                    
-                for y in range(0, ph - patch_size + 1, stride):
-                    patch = padded_img[y:y+patch_size, final_x:final_x+patch_size]
-                    inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
-                    outputs = self.segmenter.run(None, {inp_name: inp})
-                    logits = outputs[0][0, 0]
-                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                    probs_map[y:y+patch_size, final_x:final_x+patch_size] += probs
-                    counts[y:y+patch_size, final_x:final_x+patch_size] += 1.0
-                    
-                patch = padded_img[final_y:final_y+patch_size, final_x:final_x+patch_size]
-                inp = (patch.astype(np.float32) / 255.0)[None, None, :, :]
                 outputs = self.segmenter.run(None, {inp_name: inp})
                 logits = outputs[0][0, 0]
-                probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
-                probs_map[final_y:final_y+patch_size, final_x:final_x+patch_size] += probs
-                counts[final_y:final_y+patch_size, final_x:final_x+patch_size] += 1.0
+                probs_256 = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
                 
-                probs_map /= np.maximum(counts, 1.0)
-                crop_probs = probs_map[:b_h, :b_w]
+                # Масштабируем вероятности назад в размеры контекстного кропа
+                probs_orig = cv2.resize(probs_256, (cp_w, cp_h), interpolation=cv2.INTER_LINEAR)
                 
-                # Порог 0.30 идеально объединяет все глифы текста и их белую окантовку, не цепляя пуговицы
-                raw_unet = (crop_probs > 0.30).astype(np.uint8) * 255
+                off_y = y_min - y_min_pad
+                off_x = x_min - x_min_pad
+                crop_probs = probs_orig[off_y:off_y+b_h, off_x:off_x+b_w]
                 
-                # Очищаем от случайных шумов и микро-точек
-                num_l, lbs, sts, _ = cv2.connectedComponentsWithStats((raw_unet > 0).astype(np.uint8), connectivity=8)
+                # Порог 0.45 чисто отсекает фоновый скринтон (0.20-0.25) и выделяет 100% текста
+                raw_unet_mask = (crop_probs > 0.45).astype(np.uint8) * 255
+                
+                # Морфологическая чистка MORPH_OPEN (убирает мелкий шум/blobs)
+                kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                mask_opened = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_OPEN, kernel_open)
+                
+                # Connected Components + фильтр по площади (отсекаем мусор < 8px)
+                num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(mask_opened, connectivity=8)
+                seg_box_unet = np.zeros_like(mask_opened)
                 for i in range(1, num_l):
-                    w_i = sts[i, cv2.CC_STAT_WIDTH]
-                    h_i = sts[i, cv2.CC_STAT_HEIGHT]
                     area_i = sts[i, cv2.CC_STAT_AREA]
-                    if area_i >= 6 and (w_i >= 2 or h_i >= 2) and area_i < 2500:
+                    if area_i >= 8:
                         seg_box_unet[lbs == i] = 255
             except Exception as e:
-                print(f"[LaMa] Sliding window U-Net segmenter error: {e}")
+                print(f"[LaMa] U-Net segmenter error: {e}")
                 
-        # ШАГ 2: Выделяем 100% всех букв текста без пропуска символов и без задевания лишнего
-        dark_ink = (crop_box_gray < 165).astype(np.uint8) * 255
-        n_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-        compact_dark_ink = np.zeros_like(dark_ink)
+        # ШАГ 2: Формируем точную маску текста (M_text): символы туши + белая обводка (fuchidori)
+        dark_ink = (crop_box_gray < 160).astype(np.uint8) * 255
+        
+        num_l, lbs, sts, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
+        text_ink_base = np.zeros_like(dark_ink)
         c_h, c_w = crop_box_gray.shape
-        for i in range(1, n_l):
+        
+        has_unet = (self.segmenter is not None and np.any(seg_box_unet > 0))
+        if has_unet:
+            # Зона детекции U-Net с запасом на обводку
+            k_unet_zone = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            unet_zone = cv2.dilate(seg_box_unet, k_unet_zone, iterations=1) > 0
+            
+        k_bg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        
+        for i in range(1, num_l):
             w_i = sts[i, cv2.CC_STAT_WIDTH]
             h_i = sts[i, cv2.CC_STAT_HEIGHT]
             area_i = sts[i, cv2.CC_STAT_AREA]
-            # Исключаем только гигантские внешние рамки всего кадра
-            if area_i >= 6 and w_i < (c_w * 0.85) and h_i < (c_h * 0.85):
-                compact_dark_ink[lbs == i] = 255
-                
-        if np.count_nonzero(seg_box_unet) > 5:
-            text_ink_base = compact_dark_ink | seg_box_unet
-        else:
-            text_ink_base = compact_dark_ink
+            aspect_r = max(w_i, h_i) / max(1, min(w_i, h_i))
             
-        # Захватываем белые обводки/окантовки вокруг символов (аккуратные 4px)
-        k_halo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        text_ink_box = cv2.dilate(text_ink_base, k_halo, iterations=1)
+            # 1. Исключаем длинные линии кадров, ног и рамок
+            is_long_line = (aspect_r > 3.5 and (w_i > c_w * 0.40 or h_i > c_h * 0.40))
+            is_huge_block = (w_i > c_w * 0.85 or h_i > c_h * 0.85)
+            if is_long_line or is_huge_block:
+                continue
+                
+            comp_mask = (lbs == i)
+            overlaps_unet = np.any(unet_zone & comp_mask) if has_unet else False
+            
+            # 2. Исключаем мелкие одиночные точки скринтона (< 16px) вне U-Net
+            is_screentone_dot = (area_i < 16)
+            if is_screentone_dot and not overlaps_unet:
+                continue
+                
+            # 3. Исключаем изолированные пуговицы на чистой белой одежде вне детектора U-Net
+            if has_unet and not overlaps_unet:
+                dil_comp = cv2.dilate(comp_mask.astype(np.uint8), k_bg, iterations=1) > 0
+                ring_bg = crop_box_gray[dil_comp & (~comp_mask)]
+                if ring_bg.size > 0 and float(np.mean(ring_bg)) > 230.0:
+                    continue  # Изолированная пуговица на белой рубашке!
+                    
+            text_ink_base[comp_mask] = 255
+                
+        # Точечный захват белого ореола обводки (fuchidori) строго в радиусе 2px вокруг букв
+        k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        dilated_text = cv2.dilate(text_ink_base, k_outline, iterations=1)
+        white_fuchidori = (crop_box_gray > 200).astype(np.uint8) * 255
+        
+        # Точная компактная маска: буквы + обводка (без захода на белую одежду)
+        text_ink_box = text_ink_base | (dilated_text & white_fuchidori)
+            
+        # Защитная окантовка 1px
+        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        text_ink_box = cv2.dilate(text_ink_box, k_safety, iterations=1)
             
         # Размещаем точную маску текста в полноразмерной маске
         combined_text_ink_full = np.zeros((height, width), dtype=np.uint8)
@@ -812,12 +805,12 @@ class LamaMPEPyTorchInpainter:
         erase_mask_crop = (crop_mask_dilated > 0)
         crop_ans[erase_mask_crop] = crop_lama_bgr[erase_mask_crop]
         
-        # --- ШАГ 4: Детектор провала LaMa (M_fail) ---
-        M_fail_crop = detect_lama_failures(crop_ans, crop_mask_dilated, patch_size=16, ring_width=20)
+        # --- ШАГИ 4 и 5: Orientation-Aware Donor Fill (100% прямое применение на скринтонах) ---
+        from donor_fill_v2 import region_needs_texture, orientation_aware_donor_fill
         
-        # --- ШАГИ 5 и 6: Orientation-Aware Donor Fill & Blending ---
-        if np.any(M_fail_crop > 0):
-            crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, M_fail_crop, crop_mask_raw)
+        is_screentone = region_needs_texture(crop_image, crop_mask_dilated, ring_width=20)
+        if is_screentone:
+            crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, crop_mask_dilated, crop_mask_dilated)
             
         # --- Post-inpaint Artifact Repair (Telea smudging disabled to preserve sharp screentone dots!) ---
         # outlier_fail_mask = detect_outlier_patches(crop_ans, crop_mask_dilated)
