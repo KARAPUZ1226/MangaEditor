@@ -736,20 +736,12 @@ class LamaMPEPyTorchInpainter:
                 continue
                 
             comp_mask = (lbs == i)
-            overlaps_unet = np.any(unet_zone & comp_mask) if has_unet else False
+            overlaps_unet = np.any(unet_zone & comp_mask) if has_unet else True
             
-            # 2. Исключаем мелкие одиночные точки скринтона (< 16px) вне U-Net
-            is_screentone_dot = (area_i < 16)
-            if is_screentone_dot and not overlaps_unet:
+            # Когда нейросеть U-Net активна, маска туши подхватывается СТРОГО внутри зоны U-Net!
+            if has_unet and not overlaps_unet:
                 continue
                 
-            # 3. Исключаем изолированные пуговицы на чистой белой одежде вне детектора U-Net
-            if has_unet and not overlaps_unet:
-                dil_comp = cv2.dilate(comp_mask.astype(np.uint8), k_bg, iterations=1) > 0
-                ring_bg = crop_box_gray[dil_comp & (~comp_mask)]
-                if ring_bg.size > 0 and float(np.mean(ring_bg)) > 230.0:
-                    continue  # Изолированная пуговица на белой рубашке!
-                    
             text_ink_base[comp_mask] = 255
                 
         # Точечный захват белого ореола обводки (fuchidori) строго в радиусе 2px вокруг букв
@@ -812,9 +804,9 @@ class LamaMPEPyTorchInpainter:
         # --- ШАГИ 4 и 5: Orientation-Aware Donor Fill (100% прямое применение на скринтонах) ---
         from donor_fill_v2 import region_needs_texture, orientation_aware_donor_fill
         
-        is_screentone = region_needs_texture(crop_image, crop_mask_dilated, ring_width=20)
+        is_screentone = region_needs_texture(crop_image, crop_mask_raw, ring_width=20)
         if is_screentone:
-            crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, crop_mask_dilated, crop_mask_dilated)
+            crop_ans = orientation_aware_donor_fill(crop_image, crop_ans, crop_mask_raw, crop_mask_raw)
             
         # --- Post-inpaint Artifact Repair (Telea smudging disabled to preserve sharp screentone dots!) ---
         # outlier_fail_mask = detect_outlier_patches(crop_ans, crop_mask_dilated)
