@@ -667,14 +667,9 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
         kernel_close = np.ones((2, 2), np.uint8)
         mask_closed = cv2.morphologyEx(raw_unet_mask, cv2.MORPH_CLOSE, kernel_close)
         
-        k_outline = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        dilated = cv2.dilate(mask_closed, k_outline, iterations=1)
-        
-        white_fuchidori = (gray > 200).astype(np.uint8) * 255
-        mask_final = mask_closed | (dilated & white_fuchidori)
-        
+        # Точечная защитная окантовка 1-2px (k_safety 3x3) для укрытия градиента антиалиасинга
         k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        return cv2.dilate(mask_final, k_safety, iterations=1)
+        return cv2.dilate(mask_closed, k_safety, iterations=1)
     except Exception as e:
         print(f"[run_tiled_unet Error]: {e}")
         import traceback
