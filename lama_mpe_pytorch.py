@@ -656,6 +656,7 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 
         probs_orig /= np.maximum(1.0, counts_orig)
         probs_orig = probs_orig[:orig_h, :orig_w]
+        print(f"probs_orig min={probs_orig.min():.4f} max={probs_orig.max():.4f} mean={probs_orig.mean():.4f}")
         
         # Порог 0.30 улавливает 100% краёв символов
         raw_unet_mask = (probs_orig > threshold).astype(np.uint8) * 255
