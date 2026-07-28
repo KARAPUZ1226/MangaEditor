@@ -692,7 +692,7 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
             k_near = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51))
             near_text_zone = cv2.dilate(filtered_mask, k_near, iterations=1) > 0
             
-            dark_ink = (gray < 160).astype(np.uint8) * 255
+            dark_ink = (gray < 190).astype(np.uint8) * 255
             num_d, lbs_d, sts_d, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
             for i in range(1, num_d):
                 w_i = sts_d[i, cv2.CC_STAT_WIDTH]
@@ -716,10 +716,10 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
 
         print(f"[PIPELINE DEBUG] after marker recovery (SQUARE MARKER): {np.count_nonzero(filtered_mask)} px")
 
-        # 3. Расширенная safety-дилатация 9x9 (4px) для 100% полного закрытия обводок и ореолов
-        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        # 3. Расширенная safety-дилатация 13x13 (6px) для 100% полного закрытия обводок
+        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
         final_mask = cv2.dilate(filtered_mask, k_safety, iterations=1)
-        print(f"[PIPELINE DEBUG] after 9x9 safety dilate: {np.count_nonzero(final_mask)} px")
+        print(f"[PIPELINE DEBUG] after 13x13 safety dilate: {np.count_nonzero(final_mask)} px")
         return final_mask
     except Exception as e:
         print(f"[ERROR] run_tiled_unet: {e}")
