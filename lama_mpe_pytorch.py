@@ -11,7 +11,8 @@ try:
     HAS_PATCHMATCH = patch_match.patchmatch_available
 except Exception as e:
     HAS_PATCHMATCH = False
-    print(f"[LaMa PyTorch] PyPatchMatch not available: {e}")
+    print(f"[ERROR] PyPatchMatch not available: {e}")
+    import traceback; traceback.print_exc()
 
 def set_requires_grad(module, value):
     for param in module.parameters():
@@ -677,19 +678,6 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 continue
             filtered_mask[lbs == i] = 255
 
-        # Убираем компоненты, которые лежат на текстуре/тени, а не на белом бабле
-        num_f, lbs_f, sts_f, _ = cv2.connectedComponentsWithStats(filtered_mask, connectivity=8)
-        for i in range(1, num_f):
-            comp_mask_f = (lbs_f == i)
-            y0, x0 = sts_f[i, cv2.CC_STAT_TOP], sts_f[i, cv2.CC_STAT_LEFT]
-            h_f, w_f = sts_f[i, cv2.CC_STAT_HEIGHT], sts_f[i, cv2.CC_STAT_WIDTH]
-            pad = 6
-            by0, by1 = max(0, y0 - pad), min(gray.shape[0], y0 + h_f + pad)
-            bx0, bx1 = max(0, x0 - pad), min(gray.shape[1], x0 + w_f + pad)
-            surrounding = gray[by0:by1, bx0:bx1]
-            if surrounding.size > 0 and surrounding.mean() < 200:
-                filtered_mask[comp_mask_f] = 0
-
         print(f"[PIPELINE DEBUG] after geometric filter (is_long_line/is_huge_block/area<6): {np.count_nonzero(filtered_mask)} px")
 
         # 2. УЖЕСТОЧЕННЫЙ КОНТЕКСТНЫЙ ПРОБРОС МАРКЕРОВ (■):
@@ -712,11 +700,6 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 comp_y_min = sts_d[i, cv2.CC_STAT_TOP]
                 comp_y_max = comp_y_min + h_i
                 
-                aspect_ratio = w_i / max(1, h_i)
-                is_square_ish = (0.5 <= aspect_ratio <= 1.8)
-                size_matches_font = (h_i >= 4 and h_i <= 2.5 * median_h)
-                same_line = not (comp_y_max < text_y_min - 12 or comp_y_min > text_y_max + 12)
-
                 pad_b = 8
                 by0, by1 = max(0, comp_y_min - pad_b), comp_y_min
                 bx0, bx1 = max(0, sts_d[i, cv2.CC_STAT_LEFT] - pad_b), sts_d[i, cv2.CC_STAT_LEFT] + w_i + pad_b
@@ -736,9 +719,8 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
         print(f"[PIPELINE DEBUG] after 5x5 safety dilate: {np.count_nonzero(final_mask)} px")
         return final_mask
     except Exception as e:
-        print(f"[run_tiled_unet Error]: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[ERROR] run_tiled_unet: {e}")
+        import traceback; traceback.print_exc()
         return np.zeros(image_crop.shape[:2], dtype=np.uint8)
 
 
@@ -768,7 +750,8 @@ class LamaMPEPyTorchInpainter:
             print("[LaMa PyTorch] Loaded text detector guard successfully.")
         except Exception as e:
             self.text_detector = None
-            print(f"[LaMa PyTorch] Warning: failed to load text detector guard: {e}")
+            print(f"[ERROR] failed to load text detector guard: {e}")
+            import traceback; traceback.print_exc()
 
     def inpaint(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         from failure_detector import detect_lama_failures
@@ -821,7 +804,8 @@ class LamaMPEPyTorchInpainter:
                 off_x = x_min - tx_min
                 seg_box_unet = tight_mask[off_y:off_y+b_h, off_x:off_x+b_w]
             except Exception as e:
-                print(f"[LaMa] U-Net segmenter error: {e}")
+                print(f"[ERROR] U-Net segmenter error: {e}")
+                import traceback; traceback.print_exc()
                 
         # ШАГ 2: Формируем точную маску текста (M_text): U-Net нейросеть (источник данных №1!)
         has_unet = (self.segmenter is not None and np.any(seg_box_unet > 0))
