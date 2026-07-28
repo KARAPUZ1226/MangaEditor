@@ -701,13 +701,12 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
                 comp_y_min = sts_d[i, cv2.CC_STAT_TOP]
                 comp_y_max = comp_y_min + h_i
                 
-                pad_b = 8
-                by0, by1 = max(0, comp_y_min - pad_b), comp_y_min
-                bx0, bx1 = max(0, sts_d[i, cv2.CC_STAT_LEFT] - pad_b), sts_d[i, cv2.CC_STAT_LEFT] + w_i + pad_b
-                surrounding = gray[by0:by1, bx0:bx1]
-                is_on_white_bubble = surrounding.size > 0 and surrounding.mean() > 215
+                aspect_ratio = w_i / max(1, h_i)
+                is_square_ish = (0.5 <= aspect_ratio <= 1.8)
+                size_matches_font = (h_i >= 4 and h_i <= 2.5 * median_h)
+                same_line = not (comp_y_max < text_y_min - 12 or comp_y_min > text_y_max + 12)
 
-                if is_square_ish and size_matches_font and same_line and is_on_white_bubble:
+                if is_square_ish and size_matches_font and same_line:
                     comp_mask = (lbs_d == i)
                     if np.any(comp_mask & near_text_zone):
                         filtered_mask[comp_mask] = 255
