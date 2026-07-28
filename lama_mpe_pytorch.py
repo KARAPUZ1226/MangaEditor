@@ -694,19 +694,22 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
             
             dark_ink = (gray < 160).astype(np.uint8) * 255
             num_d, lbs_d, sts_d, _ = cv2.connectedComponentsWithStats(dark_ink, connectivity=8)
-            
             for i in range(1, num_d):
                 w_i = sts_d[i, cv2.CC_STAT_WIDTH]
                 h_i = sts_d[i, cv2.CC_STAT_HEIGHT]
+                area_i = sts_d[i, cv2.CC_STAT_AREA]
                 comp_y_min = sts_d[i, cv2.CC_STAT_TOP]
                 comp_y_max = comp_y_min + h_i
-                
+
                 aspect_ratio = w_i / max(1, h_i)
                 is_square_ish = (0.5 <= aspect_ratio <= 1.8)
                 size_matches_font = (h_i >= 4 and h_i <= 2.5 * median_h)
                 same_line = not (comp_y_max < text_y_min - 12 or comp_y_min > text_y_max + 12)
 
-                if is_square_ish and size_matches_font and same_line:
+                is_punctuation = (same_line and area_i >= 2 and h_i <= median_h * 0.6)
+                is_marker = (is_square_ish and size_matches_font and same_line)
+
+                if is_punctuation or is_marker:
                     comp_mask = (lbs_d == i)
                     if np.any(comp_mask & near_text_zone):
                         filtered_mask[comp_mask] = 255
