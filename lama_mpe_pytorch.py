@@ -718,10 +718,10 @@ def run_tiled_unet(image_crop, segmenter, threshold=0.40):
 
         print(f"[PIPELINE DEBUG] after marker recovery (SQUARE MARKER): {np.count_nonzero(filtered_mask)} px")
 
-        # 3. Безопасная аккуратная safety-дилатация 5x5 (2px)
-        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # 3. Аккуратная safety-дилатация 9x9 (4px)
+        k_safety = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         final_mask = cv2.dilate(filtered_mask, k_safety, iterations=1)
-        print(f"[PIPELINE DEBUG] after 5x5 safety dilate: {np.count_nonzero(final_mask)} px")
+        print(f"[PIPELINE DEBUG] after 9x9 safety dilate: {np.count_nonzero(final_mask)} px")
         return final_mask
     except Exception as e:
         print(f"[ERROR] run_tiled_unet: {e}")
